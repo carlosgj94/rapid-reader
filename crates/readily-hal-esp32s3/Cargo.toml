@@ -1,0 +1,14 @@
+[package]
+name = "readily-hal-esp32s3"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+embedded-hal = "1.0.0"
+ls027b7dh01 = { path = "../ls027b7dh01" }
+readily-core = { path = "../readily-core" }
+embedded-storage = "0.3.1"
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
+esp-hal = { version = "~1.0", features = ["esp32s3", "unstable"] }
+esp-rom-sys = "0.1.3"

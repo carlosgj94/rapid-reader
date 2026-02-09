@@ -1,0 +1,13 @@
+[package]
+name = "ls027b7dh01"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+embedded-hal = "1.0.0"
+embedded-graphics-core = { version = "0.3.3", optional = true }
+
+[features]
+default = []
+embedded-graphics = ["dep:embedded-graphics-core"]
