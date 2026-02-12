@@ -99,7 +99,7 @@ pub struct FakeSdCatalogSource {
     catalog_stream_chapter_total_hint: Vec<u16, SD_CATALOG_MAX_TITLES>,
     catalog_stream_chapter_label: Vec<String<SD_CATALOG_TITLE_BYTES>, SD_CATALOG_MAX_TITLES>,
     catalog_html_state: Vec<HtmlParseState, SD_CATALOG_MAX_TITLES>,
-    catalog_html_tail: Vec<String<HTML_TAIL_BYTES>, SD_CATALOG_MAX_TITLES>,
+    catalog_html_tail: Vec<Vec<u8, HTML_TAIL_BYTES>, SD_CATALOG_MAX_TITLES>,
     catalog_refill_requested: Vec<bool, SD_CATALOG_MAX_TITLES>,
     catalog_stream_seek_target: Vec<u16, SD_CATALOG_MAX_TITLES>,
     catalog_stream_paths: Vec<String<SD_CATALOG_TEXT_PATH_BYTES>, SD_CATALOG_MAX_TITLES>,
@@ -347,7 +347,7 @@ impl FakeSdCatalogSource {
         let treat_as_plain_text = path_is_plain_text(resource_path.as_bytes());
         let mut parse_input = [0u8; SD_CATALOG_TEXT_BYTES + HTML_TAIL_BYTES];
         let mut parse_len = 0usize;
-        for &byte in html_tail.as_str().as_bytes() {
+        for &byte in html_tail.iter() {
             if parse_len >= parse_input.len() {
                 break;
             }
@@ -367,8 +367,7 @@ impl FakeSdCatalogSource {
         html_tail.clear();
         if let Some(start) = tail_start {
             for &byte in &parse_input[start..parse_len] {
-                let ch = if byte.is_ascii() { byte as char } else { '?' };
-                if html_tail.push(ch).is_err() {
+                if html_tail.push(byte).is_err() {
                     break;
                 }
             }
@@ -690,7 +689,7 @@ impl FakeSdCatalogSource {
         }
         if self
             .catalog_html_tail
-            .push(String::<HTML_TAIL_BYTES>::new())
+            .push(Vec::<u8, HTML_TAIL_BYTES>::new())
             .is_err()
         {
             return true;
@@ -815,7 +814,7 @@ impl FakeSdCatalogSource {
         }
         if self
             .catalog_html_tail
-            .push(String::<HTML_TAIL_BYTES>::new())
+            .push(Vec::<u8, HTML_TAIL_BYTES>::new())
             .is_err()
         {
             return true;
@@ -1935,23 +1934,39 @@ fn sanitize_epub_chunk(
             continue;
         }
 
-        if html_state.should_emit_text(treat_as_plain_text) {
-            match byte {
-                b'\r' | b'\n' | b'\t' | b' ' => {
-                    push_normalized_char(&mut out, ' ', &mut truncated, &mut last_was_space)
-                }
-                _ if byte.is_ascii_control() => {}
-                _ => {
-                    let ch = if byte.is_ascii() { byte as char } else { '?' };
-                    push_normalized_char(&mut out, ch, &mut truncated, &mut last_was_space);
-                }
+        if !html_state.should_emit_text(treat_as_plain_text) {
+            cursor += 1;
+            continue;
+        }
+
+        match byte {
+            b'\r' | b'\n' | b'\t' | b' ' => {
+                push_normalized_char(&mut out, ' ', &mut truncated, &mut last_was_space);
+                cursor += 1;
             }
+            _ if byte.is_ascii_control() => {
+                cursor += 1;
+            }
+            _ => match decode_utf8_char(chunk, cursor) {
+                Utf8ChunkDecode::Char(ch, advance) => {
+                    push_normalized_char(&mut out, ch, &mut truncated, &mut last_was_space);
+                    cursor += advance;
+                }
+                Utf8ChunkDecode::Incomplete => {
+                    tail_start = Some(cursor);
+                    break;
+                }
+                Utf8ChunkDecode::Invalid => {
+                    let fallback = decode_single_byte_fallback(byte);
+                    push_normalized_char(&mut out, fallback, &mut truncated, &mut last_was_space);
+                    cursor += 1;
+                }
+            },
         }
 
         if truncated {
             break;
         }
-        cursor += 1;
     }
 
     while out.ends_with(' ') || out.ends_with('\n') {
@@ -1959,6 +1974,121 @@ fn sanitize_epub_chunk(
     }
 
     (out, truncated, tail_start)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Utf8ChunkDecode {
+    Char(char, usize),
+    Incomplete,
+    Invalid,
+}
+
+fn decode_utf8_char(chunk: &[u8], cursor: usize) -> Utf8ChunkDecode {
+    let first = chunk[cursor];
+    if first < 0x80 {
+        return Utf8ChunkDecode::Char(first as char, 1);
+    }
+
+    let remaining = chunk.len().saturating_sub(cursor);
+    if (0xC2..=0xDF).contains(&first) {
+        if remaining < 2 {
+            return Utf8ChunkDecode::Incomplete;
+        }
+        let b1 = chunk[cursor + 1];
+        if !is_utf8_continuation(b1) {
+            return Utf8ChunkDecode::Invalid;
+        }
+        let codepoint = (((first & 0x1f) as u32) << 6) | ((b1 & 0x3f) as u32);
+        return core::char::from_u32(codepoint)
+            .map(|ch| Utf8ChunkDecode::Char(ch, 2))
+            .unwrap_or(Utf8ChunkDecode::Invalid);
+    }
+
+    if (0xE0..=0xEF).contains(&first) {
+        if remaining < 3 {
+            return Utf8ChunkDecode::Incomplete;
+        }
+        let b1 = chunk[cursor + 1];
+        let b2 = chunk[cursor + 2];
+        if !is_utf8_continuation(b1) || !is_utf8_continuation(b2) {
+            return Utf8ChunkDecode::Invalid;
+        }
+        if (first == 0xE0 && b1 < 0xA0) || (first == 0xED && b1 >= 0xA0) {
+            return Utf8ChunkDecode::Invalid;
+        }
+        let codepoint =
+            (((first & 0x0f) as u32) << 12) | (((b1 & 0x3f) as u32) << 6) | ((b2 & 0x3f) as u32);
+        return core::char::from_u32(codepoint)
+            .map(|ch| Utf8ChunkDecode::Char(ch, 3))
+            .unwrap_or(Utf8ChunkDecode::Invalid);
+    }
+
+    if (0xF0..=0xF4).contains(&first) {
+        if remaining < 4 {
+            return Utf8ChunkDecode::Incomplete;
+        }
+        let b1 = chunk[cursor + 1];
+        let b2 = chunk[cursor + 2];
+        let b3 = chunk[cursor + 3];
+        if !is_utf8_continuation(b1) || !is_utf8_continuation(b2) || !is_utf8_continuation(b3) {
+            return Utf8ChunkDecode::Invalid;
+        }
+        if (first == 0xF0 && b1 < 0x90) || (first == 0xF4 && b1 > 0x8F) {
+            return Utf8ChunkDecode::Invalid;
+        }
+        let codepoint = (((first & 0x07) as u32) << 18)
+            | (((b1 & 0x3f) as u32) << 12)
+            | (((b2 & 0x3f) as u32) << 6)
+            | ((b3 & 0x3f) as u32);
+        return core::char::from_u32(codepoint)
+            .map(|ch| Utf8ChunkDecode::Char(ch, 4))
+            .unwrap_or(Utf8ChunkDecode::Invalid);
+    }
+
+    Utf8ChunkDecode::Invalid
+}
+
+fn is_utf8_continuation(byte: u8) -> bool {
+    (byte & 0b1100_0000) == 0b1000_0000
+}
+
+fn decode_single_byte_fallback(byte: u8) -> char {
+    match byte {
+        0x91 | 0x92 => '\'',
+        0x93 | 0x94 => '"',
+        0x96 | 0x97 => '-',
+        0x85 => '.',
+        0xA0 => ' ',
+        0xA1 => '¡',
+        0xBF => '¿',
+        0xC0 => 'À',
+        0xC1 => 'Á',
+        0xC8 => 'È',
+        0xC9 => 'É',
+        0xCC => 'Ì',
+        0xCD => 'Í',
+        0xD1 => 'Ñ',
+        0xD2 => 'Ò',
+        0xD3 => 'Ó',
+        0xD9 => 'Ù',
+        0xDA => 'Ú',
+        0xDC => 'Ü',
+        0xE0 => 'à',
+        0xE1 => 'á',
+        0xE7 => 'ç',
+        0xE8 => 'è',
+        0xE9 => 'é',
+        0xEC => 'ì',
+        0xED => 'í',
+        0xF1 => 'ñ',
+        0xF2 => 'ò',
+        0xF3 => 'ó',
+        0xF9 => 'ù',
+        0xFA => 'ú',
+        0xFC => 'ü',
+        _ if byte.is_ascii() => byte as char,
+        _ => '?',
+    }
 }
 
 fn push_paragraph_break<const N: usize>(
@@ -2008,16 +2138,65 @@ fn push_normalized_char<const N: usize>(
 }
 
 fn decode_html_entity(entity: &[u8]) -> Option<char> {
-    match entity {
-        b"amp" | b"AMP" => Some('&'),
-        b"lt" | b"LT" => Some('<'),
-        b"gt" | b"GT" => Some('>'),
-        b"quot" | b"QUOT" => Some('"'),
-        b"apos" | b"APOS" => Some('\''),
-        b"nbsp" | b"NBSP" => Some(' '),
-        b"#39" => Some('\''),
-        b"#160" => Some(' '),
-        _ => decode_numeric_entity(entity),
+    if entity.eq_ignore_ascii_case(b"amp") {
+        Some('&')
+    } else if entity.eq_ignore_ascii_case(b"lt") {
+        Some('<')
+    } else if entity.eq_ignore_ascii_case(b"gt") {
+        Some('>')
+    } else if entity.eq_ignore_ascii_case(b"quot") {
+        Some('"')
+    } else if entity.eq_ignore_ascii_case(b"apos")
+        || entity.eq_ignore_ascii_case(b"lsquo")
+        || entity.eq_ignore_ascii_case(b"rsquo")
+    {
+        Some('\'')
+    } else if entity.eq_ignore_ascii_case(b"ldquo")
+        || entity.eq_ignore_ascii_case(b"rdquo")
+        || entity.eq_ignore_ascii_case(b"laquo")
+        || entity.eq_ignore_ascii_case(b"raquo")
+    {
+        Some('"')
+    } else if entity.eq_ignore_ascii_case(b"nbsp") || entity == b"#160" {
+        Some(' ')
+    } else if entity == b"#39" {
+        Some('\'')
+    } else if entity.eq_ignore_ascii_case(b"ndash") || entity.eq_ignore_ascii_case(b"mdash") {
+        Some('-')
+    } else if entity.eq_ignore_ascii_case(b"hellip") {
+        Some('.')
+    } else if entity.eq_ignore_ascii_case(b"aacute") {
+        Some('á')
+    } else if entity.eq_ignore_ascii_case(b"eacute") {
+        Some('é')
+    } else if entity.eq_ignore_ascii_case(b"iacute") {
+        Some('í')
+    } else if entity.eq_ignore_ascii_case(b"oacute") {
+        Some('ó')
+    } else if entity.eq_ignore_ascii_case(b"uacute") {
+        Some('ú')
+    } else if entity.eq_ignore_ascii_case(b"ntilde") {
+        Some('ñ')
+    } else if entity.eq_ignore_ascii_case(b"uuml") {
+        Some('ü')
+    } else if entity.eq_ignore_ascii_case(b"agrave") {
+        Some('à')
+    } else if entity.eq_ignore_ascii_case(b"egrave") {
+        Some('è')
+    } else if entity.eq_ignore_ascii_case(b"igrave") {
+        Some('ì')
+    } else if entity.eq_ignore_ascii_case(b"ograve") {
+        Some('ò')
+    } else if entity.eq_ignore_ascii_case(b"ugrave") {
+        Some('ù')
+    } else if entity.eq_ignore_ascii_case(b"ccedil") {
+        Some('ç')
+    } else if entity.eq_ignore_ascii_case(b"iexcl") {
+        Some('¡')
+    } else if entity.eq_ignore_ascii_case(b"iquest") {
+        Some('¿')
+    } else {
+        decode_numeric_entity(entity)
     }
 }
 
@@ -2328,5 +2507,41 @@ mod tests {
                 target_chapter: None
             })
         );
+    }
+
+    #[test]
+    fn sanitize_preserves_utf8_accents() {
+        let mut html_state = HtmlParseState::default();
+        let (sanitized, truncated, tail_start) =
+            sanitize_epub_chunk("salió corazón".as_bytes(), &mut html_state, true);
+        assert_eq!(sanitized.as_str(), "salió corazón");
+        assert!(!truncated);
+        assert_eq!(tail_start, None);
+    }
+
+    #[test]
+    fn stream_chunk_reassembles_split_utf8_codepoint() {
+        let mut src = FakeSdCatalogSource::new();
+        src.set_catalog_entries_from_iter([("Book One", false)]);
+        src.set_catalog_text_chunk_from_bytes(0, b"sali\xc3", false, "OEBPS/chapter.xhtml")
+            .unwrap();
+        src.set_catalog_text_chunk_from_bytes(0, b"\xb3 bien", false, "OEBPS/chapter.xhtml")
+            .unwrap();
+        src.select_text(0).unwrap();
+
+        assert_eq!(src.next_word().unwrap().map(|w| w.text), Some("salió"));
+        assert_eq!(src.next_word().unwrap().map(|w| w.text), Some("bien"));
+    }
+
+    #[test]
+    fn stream_chunk_decodes_typographic_apostrophe_entity() {
+        let mut src = FakeSdCatalogSource::new();
+        src.set_catalog_entries_from_iter([("Book One", false)]);
+        src.set_catalog_text_chunk_from_bytes(0, b"can&rsquo;t stop", false, "OEBPS/chapter.xhtml")
+            .unwrap();
+        src.select_text(0).unwrap();
+
+        assert_eq!(src.next_word().unwrap().map(|w| w.text), Some("can't"));
+        assert_eq!(src.next_word().unwrap().map(|w| w.text), Some("stop"));
     }
 }
