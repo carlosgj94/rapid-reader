@@ -132,6 +132,8 @@ pub enum Screen<'a> {
     },
     Countdown {
         title: &'a str,
+        cover_slot: u16,
+        has_cover: bool,
         wpm: u16,
         remaining: u8,
         style: VisualStyle,

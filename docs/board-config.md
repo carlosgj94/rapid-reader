@@ -25,3 +25,6 @@ This project splits responsibilities as:
 
 ## Pin selection
 `src/bin/main.rs` contains explicit pin constants that can be changed to match actual wiring.
+
+## SD card wiring
+SD card support is disabled in current firmware.

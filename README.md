@@ -46,7 +46,7 @@ Design rule:
 | `CLK` | SPI SCK | `GPIO4` |
 | `DI` | SPI MOSI | `GPIO5` |
 | `CS` | `SCS` | `GPIO6` |
-| `DISP` | display enable | `GPIO7` |
+| `DISP` | display enable | `GPIO21` |
 | `EMD` | `EXTCOMIN` | `GPIO9` |
 | `GND` | ground | `GND` |
 | `3V` | power | `3V3` |
@@ -108,15 +108,14 @@ Note:
 
 ## Current Content Backend
 
-The active source is `FakeSdCatalogSource` (stub) in:
+The active source is the built-in in-memory stub:
 
-`crates/readily-core/src/content/sd_stub.rs`
+`readily_core::content::sd_stub::FakeSdCatalogSource`
 
-It already matches core traits, so replacing it with a real SD implementation is a drop-in change at the app boundary.
+No SD card initialization, probing, or FAT32 catalog loading runs in the current firmware.
 
 ## Near-Term Roadmap
 
-- Real SD text catalog + paragraph/chapter metadata
 - Book cover assets in library cards
 - More navigation affordances for long books
 - Additional motion presets tuned for memory-LCD refresh behavior

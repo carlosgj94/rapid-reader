@@ -1,5 +1,6 @@
 //! Content sources for RSVP rendering.
 
+pub mod epub;
 pub mod sd_stub;
 pub mod static_source;
 mod text_utils;
@@ -16,6 +17,9 @@ pub struct WordToken<'a> {
 pub trait TextCatalog {
     fn title_count(&self) -> u16;
     fn title_at(&self, index: u16) -> Option<&str>;
+    fn has_cover_at(&self, _index: u16) -> bool {
+        false
+    }
 }
 
 /// Abstract source of word tokens.
@@ -36,6 +40,12 @@ pub trait WordSource {
 
     /// Total paragraph count.
     fn paragraph_total(&self) -> u16;
+
+    /// Whether the source has temporarily run out of buffered words but expects
+    /// more data to be loaded.
+    fn is_waiting_for_refill(&self) -> bool {
+        false
+    }
 }
 
 /// Word source that can switch to a selected text from a catalog.
@@ -68,6 +78,17 @@ pub trait NavigationCatalog: WordSource {
 
     /// Chapter metadata by zero-based index.
     fn chapter_at(&self, index: u16) -> Option<ChapterInfo<'_>>;
+
+    /// Current chapter index for the selected text when available.
+    fn current_chapter_index(&self) -> Option<u16> {
+        None
+    }
+
+    /// Request chapter-level seek when source supports it.
+    /// Returns `Ok(true)` when seek request was accepted.
+    fn seek_chapter(&mut self, _chapter_index: u16) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
 
     /// Preview string for a paragraph (zero-based index).
     fn paragraph_preview(&self, paragraph_index: u16) -> Option<&str>;

@@ -1,0 +1,23 @@
+name: Rust
+
+on: [push, pull_request]
+
+jobs:
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ['log', 'defmt-log', '""']
+    steps:
+    - uses: actions/checkout@v1
+    - name: Build
+      run: cargo build --no-default-features --features ${{matrix.features}} --verbose
+    - name: Run Tests
+      run: cargo test --no-default-features --features ${{matrix.features}} --verbose

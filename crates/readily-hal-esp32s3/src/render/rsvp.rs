@@ -9,6 +9,8 @@ use readily_core::render::{
     SettingRowView, SettingValue, VisualStyle,
 };
 
+use crate::network::ConnectivitySnapshot;
+
 use super::{FrameRenderer, book_font};
 
 const SETTINGS_ROWS_VISIBLE: usize = 5;
@@ -17,28 +19,105 @@ const MENU_LIST_TOP: usize = 42;
 const MENU_MARKER_X: usize = 14;
 const MENU_TEXT_X: usize = 30;
 const LIB_MAIN_W: usize = 192;
-const LIB_MAIN_H: usize = 140;
+const LIB_MAIN_H: usize = 192;
 const LIB_SIDE_W: usize = 74;
 const LIB_SIDE_H: usize = 104;
 const SELECTOR_TEXT_BUF: usize = 96;
+const COVER_THUMB_SLOTS: usize = 16;
+const COVER_THUMB_MAX_W: usize = 56;
+const COVER_THUMB_MAX_H: usize = 76;
+const COVER_THUMB_MAX_BYTES: usize = COVER_THUMB_MAX_W.div_ceil(8) * COVER_THUMB_MAX_H;
+
+#[derive(Clone, Copy, Debug)]
+struct CoverThumbSlot {
+    loaded: bool,
+    width: u16,
+    height: u16,
+    bytes: [u8; COVER_THUMB_MAX_BYTES],
+}
+
+impl CoverThumbSlot {
+    const EMPTY: Self = Self {
+        loaded: false,
+        width: 0,
+        height: 0,
+        bytes: [0u8; COVER_THUMB_MAX_BYTES],
+    };
+}
 
 /// Renderer for countdown, RSVP reading, and status screens.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RsvpRenderer {
     orp_anchor_percent: usize,
+    connectivity: ConnectivitySnapshot,
+    cover_thumbs: [CoverThumbSlot; COVER_THUMB_SLOTS],
 }
 
 impl Default for RsvpRenderer {
     fn default() -> Self {
         Self {
             orp_anchor_percent: 45,
+            connectivity: ConnectivitySnapshot::disconnected(),
+            cover_thumbs: [CoverThumbSlot::EMPTY; COVER_THUMB_SLOTS],
         }
     }
 }
 
 impl RsvpRenderer {
     pub const fn new(orp_anchor_percent: usize) -> Self {
-        Self { orp_anchor_percent }
+        Self {
+            orp_anchor_percent,
+            connectivity: ConnectivitySnapshot::disconnected(),
+            cover_thumbs: [CoverThumbSlot::EMPTY; COVER_THUMB_SLOTS],
+        }
+    }
+
+    pub fn set_connectivity(&mut self, connectivity: ConnectivitySnapshot) {
+        self.connectivity = connectivity;
+    }
+
+    pub const fn cover_thumb_target_size() -> (u16, u16) {
+        (COVER_THUMB_MAX_W as u16, COVER_THUMB_MAX_H as u16)
+    }
+
+    pub fn set_cover_thumbnail(
+        &mut self,
+        slot: u16,
+        width: u16,
+        height: u16,
+        bytes: &[u8],
+    ) -> bool {
+        let idx = slot as usize;
+        if idx >= self.cover_thumbs.len() {
+            return false;
+        }
+        if width == 0
+            || height == 0
+            || width as usize > COVER_THUMB_MAX_W
+            || height as usize > COVER_THUMB_MAX_H
+        {
+            return false;
+        }
+
+        let row_bytes = (width as usize).div_ceil(8);
+        let needed = row_bytes.saturating_mul(height as usize);
+        if needed == 0 || needed > self.cover_thumbs[idx].bytes.len() || bytes.len() < needed {
+            return false;
+        }
+
+        let slot_ref = &mut self.cover_thumbs[idx];
+        slot_ref.bytes.fill(0);
+        slot_ref.bytes[..needed].copy_from_slice(&bytes[..needed]);
+        slot_ref.width = width;
+        slot_ref.height = height;
+        slot_ref.loaded = true;
+        true
+    }
+
+    fn cover_thumb(&self, slot: usize) -> Option<&CoverThumbSlot> {
+        self.cover_thumbs
+            .get(slot)
+            .filter(|thumb| thumb.loaded && thumb.width > 0 && thumb.height > 0)
     }
 }
 
@@ -47,7 +126,7 @@ impl FrameRenderer for RsvpRenderer {
         match screen {
             Screen::Library {
                 title: _,
-                subtitle,
+                subtitle: _,
                 items,
                 cursor,
                 style,
@@ -57,11 +136,9 @@ impl FrameRenderer for RsvpRenderer {
                 clear_frame(frame, bg_on);
 
                 let motion = library_motion(animation);
-                // Keep the header static and minimal while list content animates.
-                draw_text(frame, 12, 12, subtitle, 2, fg_on);
-                draw_filled_rect(frame, 12, 34, WIDTH.saturating_sub(24), 1, fg_on);
+                render_library_header(frame, items, cursor, self.connectivity, fg_on);
 
-                draw_library_shelf(frame, items, cursor, fg_on, motion);
+                draw_library_shelf(frame, items, cursor, fg_on, motion, &self.cover_thumbs);
             }
             Screen::Settings {
                 title,
@@ -75,7 +152,7 @@ impl FrameRenderer for RsvpRenderer {
                 let (bg_on, fg_on) = palette(style);
                 clear_frame(frame, bg_on);
                 draw_rect(frame, 0, 0, WIDTH, HEIGHT, fg_on);
-                render_header_text(frame, title, subtitle, fg_on);
+                render_header_text(frame, title, subtitle, self.connectivity, fg_on);
                 draw_settings_rows(frame, rows, cursor, editing, fg_on);
                 let hint = if editing {
                     "Rotate to edit, press done"
@@ -86,6 +163,8 @@ impl FrameRenderer for RsvpRenderer {
             }
             Screen::Countdown {
                 title,
+                cover_slot,
+                has_cover,
                 wpm,
                 remaining,
                 style,
@@ -94,8 +173,17 @@ impl FrameRenderer for RsvpRenderer {
                 let (bg_on, fg_on) = palette(style);
                 clear_frame(frame, bg_on);
                 draw_rect(frame, 0, 0, WIDTH, HEIGHT, fg_on);
-                render_header_wpm(frame, title, wpm, fg_on);
-                draw_countdown_stage(frame, remaining, animation, fg_on);
+                render_header_wpm(frame, title, wpm, self.connectivity, fg_on);
+                draw_countdown_stage(
+                    frame,
+                    title,
+                    cover_slot,
+                    has_cover,
+                    self.cover_thumb(cover_slot as usize),
+                    remaining,
+                    animation,
+                    fg_on,
+                );
             }
             Screen::Reading {
                 title,
@@ -112,7 +200,7 @@ impl FrameRenderer for RsvpRenderer {
                 let (bg_on, fg_on) = palette(style);
                 clear_frame(frame, bg_on);
                 draw_rect(frame, 0, 0, WIDTH, HEIGHT, fg_on);
-                render_header_wpm_custom(frame, title, wpm, 2, 1, fg_on);
+                render_header_wpm_custom(frame, title, wpm, 2, 1, self.connectivity, fg_on);
 
                 let (use_serif, word_scale, stride) = match style.font_family {
                     FontFamily::Serif => {
@@ -164,7 +252,7 @@ impl FrameRenderer for RsvpRenderer {
                 let (bg_on, fg_on) = palette(style);
                 clear_frame(frame, bg_on);
                 draw_rect(frame, 0, 0, WIDTH, HEIGHT, fg_on);
-                render_header_wpm(frame, title, wpm, fg_on);
+                render_header_wpm(frame, title, wpm, self.connectivity, fg_on);
                 draw_navigation_selector(
                     frame,
                     NavigationSelectorSpec {
@@ -203,7 +291,7 @@ impl FrameRenderer for RsvpRenderer {
                 let (bg_on, fg_on) = palette(style);
                 clear_frame(frame, bg_on);
                 draw_rect(frame, 0, 0, WIDTH, HEIGHT, fg_on);
-                render_header_wpm(frame, title, wpm, fg_on);
+                render_header_wpm(frame, title, wpm, self.connectivity, fg_on);
                 draw_navigation_selector(
                     frame,
                     NavigationSelectorSpec {
@@ -231,7 +319,7 @@ impl FrameRenderer for RsvpRenderer {
                 let (bg_on, fg_on) = palette(style);
                 clear_frame(frame, bg_on);
                 draw_rect(frame, 0, 0, WIDTH, HEIGHT, fg_on);
-                render_header_wpm(frame, title, wpm, fg_on);
+                render_header_wpm(frame, title, wpm, self.connectivity, fg_on);
                 draw_text(frame, 12, 84, line1, 2, fg_on);
                 draw_text(frame, 12, 120, line2, 2, fg_on);
                 draw_paragraph_progress(frame, 0, 1, fg_on);
@@ -252,8 +340,43 @@ fn palette(style: VisualStyle) -> (bool, bool) {
     }
 }
 
-fn render_header_wpm(frame: &mut FrameBuffer, title: &str, wpm: u16, on: bool) {
-    render_header_wpm_custom(frame, title, wpm, 2, 2, on);
+const WIFI_ICON_SIZE: usize = 14;
+const WIFI_ICON_RIGHT_PAD: usize = 12;
+const WIFI_ICON_TEXT_GAP: usize = 8;
+
+fn wifi_icon_xy() -> (usize, usize) {
+    (
+        WIDTH.saturating_sub(WIFI_ICON_RIGHT_PAD + WIFI_ICON_SIZE),
+        11,
+    )
+}
+
+fn header_right_text_x(right_width: usize) -> usize {
+    let (icon_x, _) = wifi_icon_xy();
+    let anchor = icon_x.saturating_sub(WIFI_ICON_TEXT_GAP);
+    anchor.saturating_sub(right_width)
+}
+
+fn draw_header_wifi_icon(frame: &mut FrameBuffer, connectivity: ConnectivitySnapshot, on: bool) {
+    let (x, y) = wifi_icon_xy();
+    draw_wifi_icon(
+        frame,
+        x,
+        y,
+        WIFI_ICON_SIZE,
+        connectivity.icon_connected(),
+        on,
+    );
+}
+
+fn render_header_wpm(
+    frame: &mut FrameBuffer,
+    title: &str,
+    wpm: u16,
+    connectivity: ConnectivitySnapshot,
+    on: bool,
+) {
+    render_header_wpm_custom(frame, title, wpm, 2, 2, connectivity, on);
 }
 
 fn render_header_wpm_custom(
@@ -262,6 +385,7 @@ fn render_header_wpm_custom(
     wpm: u16,
     title_scale: usize,
     wpm_scale: usize,
+    connectivity: ConnectivitySnapshot,
     on: bool,
 ) {
     draw_text(frame, 12, 12, title, title_scale, on);
@@ -269,13 +393,20 @@ fn render_header_wpm_custom(
     let mut wpm_buf = [0u8; 16];
     let wpm_label = wpm_label(wpm, &mut wpm_buf);
     let right_width = text_pixel_width(wpm_label, wpm_scale);
-    let right_x = WIDTH.saturating_sub(12 + right_width);
+    let right_x = header_right_text_x(right_width);
     let wpm_y = if wpm_scale < title_scale { 14 } else { 12 };
     draw_text(frame, right_x, wpm_y, wpm_label, wpm_scale, on);
+    draw_header_wifi_icon(frame, connectivity, on);
 }
 
-fn render_header_text(frame: &mut FrameBuffer, title: &str, right: &str, on: bool) {
-    render_header_text_scaled(frame, title, right, 2, on);
+fn render_header_text(
+    frame: &mut FrameBuffer,
+    title: &str,
+    right: &str,
+    connectivity: ConnectivitySnapshot,
+    on: bool,
+) {
+    render_header_text_scaled(frame, title, right, 2, connectivity, on);
 }
 
 fn render_header_text_scaled(
@@ -283,52 +414,104 @@ fn render_header_text_scaled(
     title: &str,
     right: &str,
     scale: usize,
+    connectivity: ConnectivitySnapshot,
     on: bool,
 ) {
-    render_header_text_scaled_offset(frame, title, right, scale, on, 0, 0);
-}
-
-fn render_header_text_scaled_offset(
-    frame: &mut FrameBuffer,
-    title: &str,
-    right: &str,
-    scale: usize,
-    on: bool,
-    dx: isize,
-    dy: isize,
-) {
-    draw_text(
-        frame,
-        offset_pos(12, dx),
-        offset_pos(12, dy),
-        title,
-        scale,
-        on,
-    );
+    draw_text(frame, 12, 12, title, scale, on);
     let right_width = text_pixel_width(right, scale);
-    let right_x = WIDTH.saturating_sub(12 + right_width);
-    draw_text(
-        frame,
-        offset_pos(right_x, dx),
-        offset_pos(12, dy),
-        right,
-        scale,
-        on,
-    );
+    let right_x = header_right_text_x(right_width);
+    draw_text(frame, right_x, 12, right, scale, on);
+    draw_header_wifi_icon(frame, connectivity, on);
 }
 
+fn render_library_header(
+    frame: &mut FrameBuffer,
+    items: &[MenuItemView<'_>],
+    cursor: usize,
+    connectivity: ConnectivitySnapshot,
+    on: bool,
+) {
+    let selected = items
+        .get(cursor.min(items.len().saturating_sub(1)))
+        .map(|item| item.label)
+        .unwrap_or("Library");
+    let mut title_buf = [0u8; SELECTOR_TEXT_BUF];
+    let title_max_w = header_right_text_x(0).saturating_sub(12);
+    let title_fit = fit_text_in_width(selected, title_max_w, 2, &mut title_buf);
+
+    draw_text(frame, 12, 12, title_fit, 2, on);
+    draw_filled_rect(frame, 12, 34, WIDTH.saturating_sub(24), 1, on);
+    draw_header_wifi_icon(frame, connectivity, on);
+}
+
+fn draw_wifi_icon(
+    frame: &mut FrameBuffer,
+    x: usize,
+    y: usize,
+    size: usize,
+    connected: bool,
+    on: bool,
+) {
+    let s = icon_scale(size);
+
+    // Dot
+    draw_filled_rect(frame, x + 7 * s, y + 12 * s, 2 * s, 2 * s, on);
+
+    // Inner arc
+    draw_filled_rect(frame, x + 5 * s, y + 10 * s, 6 * s, s, on);
+    draw_filled_rect(frame, x + 4 * s, y + 9 * s, s, s, on);
+    draw_filled_rect(frame, x + 11 * s, y + 9 * s, s, s, on);
+
+    // Middle arc
+    draw_filled_rect(frame, x + 3 * s, y + 7 * s, 10 * s, s, on);
+    draw_filled_rect(frame, x + 2 * s, y + 6 * s, s, s, on);
+    draw_filled_rect(frame, x + 13 * s, y + 6 * s, s, s, on);
+
+    // Outer arc
+    draw_filled_rect(frame, x + s, y + 4 * s, 14 * s, s, on);
+    draw_filled_rect(frame, x, y + 3 * s, s, s, on);
+    draw_filled_rect(frame, x + 15 * s, y + 3 * s, s, s, on);
+
+    if !connected {
+        // Connection cut slash.
+        for i in 0..=(13 * s) {
+            let px = x + i;
+            let py = y + i;
+            set_pixel(frame, px, py, on);
+            set_pixel(frame, px, py.saturating_add(1), on);
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "countdown rendering keeps params explicit to avoid heap-backed structs in hot path"
+)]
 fn draw_countdown_stage(
     frame: &mut FrameBuffer,
+    title: &str,
+    cover_slot: u16,
+    has_cover: bool,
+    cover_thumb: Option<&CoverThumbSlot>,
     remaining: u8,
     animation: Option<AnimationFrame>,
     on: bool,
 ) {
     let pulse = countdown_pulse_px(animation);
-    draw_text_centered(frame, 48, "GET READY", 2, on);
+    draw_text_centered(frame, 42, "GET READY", 2, on);
 
-    let cx = (WIDTH / 2) as isize;
+    let wide_layout = WIDTH >= 320;
+    if wide_layout {
+        draw_countdown_cover_card(frame, title, cover_slot, has_cover, cover_thumb, on);
+    }
+
+    let cx = if wide_layout {
+        WIDTH.saturating_sub(102) as isize
+    } else {
+        (WIDTH / 2) as isize
+    };
     let cy = 108isize;
-    let outer = 42isize + pulse as isize;
+    let outer = if wide_layout { 38isize } else { 42isize } + pulse as isize;
     let inner = (outer - 7).max(10);
     draw_ring(frame, cx, cy, outer, inner, on);
 
@@ -339,18 +522,98 @@ fn draw_countdown_stage(
         3 => "3",
         _ => "3",
     };
-    draw_text_centered(frame, 84, countdown_text, 8, on);
+    let count_scale = 8usize;
+    let count_width = text_pixel_width(countdown_text, count_scale);
+    let center_x = cx.max(0) as usize;
+    let count_x = center_x.saturating_sub(count_width / 2);
+    draw_text(frame, count_x, 84, countdown_text, count_scale, on);
 
-    draw_countdown_ticks(frame, remaining, on);
+    draw_countdown_ticks(frame, remaining, center_x, on);
 }
 
-fn draw_countdown_ticks(frame: &mut FrameBuffer, remaining: u8, on: bool) {
+fn draw_countdown_cover_card(
+    frame: &mut FrameBuffer,
+    title: &str,
+    cover_slot: u16,
+    has_cover: bool,
+    cover_thumb: Option<&CoverThumbSlot>,
+    on: bool,
+) {
+    let card_w = 116usize;
+    let card_h = 150usize;
+    let x = 18usize;
+    let y = 56usize;
+
+    draw_rect(frame, x, y, card_w, card_h, on);
+    if card_w > 4 && card_h > 4 {
+        draw_rect(frame, x + 2, y + 2, card_w - 4, card_h - 4, on);
+    }
+
+    if card_h > 10 {
+        draw_filled_rect(frame, x + 5, y + 6, 2, card_h - 12, on);
+    }
+    for i in 0..4usize {
+        let mark_y = y + 18 + i * 16;
+        if mark_y + 2 < y + card_h {
+            draw_filled_rect(frame, x + 4, mark_y, 4, 2, on);
+        }
+    }
+
+    let icon_x = x + 10;
+    let icon_y = y + 10;
+    let icon_w = card_w.saturating_sub(20);
+    let icon_h = card_h.saturating_sub(42);
+    let icon_size = core::cmp::min(icon_w, icon_h).saturating_mul(90) / 100;
+    let drew_thumb = cover_thumb.is_some_and(|thumb| {
+        draw_cover_thumbnail_in_box(frame, icon_x, icon_y, icon_w, icon_h, thumb, on)
+    });
+    if !drew_thumb {
+        let item = MenuItemView {
+            label: title,
+            kind: MenuItemKind::Text,
+        };
+        let symbol = if has_cover {
+            cover_symbol(cover_slot as usize, item)
+        } else {
+            "📘"
+        };
+        draw_cover_symbol_in_box(
+            frame,
+            CoverSymbolSpec {
+                x: icon_x,
+                y: icon_y,
+                w: icon_w,
+                h: icon_h,
+                symbol,
+                icon_size,
+            },
+            on,
+        );
+    }
+
+    let mut title_buf = [0u8; SELECTOR_TEXT_BUF];
+    let title_fit = fit_text_in_width(title, card_w.saturating_sub(16), 1, &mut title_buf);
+    draw_text_centered_in_box(
+        frame,
+        BoxTextSpec {
+            x: x + 8,
+            y: y + card_h.saturating_sub(24),
+            w: card_w.saturating_sub(16),
+            h: 14,
+            text: title_fit,
+            scale: 1,
+        },
+        on,
+    );
+}
+
+fn draw_countdown_ticks(frame: &mut FrameBuffer, remaining: u8, center_x: usize, on: bool) {
     let total = 3usize;
     let lit = remaining.min(total as u8) as usize;
     let dot = 8usize;
     let gap = 10usize;
     let block_w = total * dot + (total - 1) * gap;
-    let start_x = WIDTH.saturating_sub(block_w) / 2;
+    let start_x = center_x.saturating_sub(block_w / 2);
     let y = HEIGHT.saturating_sub(56);
 
     for i in 0..total {
@@ -1043,6 +1306,7 @@ fn draw_library_shelf(
     cursor: usize,
     on: bool,
     motion: LibraryMotion,
+    cover_thumbs: &[CoverThumbSlot; COVER_THUMB_SLOTS],
 ) {
     if items.is_empty() {
         draw_text_centered(frame, 118, "No titles", 3, on);
@@ -1051,7 +1315,7 @@ fn draw_library_shelf(
 
     let cursor = cursor.min(items.len().saturating_sub(1));
     let main_x = offset_pos((WIDTH.saturating_sub(LIB_MAIN_W)) / 2, motion.list_dx);
-    let main_y = offset_pos(58, motion.list_dy);
+    let main_y = offset_pos(38, motion.list_dy);
     let main_x = clamp_cover_x(offset_pos(main_x, motion.selected_nudge / 2), LIB_MAIN_W, 8);
 
     let side_y = main_y + (LIB_MAIN_H.saturating_sub(LIB_SIDE_H)) / 2;
@@ -1076,6 +1340,9 @@ fn draw_library_shelf(
                 item_index: cursor - 1,
                 item: items[cursor - 1],
                 selected: false,
+                cover_thumb: cover_thumbs
+                    .get(cursor - 1)
+                    .filter(|thumb| thumb.loaded && thumb.width > 0 && thumb.height > 0),
             },
             on,
         );
@@ -1092,6 +1359,9 @@ fn draw_library_shelf(
                 item_index: cursor + 1,
                 item: items[cursor + 1],
                 selected: false,
+                cover_thumb: cover_thumbs
+                    .get(cursor + 1)
+                    .filter(|thumb| thumb.loaded && thumb.width > 0 && thumb.height > 0),
             },
             on,
         );
@@ -1107,12 +1377,12 @@ fn draw_library_shelf(
             item_index: cursor,
             item: items[cursor],
             selected: true,
+            cover_thumb: cover_thumbs
+                .get(cursor)
+                .filter(|thumb| thumb.loaded && thumb.width > 0 && thumb.height > 0),
         },
         on,
     );
-
-    let label_y = main_y + LIB_MAIN_H + 10;
-    draw_text_centered(frame, label_y, items[cursor].label, 2, on);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1124,6 +1394,7 @@ struct CoverCardSpec<'a> {
     item_index: usize,
     item: MenuItemView<'a>,
     selected: bool,
+    cover_thumb: Option<&'a CoverThumbSlot>,
 }
 
 fn draw_cover_card(frame: &mut FrameBuffer, spec: CoverCardSpec<'_>, on: bool) {
@@ -1150,39 +1421,39 @@ fn draw_cover_card(frame: &mut FrameBuffer, spec: CoverCardSpec<'_>, on: bool) {
     }
 
     let symbol = cover_symbol(spec.item_index, spec.item);
-    let icon_box_w = w.saturating_sub(20);
-    let icon_box_h = h.saturating_sub(24);
+    let icon_box_w = w.saturating_sub(12);
+    let icon_box_h = h.saturating_sub(10);
     let icon_limit = core::cmp::min(icon_box_w, icon_box_h);
     let icon_size = if spec.selected {
         icon_limit.saturating_mul(95) / 100
     } else {
         icon_limit.saturating_mul(90) / 100
     };
-    draw_cover_symbol_in_box(
-        frame,
-        CoverSymbolSpec {
-            x: x + 10,
-            y: y + 8,
-            w: w.saturating_sub(20),
-            h: h.saturating_sub(24),
-            symbol,
-            icon_size,
-        },
-        on,
-    );
-
-    draw_text_centered_in_box(
-        frame,
-        BoxTextSpec {
-            x: x + 10,
-            y: y + h.saturating_sub(14),
-            w: w.saturating_sub(20),
-            h: 10,
-            text: menu_kind_label(spec.item.kind),
-            scale: 1,
-        },
-        on,
-    );
+    let drew_thumb = spec.cover_thumb.is_some_and(|thumb| {
+        draw_cover_thumbnail_in_box(
+            frame,
+            x + 7,
+            y + 4,
+            w.saturating_sub(12),
+            h.saturating_sub(8),
+            thumb,
+            on,
+        )
+    });
+    if !drew_thumb {
+        draw_cover_symbol_in_box(
+            frame,
+            CoverSymbolSpec {
+                x: x + 7,
+                y: y + 4,
+                w: w.saturating_sub(12),
+                h: h.saturating_sub(8),
+                symbol,
+                icon_size,
+            },
+            on,
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1256,6 +1527,61 @@ fn draw_cover_symbol_in_box(frame: &mut FrameBuffer, spec: CoverSymbolSpec<'_>, 
             );
         }
     }
+}
+
+fn draw_cover_thumbnail_in_box(
+    frame: &mut FrameBuffer,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    thumb: &CoverThumbSlot,
+    on: bool,
+) -> bool {
+    if w == 0 || h == 0 || !thumb.loaded || thumb.width == 0 || thumb.height == 0 {
+        return false;
+    }
+
+    let src_w = thumb.width as usize;
+    let src_h = thumb.height as usize;
+    if src_w == 0 || src_h == 0 {
+        return false;
+    }
+
+    let mut draw_w = w;
+    let mut draw_h = (draw_w.saturating_mul(src_h)).max(1) / src_w.max(1);
+    if draw_h == 0 {
+        draw_h = 1;
+    }
+    if draw_h > h {
+        draw_h = h;
+        draw_w = (draw_h.saturating_mul(src_w)).max(1) / src_h.max(1);
+        if draw_w == 0 {
+            draw_w = 1;
+        }
+    }
+    draw_w = draw_w.max(1).min(w);
+    draw_h = draw_h.max(1).min(h);
+
+    let origin_x = x + (w.saturating_sub(draw_w) / 2);
+    let origin_y = y + (h.saturating_sub(draw_h) / 2);
+    let src_row_bytes = src_w.div_ceil(8);
+    for dy in 0..draw_h {
+        let sy = dy.saturating_mul(src_h) / draw_h;
+        for dx in 0..draw_w {
+            let sx = dx.saturating_mul(src_w) / draw_w;
+            let src_idx = sy.saturating_mul(src_row_bytes).saturating_add(sx / 8);
+            if src_idx >= thumb.bytes.len() {
+                continue;
+            }
+            let src_mask = 1u8 << (7 - (sx % 8));
+            if (thumb.bytes[src_idx] & src_mask) != 0 {
+                let _ = frame.set_pixel(origin_x + dx, origin_y + dy, on);
+            }
+        }
+    }
+
+    true
 }
 
 fn draw_icon_book(frame: &mut FrameBuffer, x: usize, y: usize, size: usize, on: bool) {
@@ -1528,13 +1854,6 @@ fn draw_disk(frame: &mut FrameBuffer, cx: isize, cy: isize, r: isize, on: bool) 
     }
 }
 
-fn menu_kind_label(kind: MenuItemKind) -> &'static str {
-    match kind {
-        MenuItemKind::Text => "BOOK",
-        MenuItemKind::Settings => "SET",
-    }
-}
-
 fn clamp_cover_x(x: usize, width: usize, pad: usize) -> usize {
     let min_x = pad;
     let max_x = WIDTH.saturating_sub(width + pad);
@@ -1667,7 +1986,7 @@ fn library_motion(animation: Option<AnimationFrame>) -> LibraryMotion {
 
     let remaining = (100u8.saturating_sub(animation.progress_pct)) as isize;
     let slide = (remaining * 34) / 100;
-    let lift = (remaining * 14) / 100;
+    let lift = (remaining * 10) / 100;
     let nudge = (remaining * 10) / 100;
 
     match animation.kind {

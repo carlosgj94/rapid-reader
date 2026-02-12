@@ -5,4 +5,5 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-
+heapless = "0.8.0"
+log = "0.4.27"

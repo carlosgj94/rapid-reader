@@ -6,9 +6,13 @@ rust-version = "1.88"
 
 [dependencies]
 embedded-hal = "1.0.0"
+heapless = "0.8.0"
 ls027b7dh01 = { path = "../ls027b7dh01" }
 readily-core = { path = "../readily-core" }
 embedded-storage = "0.3.1"
+embedded-sdmmc = "0.8.1"
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
 esp-hal = { version = "~1.0", features = ["esp32s3", "unstable"] }
 esp-rom-sys = "0.1.3"
+miniz_oxide = { version = "0.8.9", default-features = false }
+log = "0.4.27"

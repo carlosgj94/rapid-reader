@@ -2,6 +2,8 @@
 
 use core::str;
 
+use log::debug;
+
 use crate::{
     content::{
         NavigationCatalog, ParagraphNavigator, SelectableWordSource, TextCatalog, WordSource,
@@ -117,6 +119,7 @@ impl SettingsRow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdvanceWordResult {
     Advanced,
+    AwaitingRefill,
     EndOfText,
 }
 
@@ -229,8 +232,20 @@ where
                 let mut items = [MenuItemView::default(); MAX_LIBRARY_ITEMS];
                 let mut count = 0usize;
 
-                let titles_to_show = self.visible_title_count();
-                for idx in 0..titles_to_show {
+                let total_titles = self.total_title_count() as usize;
+                let visible_slots = MAX_LIBRARY_ITEMS.saturating_sub(1);
+                let selected_cursor = cursor as usize;
+                let selected_book = selected_cursor.min(total_titles.saturating_sub(1));
+                let window_start = if total_titles <= visible_slots {
+                    0
+                } else {
+                    selected_book
+                        .saturating_sub(visible_slots / 2)
+                        .min(total_titles.saturating_sub(visible_slots))
+                };
+                let window_end = core::cmp::min(total_titles, window_start + visible_slots);
+
+                for idx in window_start..window_end {
                     let label = self.content.title_at(idx as u16).unwrap_or("Untitled");
                     items[count] = MenuItemView {
                         label,
@@ -245,7 +260,14 @@ where
                 };
                 count += 1;
 
-                let cursor = (cursor as usize).min(count.saturating_sub(1));
+                let settings_cursor = self.settings_item_index();
+                let cursor = if cursor == settings_cursor {
+                    count.saturating_sub(1)
+                } else {
+                    selected_book
+                        .saturating_sub(window_start)
+                        .min(count.saturating_sub(1))
+                };
                 f(Screen::Library {
                     title: self.app_title,
                     subtitle: "Library",
@@ -297,6 +319,8 @@ where
                 let title = self.content.title_at(selected_book).unwrap_or("Untitled");
                 f(Screen::Countdown {
                     title,
+                    cover_slot: selected_book,
+                    has_cover: self.content.has_cover_at(selected_book),
                     wpm: self.config.wpm,
                     remaining,
                     style: self.style,
@@ -315,7 +339,7 @@ where
                     0
                 };
                 let current_paragraph = self.content.paragraph_index().saturating_sub(1);
-                let current_chapter = self.chapter_for_paragraph(current_paragraph);
+                let current_chapter = self.current_chapter_index();
                 let chapter_label_raw = self
                     .content
                     .chapter_at(current_chapter)
@@ -352,8 +376,7 @@ where
                 let title = self.content.title_at(selected_book).unwrap_or("Untitled");
                 let chapter_total = self.content.chapter_count().max(1);
                 let chapter_cursor = chapter_cursor.min(chapter_total.saturating_sub(1));
-                let current_paragraph = self.content.paragraph_index().saturating_sub(1);
-                let current_chapter = self.chapter_for_paragraph(current_paragraph);
+                let current_chapter = self.current_chapter_index();
 
                 let current_label_raw = self
                     .content
@@ -487,6 +510,13 @@ where
                 });
             }
         }
+    }
+
+    pub fn with_content_mut<R, F>(&mut self, f: F) -> R
+    where
+        F: FnOnce(&mut WS) -> R,
+    {
+        f(&mut self.content)
     }
 
     pub fn drain_word_updates(&mut self) -> u32 {
@@ -698,9 +728,16 @@ where
             InputEvent::RotateCw => {
                 if paused {
                     let chapter_total = self.content.chapter_count().max(1);
-                    let current_paragraph = self.content.paragraph_index().saturating_sub(1);
-                    let current_chapter = self.chapter_for_paragraph(current_paragraph);
+                    let current_chapter = self.current_chapter_index();
                     let next_chapter = rotate_cw(current_chapter, chapter_total);
+                    debug!(
+                        "ui-nav: paused rotate_cw selected_book={} current_chapter={}/{} next_chapter={}/{}",
+                        selected_book,
+                        current_chapter.saturating_add(1),
+                        chapter_total,
+                        next_chapter.saturating_add(1),
+                        chapter_total
+                    );
                     self.enter_chapter_navigation(selected_book, next_chapter, now_ms);
                     return;
                 }
@@ -717,9 +754,16 @@ where
             InputEvent::RotateCcw => {
                 if paused {
                     let chapter_total = self.content.chapter_count().max(1);
-                    let current_paragraph = self.content.paragraph_index().saturating_sub(1);
-                    let current_chapter = self.chapter_for_paragraph(current_paragraph);
+                    let current_chapter = self.current_chapter_index();
                     let next_chapter = rotate_ccw(current_chapter, chapter_total);
+                    debug!(
+                        "ui-nav: paused rotate_ccw selected_book={} current_chapter={}/{} next_chapter={}/{}",
+                        selected_book,
+                        current_chapter.saturating_add(1),
+                        chapter_total,
+                        next_chapter.saturating_add(1),
+                        chapter_total
+                    );
                     self.enter_chapter_navigation(selected_book, next_chapter, now_ms);
                     return;
                 }
@@ -749,6 +793,14 @@ where
         match event {
             InputEvent::RotateCw => {
                 let next = rotate_cw(chapter_cursor, chapter_total);
+                debug!(
+                    "ui-nav: chapter rotate_cw selected_book={} chapter_cursor={}/{} -> {}/{}",
+                    selected_book,
+                    chapter_cursor.saturating_add(1),
+                    chapter_total,
+                    next.saturating_add(1),
+                    chapter_total
+                );
                 self.ui = UiState::NavigateChapter {
                     selected_book,
                     chapter_cursor: next,
@@ -758,6 +810,14 @@ where
             }
             InputEvent::RotateCcw => {
                 let next = rotate_ccw(chapter_cursor, chapter_total);
+                debug!(
+                    "ui-nav: chapter rotate_ccw selected_book={} chapter_cursor={}/{} -> {}/{}",
+                    selected_book,
+                    chapter_cursor.saturating_add(1),
+                    chapter_total,
+                    next.saturating_add(1),
+                    chapter_total
+                );
                 self.ui = UiState::NavigateChapter {
                     selected_book,
                     chapter_cursor: next,
@@ -781,6 +841,63 @@ where
                 } else {
                     chapter_start
                 };
+
+                debug!(
+                    "ui-nav: chapter press selected_book={} chapter_cursor={}/{} label={:?} start_paragraph={} paragraph_count={} current_paragraph={} initial_cursor={}",
+                    selected_book,
+                    chapter_cursor.saturating_add(1),
+                    chapter_total,
+                    chapter.label,
+                    chapter_start,
+                    chapter.paragraph_count,
+                    current_paragraph,
+                    initial_cursor
+                );
+
+                match self.content.seek_chapter(chapter_cursor) {
+                    Ok(true) => {
+                        debug!(
+                            "ui-nav: chapter press seek accepted selected_book={} chapter_cursor={}/{} -> direct-reading",
+                            selected_book,
+                            chapter_cursor.saturating_add(1),
+                            chapter_total
+                        );
+                        self.word_buffer.clear();
+                        self.paragraph_word_index = 0;
+                        self.paragraph_word_total = 1;
+                        self.last_ends_clause = false;
+                        self.last_ends_sentence = false;
+                        let _ = self.advance_word();
+                        self.ui = UiState::Reading {
+                            selected_book,
+                            paused: true,
+                            next_word_ms: now_ms,
+                        };
+                        self.paused_since_ms = Some(now_ms);
+                        self.last_pause_anim_slot = None;
+                        self.start_transition(AnimationKind::SlideRight, now_ms, ANIM_NAV_MS);
+                        self.pending_redraw = true;
+                        return;
+                    }
+                    Ok(false) => {
+                        debug!(
+                            "ui-nav: chapter press seek unsupported selected_book={} chapter_cursor={}/{} -> paragraph-navigation",
+                            selected_book,
+                            chapter_cursor.saturating_add(1),
+                            chapter_total
+                        );
+                    }
+                    Err(_) => {
+                        debug!(
+                            "ui-nav: chapter press seek failed selected_book={} chapter_cursor={}/{}",
+                            selected_book,
+                            chapter_cursor.saturating_add(1),
+                            chapter_total
+                        );
+                        self.set_status("NAVIGATION ERROR", "CHAPTER SEEK FAILED", now_ms);
+                        return;
+                    }
+                }
 
                 self.enter_paragraph_navigation(
                     selected_book,
@@ -814,6 +931,15 @@ where
             InputEvent::RotateCw => {
                 let rel = paragraph_cursor.saturating_sub(chapter_start);
                 let next_rel = rotate_cw(rel, chapter_total);
+                debug!(
+                    "ui-nav: paragraph rotate_cw selected_book={} chapter_index={} cursor={} rel={}/{} -> rel={}",
+                    selected_book,
+                    chapter_index.saturating_add(1),
+                    paragraph_cursor,
+                    rel.saturating_add(1),
+                    chapter_total,
+                    next_rel.saturating_add(1)
+                );
                 self.ui = UiState::NavigateParagraph {
                     selected_book,
                     chapter_index,
@@ -825,6 +951,15 @@ where
             InputEvent::RotateCcw => {
                 let rel = paragraph_cursor.saturating_sub(chapter_start);
                 let next_rel = rotate_ccw(rel, chapter_total);
+                debug!(
+                    "ui-nav: paragraph rotate_ccw selected_book={} chapter_index={} cursor={} rel={}/{} -> rel={}",
+                    selected_book,
+                    chapter_index.saturating_add(1),
+                    paragraph_cursor,
+                    rel.saturating_add(1),
+                    chapter_total,
+                    next_rel.saturating_add(1)
+                );
                 self.ui = UiState::NavigateParagraph {
                     selected_book,
                     chapter_index,
@@ -834,6 +969,12 @@ where
                 self.pending_redraw = true;
             }
             InputEvent::Press => {
+                debug!(
+                    "ui-nav: paragraph press selected_book={} chapter_index={} target_paragraph={}",
+                    selected_book,
+                    chapter_index.saturating_add(1),
+                    paragraph_cursor
+                );
                 self.apply_navigation_confirm(selected_book, paragraph_cursor, now_ms)
             }
         }
@@ -912,6 +1053,15 @@ where
                     self.words_since_drain = self.words_since_drain.saturating_add(1);
                     return TickResult::RenderRequested;
                 }
+                Ok(AdvanceWordResult::AwaitingRefill) => {
+                    self.ui = UiState::Reading {
+                        selected_book,
+                        paused: false,
+                        next_word_ms: now_ms + 40,
+                    };
+                    self.pending_redraw = false;
+                    return TickResult::NoRender;
+                }
                 Ok(AdvanceWordResult::EndOfText) => {
                     self.enter_library(selected_book, now_ms);
                     self.pending_redraw = false;
@@ -946,7 +1096,13 @@ where
                 self.paragraph_word_total = total.max(1);
                 Ok(AdvanceWordResult::Advanced)
             }
-            Ok(None) => Ok(AdvanceWordResult::EndOfText),
+            Ok(None) => {
+                if self.content.is_waiting_for_refill() {
+                    Ok(AdvanceWordResult::AwaitingRefill)
+                } else {
+                    Ok(AdvanceWordResult::EndOfText)
+                }
+            }
             Err(_) => Err(()),
         }
     }
@@ -1065,6 +1221,12 @@ where
         self.last_reading_press_ms = None;
         self.last_pause_anim_slot = None;
         let chapter_total = self.content.chapter_count().max(1);
+        debug!(
+            "ui-nav: enter chapter navigation selected_book={} chapter_cursor={}/{}",
+            selected_book,
+            chapter_cursor.saturating_add(1),
+            chapter_total
+        );
         self.ui = UiState::NavigateChapter {
             selected_book,
             chapter_cursor: chapter_cursor.min(chapter_total.saturating_sub(1)),
@@ -1087,6 +1249,15 @@ where
 
         let chapter_start = chapter.start_paragraph;
         let chapter_end = chapter_start.saturating_add(chapter.paragraph_count.saturating_sub(1));
+        debug!(
+            "ui-nav: enter paragraph navigation selected_book={} chapter_index={} label={:?} chapter_start={} chapter_end={} requested_cursor={}",
+            selected_book,
+            chapter_index.saturating_add(1),
+            chapter.label,
+            chapter_start,
+            chapter_end,
+            paragraph_cursor
+        );
 
         self.ui = UiState::NavigateParagraph {
             selected_book,
@@ -1098,10 +1269,31 @@ where
     }
 
     fn apply_navigation_confirm(&mut self, selected_book: u16, target_paragraph: u16, now_ms: u64) {
+        debug!(
+            "ui-nav: confirm selected_book={} target_paragraph={}",
+            selected_book, target_paragraph
+        );
         if self.content.seek_paragraph(target_paragraph).is_err() {
+            debug!(
+                "ui-nav: confirm failed selected_book={} target_paragraph={} status=invalid_paragraph",
+                selected_book, target_paragraph
+            );
             self.set_status("NAVIGATION ERROR", "PARAGRAPH INVALID", now_ms);
             return;
         }
+        debug!(
+            "ui-nav: confirm applied selected_book={} target_paragraph={} paragraph_index={} paragraph_total={} chapter={}/{} chapter_label={:?} preview={:?}",
+            selected_book,
+            target_paragraph,
+            self.content.paragraph_index(),
+            self.content.paragraph_total(),
+            self.current_chapter_index().saturating_add(1),
+            self.content.chapter_count().max(1),
+            self.content
+                .chapter_at(self.current_chapter_index())
+                .map(|chapter| chapter.label),
+            self.content.paragraph_preview(target_paragraph)
+        );
 
         self.word_buffer.clear();
         self.paragraph_word_index = 0;
@@ -1137,16 +1329,16 @@ where
         self.transition.and_then(|anim| anim.frame(now_ms))
     }
 
-    fn visible_title_count(&self) -> usize {
-        (self.content.title_count() as usize).min(MAX_LIBRARY_ITEMS.saturating_sub(1))
+    fn total_title_count(&self) -> u16 {
+        self.content.title_count()
     }
 
     fn library_item_count(&self) -> u16 {
-        self.visible_title_count() as u16 + 1
+        self.total_title_count().saturating_add(1)
     }
 
     fn settings_item_index(&self) -> u16 {
-        self.visible_title_count() as u16
+        self.total_title_count()
     }
 
     fn chapter_for_paragraph(&self, paragraph_index: u16) -> u16 {
@@ -1163,6 +1355,15 @@ where
         }
 
         0
+    }
+
+    fn current_chapter_index(&self) -> u16 {
+        if let Some(index) = self.content.current_chapter_index() {
+            return index.min(self.content.chapter_count().saturating_sub(1));
+        }
+
+        let current_paragraph = self.content.paragraph_index().saturating_sub(1);
+        self.chapter_for_paragraph(current_paragraph)
     }
 }
 
