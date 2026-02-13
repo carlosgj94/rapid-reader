@@ -5,7 +5,10 @@ use heapless::{String as HeaplessString, Vec as HeaplessVec};
 use log::{debug, info};
 use readily_core::{
     app::ReaderApp,
-    content::sd_catalog::{SdCatalogError, SdCatalogSource},
+    content::{
+        NavigationCatalog,
+        sd_catalog::{SdCatalogError, SdCatalogSource},
+    },
     input::InputProvider,
 };
 use readily_hal_esp32s3::storage::sd_spi::{
@@ -173,6 +176,21 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
                     }
                 }
             }
+            let mut requeued = false;
+            let _ = app.with_content_mut(|content| {
+                if content.seek_chapter(target_chapter).ok() == Some(true) {
+                    requeued = true;
+                }
+            });
+            if requeued {
+                info!(
+                    "sd: refill seek deferred short_name={} target_chapter={} status=requeued",
+                    stream_state.short_name,
+                    target_chapter.saturating_add(1)
+                );
+                return;
+            }
+
             let _ =
                 app.with_content_mut(|content| content.mark_catalog_stream_exhausted(book_index));
             exhausted = true;

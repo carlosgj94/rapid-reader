@@ -693,14 +693,25 @@ where
             let _ = self.advance_word();
         }
 
-        let resume_unreadable = advanced_count < target_word && !self.content.is_waiting_for_refill();
+        let resume_unreadable = advanced_count == 0 && !self.content.is_waiting_for_refill();
         if resume_unreadable {
             info!(
-                "resume: fallback to book start selected_book={} chapter={} paragraph={} word={}",
+                "resume: unreadable position selected_book={} chapter={} paragraph={} word={}",
                 resume.selected_book.saturating_add(1),
                 resume.chapter_index.saturating_add(1),
                 resume.paragraph_in_chapter.saturating_add(1),
                 resume.word_index.max(1)
+            );
+
+            if let Ok(true) = self.content.seek_chapter(resume.chapter_index) {
+                self.reset_read_word_state();
+                self.word_buffer.set("LOAD");
+                return true;
+            }
+
+            info!(
+                "resume: fallback to book start selected_book={} reason=chapter_requeue_failed",
+                resume.selected_book.saturating_add(1)
             );
             match self.content.seek_chapter(0) {
                 Ok(true) => {}
