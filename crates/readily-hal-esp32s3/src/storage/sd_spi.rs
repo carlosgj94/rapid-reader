@@ -382,3 +382,4 @@ include!("sd_spi/chapter_seek.rs");
 include!("sd_spi/text_probe_core.rs");
 include!("sd_spi/cover_probe.rs");
 include!("sd_spi/stream_scan.rs");
+include!("sd_spi/book_db.rs");

@@ -127,11 +127,8 @@ impl SdCatalogSource {
             .and_then(|last| Self::chunk_paragraph_at(slot.as_str(), last))
             .map(|paragraph| first_words_excerpt(paragraph, CHAPTER_LABEL_WORDS))
             .unwrap_or("");
-        let raw_preview_len = chunk.len().min(96);
-        let raw_preview = core::str::from_utf8(&chunk[..raw_preview_len]).unwrap_or("");
-
         debug!(
-            "sd-stream: chunk-set idx={} resource={} in_bytes={} loaded={} truncated={} stream_mode={} end={} terminal={} chapter={}/{} chapter_label={} html_flags=0x{:02x} tail_bytes={} parsed_paragraphs={} first_paragraph={:?} last_paragraph={:?} raw_preview={:?}",
+            "sd-stream: chunk-set idx={} resource={} in_bytes={} loaded={} truncated={} stream_mode={} end={} terminal={} chapter={}/{} chapter_label={} html_flags=0x{:02x} tail_bytes={} parsed_paragraphs={} first_paragraph={:?} last_paragraph={:?}",
             idx,
             stream_path.as_str(),
             chunk.len(),
@@ -147,8 +144,7 @@ impl SdCatalogSource {
             html_tail.len(),
             parsed_paragraphs,
             first_paragraph,
-            last_paragraph,
-            raw_preview
+            last_paragraph
         );
         let stream_mode_now = *stream_mode;
         let stream_end_now = *stream_end;

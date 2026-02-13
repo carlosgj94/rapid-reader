@@ -27,13 +27,13 @@ use esp_hal::{
 };
 use esp_radio::wifi::{ClientConfig, ModeConfig, WifiController};
 use heapless::{String as HeaplessString, Vec as HeaplessVec};
-use log::info;
+use log::{LevelFilter, info};
 use ls027b7dh01::FrameBuffer;
 use readily_core::{
     app::{ReaderApp, ReaderConfig, TickResult},
     content::sd_catalog::{SD_CATALOG_MAX_TITLES, SD_CATALOG_TITLE_BYTES, SdCatalogSource},
     render::Screen,
-    settings::SettingsStore,
+    settings::{ResumeState, SettingsStore},
 };
 use readily_hal_esp32s3::{
     input::rotary::{RotaryConfig, RotaryInput},
@@ -44,9 +44,11 @@ use readily_hal_esp32s3::{
 };
 use static_cell::StaticCell;
 
-use loading::{LoadingCoordinator, LoadingMode};
+use loading::{LoadingCoordinator, LoadingEvent, LoadingMode};
 use settings_sync::SettingsSyncState;
 
+#[path = "main/book_db.rs"]
+mod book_db;
 #[path = "main/initial_catalog.rs"]
 mod initial_catalog;
 #[path = "main/loading.rs"]
@@ -79,6 +81,8 @@ const ORP_ANCHOR_PERCENT: usize = 42;
 const COUNTDOWN_SECONDS: u8 = 3;
 const ENCODER_DIRECTION_INVERTED: bool = false;
 const SETTINGS_SAVE_DEBOUNCE_MS: u64 = 1_500;
+const RESUME_SAVE_DEBOUNCE_MS: u64 = 4_000;
+const RESUME_SAVE_MIN_SPACING_MS: u64 = 500;
 const WIFI_RETRY_BACKOFF_MIN_SECS: u64 = 2;
 const WIFI_RETRY_BACKOFF_MAX_SECS: u64 = 120;
 const NETWORK_POLL_INTERVAL_MS: u64 = 500;
@@ -86,7 +90,7 @@ const PING_INTERVAL_SECS: u64 = 5;
 const PING_IDLE_INTERVAL_SECS: u64 = 20;
 const PING_TIMEOUT_MS: u64 = 1_200;
 const DHCP_TIMEOUT_SECS: u64 = 15;
-const SLEEP_INACTIVITY_TIMEOUT_MS: u64 = 120_000;
+const SLEEP_INACTIVITY_TIMEOUT_MS: u64 = 60_000;
 const SLEEP_NOTICE_MS: u64 = 120;
 
 const WIFI_SSID: &str = env!(
@@ -110,6 +114,130 @@ struct SdBookStreamState {
     next_offset: u32,
     end_of_resource: bool,
     ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeFlushReason {
+    Debounce,
+    PauseOrNavigation,
+    Sleep,
+}
+
+impl ResumeFlushReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Debounce => "debounce",
+            Self::PauseOrNavigation => "pause_or_navigation",
+            Self::Sleep => "sleep",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResumeSyncState {
+    last_saved: Option<ResumeState>,
+    last_seen: Option<ResumeState>,
+    dirty_since_ms: Option<u64>,
+    last_flush_ms: Option<u64>,
+    prev_sleep_eligible: bool,
+}
+
+impl ResumeSyncState {
+    fn new(initial_resume: Option<ResumeState>, initial_sleep_eligible: bool) -> Self {
+        Self {
+            last_saved: initial_resume,
+            last_seen: initial_resume,
+            dirty_since_ms: None,
+            last_flush_ms: None,
+            prev_sleep_eligible: initial_sleep_eligible,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        current: Option<ResumeState>,
+        sleep_eligible_now: bool,
+        now_ms: u64,
+    ) -> Option<(ResumeState, ResumeFlushReason)> {
+        let mut force = None;
+
+        if !self.prev_sleep_eligible
+            && sleep_eligible_now
+            && let Some(resume) = current
+        {
+            force = Some((resume, ResumeFlushReason::PauseOrNavigation));
+        }
+        self.prev_sleep_eligible = sleep_eligible_now;
+
+        match (self.last_seen, current) {
+            (Some(previous), Some(now)) => {
+                if sleep_eligible_now
+                    && previous.selected_book == now.selected_book
+                    && !same_resume_paragraph(previous, now)
+                    && force.is_none()
+                {
+                    force = Some((now, ResumeFlushReason::PauseOrNavigation));
+                }
+                if !sleep_eligible_now && !same_resume_paragraph(previous, now) {
+                    self.dirty_since_ms = Some(now_ms);
+                }
+                self.last_seen = Some(now);
+            }
+            (None, Some(now)) => {
+                if !sleep_eligible_now
+                    && self
+                        .last_saved
+                        .is_none_or(|saved| !same_resume_paragraph(saved, now))
+                {
+                    self.dirty_since_ms = Some(now_ms);
+                }
+                self.last_seen = Some(now);
+            }
+            (_, None) => {
+                self.last_seen = None;
+                self.dirty_since_ms = None;
+            }
+        }
+
+        force
+    }
+
+    fn debounced_due(&self, now_ms: u64) -> Option<ResumeState> {
+        let dirty_since = self.dirty_since_ms?;
+        let resume = self.last_seen?;
+        if now_ms.saturating_sub(dirty_since) < RESUME_SAVE_DEBOUNCE_MS {
+            return None;
+        }
+        if self
+            .last_saved
+            .is_some_and(|saved| same_resume_paragraph(saved, resume))
+        {
+            return None;
+        }
+        Some(resume)
+    }
+
+    fn can_flush_now(&self, now_ms: u64) -> bool {
+        self.last_flush_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= RESUME_SAVE_MIN_SPACING_MS)
+    }
+
+    fn mark_saved(&mut self, saved: ResumeState, now_ms: u64) {
+        self.last_saved = Some(saved);
+        self.last_flush_ms = Some(now_ms);
+        if self
+            .last_seen
+            .is_some_and(|seen| same_resume_paragraph(seen, saved))
+        {
+            self.dirty_since_ms = None;
+        }
+    }
+}
+
+fn same_resume_paragraph(a: ResumeState, b: ResumeState) -> bool {
+    a.selected_book == b.selected_book
+        && a.chapter_index == b.chapter_index
+        && a.paragraph_in_chapter == b.paragraph_in_chapter
 }
 
 #[panic_handler]
@@ -262,7 +390,7 @@ async fn ping_loop(stack: Stack<'_>, connectivity: &'static ConnectivityHandle) 
 )]
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
+    esp_println::logger::init_logger(LevelFilter::Info);
     esp_println::println!("boot: readily starting");
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -376,36 +504,106 @@ async fn main(_spawner: Spawner) -> ! {
     let mut content = SdCatalogSource::new();
     let mut sd_stream_states: HeaplessVec<SdBookStreamState, SD_SCAN_MAX_EPUBS> =
         HeaplessVec::new();
-    sd_spi_speed_index = initial_catalog::preload_initial_catalog(
+    let mut catalog_loaded_from_db = false;
+    match book_db::try_load_catalog_from_db(
         &mut content,
-        &mut renderer,
         &mut sd_stream_states,
         &mut sd_spi,
         &mut sd_cs,
         &mut sd_delay,
-        sd_spi_speed_index,
-        |spi, speed_index| {
-            let speed_hz = SD_SPI_HZ_CANDIDATES[speed_index];
-            let speed_config = esp_hal::spi::master::Config::default()
-                .with_frequency(Rate::from_hz(speed_hz))
-                .with_mode(esp_hal::spi::Mode::_0);
-            spi.apply_config(&speed_config).is_ok()
-        },
-        |event, renderer| {
-            let now_ms = loading_start.elapsed().as_millis();
-            if loading.on_event(now_ms, event) {
-                renderer.render_loading(loading.view(now_ms), &mut frame);
-                if let Err(err) = display.flush_frame(&frame, &mut delay)
-                    && !display_fault_logged
-                {
-                    esp_println::println!("display: loading flush failed");
-                    info!("display loading flush failed: {:?}", err);
-                    display_fault_logged = true;
-                }
+    ) {
+        Ok(loaded) => {
+            catalog_loaded_from_db = loaded;
+        }
+        Err(err) => {
+            info!("sd-db: manifest load failed: {:?}", err);
+        }
+    }
+
+    if catalog_loaded_from_db {
+        let now_ms = loading_start.elapsed().as_millis();
+        if loading.on_event(now_ms, LoadingEvent::Begin) {
+            renderer.render_loading(loading.view(now_ms), &mut frame);
+            if let Err(err) = display.flush_frame(&frame, &mut delay)
+                && !display_fault_logged
+            {
+                esp_println::println!("display: loading flush failed");
+                info!("display loading flush failed: {:?}", err);
+                display_fault_logged = true;
             }
-        },
-    )
-    .await;
+        }
+        let books_total = sd_stream_states.len().clamp(0, u16::MAX as usize) as u16;
+        let now_ms = loading_start.elapsed().as_millis();
+        if loading.on_event(
+            now_ms,
+            LoadingEvent::ScanResult {
+                books_dir_found: true,
+                books_total,
+            },
+        ) {
+            renderer.render_loading(loading.view(now_ms), &mut frame);
+            if let Err(err) = display.flush_frame(&frame, &mut delay)
+                && !display_fault_logged
+            {
+                esp_println::println!("display: loading flush failed");
+                info!("display loading flush failed: {:?}", err);
+                display_fault_logged = true;
+            }
+        }
+        let now_ms = loading_start.elapsed().as_millis();
+        if loading.on_event(now_ms, LoadingEvent::Finished) {
+            renderer.render_loading(loading.view(now_ms), &mut frame);
+            if let Err(err) = display.flush_frame(&frame, &mut delay)
+                && !display_fault_logged
+            {
+                esp_println::println!("display: loading flush failed");
+                info!("display loading flush failed: {:?}", err);
+                display_fault_logged = true;
+            }
+        }
+        info!(
+            "sd-db: boot catalog source=manifest books={} spi_hz={}",
+            books_total, SD_SPI_HZ_CANDIDATES[sd_spi_speed_index]
+        );
+    } else {
+        sd_spi_speed_index = initial_catalog::preload_initial_catalog(
+            &mut content,
+            &mut renderer,
+            &mut sd_stream_states,
+            &mut sd_spi,
+            &mut sd_cs,
+            &mut sd_delay,
+            sd_spi_speed_index,
+            |spi, speed_index| {
+                let speed_hz = SD_SPI_HZ_CANDIDATES[speed_index];
+                let speed_config = esp_hal::spi::master::Config::default()
+                    .with_frequency(Rate::from_hz(speed_hz))
+                    .with_mode(esp_hal::spi::Mode::_0);
+                spi.apply_config(&speed_config).is_ok()
+            },
+            |event, renderer| {
+                let now_ms = loading_start.elapsed().as_millis();
+                if loading.on_event(now_ms, event) {
+                    renderer.render_loading(loading.view(now_ms), &mut frame);
+                    if let Err(err) = display.flush_frame(&frame, &mut delay)
+                        && !display_fault_logged
+                    {
+                        esp_println::println!("display: loading flush failed");
+                        info!("display loading flush failed: {:?}", err);
+                        display_fault_logged = true;
+                    }
+                }
+            },
+        )
+        .await;
+        book_db::build_book_db_from_runtime(
+            &content,
+            &sd_stream_states,
+            &mut sd_spi,
+            &mut sd_cs,
+            &mut sd_delay,
+        );
+    }
 
     let reader_config = ReaderConfig {
         wpm: 230,
@@ -442,9 +640,25 @@ async fn main(_spawner: Spawner) -> ! {
         }
     }
 
+    let db_resume =
+        book_db::load_resume_from_db(&sd_stream_states, &mut sd_spi, &mut sd_cs, &mut sd_delay);
+
     if woke_from_deep_sleep {
-        if let Some(snapshot) = restore_wake_snapshot {
+        let mut restored = false;
+
+        if let Some(mut snapshot) = restore_wake_snapshot {
+            if let Some(resume) = db_resume {
+                snapshot.resume = resume;
+                info!(
+                    "wake resume merged from sd-db selected_book={} chapter={} paragraph={} word={}",
+                    resume.selected_book.saturating_add(1),
+                    resume.chapter_index.saturating_add(1),
+                    resume.paragraph_in_chapter.saturating_add(1),
+                    resume.word_index.max(1)
+                );
+            }
             if app.import_wake_snapshot(snapshot, 0) {
+                restored = true;
                 info!(
                     "wake snapshot restored context={:?} selected_book={} chapter={} paragraph={} word={}",
                     snapshot.ui_context,
@@ -456,8 +670,35 @@ async fn main(_spawner: Spawner) -> ! {
             } else {
                 info!("wake snapshot restore failed; using default app state");
             }
+        } else if let Some(resume) = db_resume {
+            if app.import_resume_state(resume, 0) {
+                restored = true;
+                info!(
+                    "wake resume restored from sd-db selected_book={} chapter={} paragraph={} word={}",
+                    resume.selected_book.saturating_add(1),
+                    resume.chapter_index.saturating_add(1),
+                    resume.paragraph_in_chapter.saturating_add(1),
+                    resume.word_index.max(1)
+                );
+            } else {
+                info!("wake resume from sd-db failed; using default app state");
+            }
+        }
+
+        if !restored {
+            info!("woke from deep sleep without restorable snapshot/progress");
+        }
+    } else if let Some(resume) = db_resume {
+        if app.import_resume_state(resume, 0) {
+            info!(
+                "boot resume restored from sd-db selected_book={} chapter={} paragraph={} word={}",
+                resume.selected_book.saturating_add(1),
+                resume.chapter_index.saturating_add(1),
+                resume.paragraph_in_chapter.saturating_add(1),
+                resume.word_index.max(1)
+            );
         } else {
-            info!("woke from deep sleep without wake snapshot");
+            info!("boot resume from sd-db failed; using default app state");
         }
     }
 
@@ -502,6 +743,7 @@ async fn main(_spawner: Spawner) -> ! {
     );
 
     let mut settings_sync = SettingsSyncState::new(app.persisted_settings());
+    let mut resume_sync = ResumeSyncState::new(app.export_resume_state(), app.sleep_eligible());
     let mut last_connectivity_revision = u32::MAX;
     let mut display_first_flush_logged = false;
 
@@ -560,6 +802,48 @@ async fn main(_spawner: Spawner) -> ! {
             let now_ms = loop_start.elapsed().as_millis();
             let connectivity = CONNECTIVITY.snapshot();
             let app_requests_render = app.tick(now_ms) == TickResult::RenderRequested;
+            let current_resume = app.export_resume_state();
+            if let Some((resume, reason)) =
+                resume_sync.observe(current_resume, app.sleep_eligible(), now_ms)
+            {
+                if book_db::save_resume_to_db(
+                    resume,
+                    &sd_stream_states,
+                    &mut sd_spi,
+                    &mut sd_cs,
+                    &mut sd_delay,
+                ) {
+                    resume_sync.mark_saved(resume, now_ms);
+                    info!(
+                        "resume-save: flushed reason={} book={} chapter={} paragraph={} word={}",
+                        reason.as_str(),
+                        resume.selected_book.saturating_add(1),
+                        resume.chapter_index.saturating_add(1),
+                        resume.paragraph_in_chapter.saturating_add(1),
+                        resume.word_index.max(1)
+                    );
+                }
+            }
+            if let Some(resume) = resume_sync.debounced_due(now_ms)
+                && resume_sync.can_flush_now(now_ms)
+                && book_db::save_resume_to_db(
+                    resume,
+                    &sd_stream_states,
+                    &mut sd_spi,
+                    &mut sd_cs,
+                    &mut sd_delay,
+                )
+            {
+                resume_sync.mark_saved(resume, now_ms);
+                info!(
+                    "resume-save: flushed reason={} book={} chapter={} paragraph={} word={}",
+                    ResumeFlushReason::Debounce.as_str(),
+                    resume.selected_book.saturating_add(1),
+                    resume.chapter_index.saturating_add(1),
+                    resume.paragraph_in_chapter.saturating_add(1),
+                    resume.word_index.max(1)
+                );
+            }
             let connectivity_changed = connectivity.revision != last_connectivity_revision;
 
             if app_requests_render || connectivity_changed {
@@ -582,6 +866,25 @@ async fn main(_spawner: Spawner) -> ! {
             settings_sync.flush_if_due(settings_store.as_mut(), now_ms);
 
             if app.inactivity_sleep_due(now_ms, SLEEP_INACTIVITY_TIMEOUT_MS) {
+                if let Some(resume) = app.export_resume_state() {
+                    if book_db::save_resume_to_db(
+                        resume,
+                        &sd_stream_states,
+                        &mut sd_spi,
+                        &mut sd_cs,
+                        &mut sd_delay,
+                    ) {
+                        resume_sync.mark_saved(resume, now_ms);
+                        info!(
+                            "resume-save: flushed reason={} book={} chapter={} paragraph={} word={}",
+                            ResumeFlushReason::Sleep.as_str(),
+                            resume.selected_book.saturating_add(1),
+                            resume.chapter_index.saturating_add(1),
+                            resume.paragraph_in_chapter.saturating_add(1),
+                            resume.word_index.max(1)
+                        );
+                    }
+                }
                 let snapshot = app
                     .persisted_settings()
                     .with_wake_snapshot(app.export_wake_snapshot());

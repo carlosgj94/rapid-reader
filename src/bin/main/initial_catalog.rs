@@ -17,7 +17,7 @@ use super::{
     SD_BOOKS_DIR, SD_COVER_MEDIA_BYTES, SD_COVER_THUMB_BYTES, SD_COVER_THUMB_HEIGHT,
     SD_COVER_THUMB_WIDTH, SD_PROBE_ATTEMPTS, SD_PROBE_RETRY_DELAY_MS, SD_SCAN_MAX_CANDIDATES,
     SD_SCAN_MAX_EPUBS, SD_SCAN_NAME_BYTES, SD_SPI_HZ_CANDIDATES, SD_TEXT_CHUNK_BYTES,
-    SD_TEXT_PATH_BYTES, SD_TEXT_PREVIEW_BYTES, SdBookStreamState, loading::LoadingEvent,
+    SD_TEXT_PATH_BYTES, SdBookStreamState, loading::LoadingEvent,
 };
 
 pub(super) async fn preload_initial_catalog<BUS, CS, DELAY, F, P>(
@@ -191,10 +191,6 @@ where
                         ) {
                             Ok(text_probe) => match text_probe.status {
                                 SdEpubTextChunkStatus::ReadOk => {
-                                    let preview_len =
-                                        text_probe.bytes_read.min(SD_TEXT_PREVIEW_BYTES);
-                                    let preview = core::str::from_utf8(&text_chunk[..preview_len])
-                                        .unwrap_or("");
                                     for ch in text_probe.text_resource.chars() {
                                         if stream_state.text_resource.push(ch).is_err() {
                                             break;
@@ -227,7 +223,7 @@ where
                                                     text_chunks_truncated.saturating_add(1);
                                             }
                                             info!(
-                                                "sd: initial text chunk short_name={} resource={} chapter={}/{} chapter_label={:?} start_offset={} compression={} bytes_read={} end={} applied_loaded={} applied_truncated={} preview={:?}",
+                                                "sd: initial text chunk short_name={} resource={} chapter={}/{} chapter_label={:?} start_offset={} compression={} bytes_read={} end={} applied_loaded={} applied_truncated={}",
                                                 epub.short_name,
                                                 text_probe.text_resource,
                                                 text_probe.chapter_index.saturating_add(1),
@@ -238,8 +234,7 @@ where
                                                 text_probe.bytes_read,
                                                 text_probe.end_of_resource,
                                                 applied.loaded,
-                                                applied.truncated,
-                                                preview
+                                                applied.truncated
                                             );
                                         }
                                         Err(_) => {

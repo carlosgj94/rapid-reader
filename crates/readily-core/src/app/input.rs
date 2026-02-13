@@ -88,7 +88,9 @@ where
                     return;
                 }
 
-                if self.content.select_text(cursor).is_err() {
+                if cursor != self.content.selected_index()
+                    && self.content.select_text(cursor).is_err()
+                {
                     self.set_status("CONTENT ERROR", "INVALID TITLE", now_ms);
                     return;
                 }
