@@ -675,21 +675,42 @@ where
             return false;
         }
 
-        self.word_buffer.clear();
-        self.paragraph_word_index = 0;
-        self.paragraph_word_total = 1;
-        self.last_ends_clause = false;
-        self.last_ends_sentence = false;
+        self.reset_read_word_state();
 
         let target_word = resume.word_index.clamp(1, 512);
         let mut advanced_any = false;
+        let mut advanced_count = 0u16;
         for _ in 0..target_word {
             match self.advance_word() {
-                Ok(AdvanceWordResult::Advanced) => advanced_any = true,
+                Ok(AdvanceWordResult::Advanced) => {
+                    advanced_any = true;
+                    advanced_count = advanced_count.saturating_add(1);
+                }
                 _ => break,
             }
         }
         if !advanced_any {
+            let _ = self.advance_word();
+        }
+
+        let resume_unreadable = advanced_count < target_word && !self.content.is_waiting_for_refill();
+        if resume_unreadable {
+            info!(
+                "resume: fallback to book start selected_book={} chapter={} paragraph={} word={}",
+                resume.selected_book.saturating_add(1),
+                resume.chapter_index.saturating_add(1),
+                resume.paragraph_in_chapter.saturating_add(1),
+                resume.word_index.max(1)
+            );
+            match self.content.seek_chapter(0) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => {
+                    if self.content.seek_paragraph(0).is_err() {
+                        return false;
+                    }
+                }
+            }
+            self.reset_read_word_state();
             let _ = self.advance_word();
         }
 
@@ -709,6 +730,14 @@ where
                     .saturating_sub(chapter_start)
             })
             .unwrap_or(0)
+    }
+
+    fn reset_read_word_state(&mut self) {
+        self.word_buffer.clear();
+        self.paragraph_word_index = 0;
+        self.paragraph_word_total = 1;
+        self.last_ends_clause = false;
+        self.last_ends_sentence = false;
     }
 
 

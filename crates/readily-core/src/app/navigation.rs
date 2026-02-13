@@ -6,6 +6,11 @@ where
     fn enter_library(&mut self, cursor: u16, now_ms: u64) {
         self.last_reading_press_ms = None;
         let max_index = self.library_item_count().saturating_sub(1);
+        info!(
+            "ui-nav: enter library cursor={}/{}",
+            cursor.saturating_add(1),
+            self.library_item_count().max(1)
+        );
         self.ui = UiState::Library {
             cursor: cursor.min(max_index),
         };
@@ -29,6 +34,10 @@ where
         self.last_ends_clause = false;
         self.last_ends_sentence = false;
 
+        info!(
+            "ui-nav: enter countdown selected_book={}",
+            selected_book.saturating_add(1)
+        );
         self.ui = UiState::Countdown {
             selected_book,
             remaining: self.countdown_seconds,
@@ -42,6 +51,14 @@ where
         self.last_reading_press_ms = None;
         self.paused_since_ms = None;
         self.last_pause_anim_slot = None;
+        info!(
+            "ui-nav: enter reading selected_book={} paragraph={}/{} chapter={}/{}",
+            selected_book.saturating_add(1),
+            self.content.paragraph_index(),
+            self.content.paragraph_total().max(1),
+            self.current_chapter_index().saturating_add(1),
+            self.content.chapter_count().max(1)
+        );
         self.ui = UiState::Reading {
             selected_book,
             paused: false,
@@ -160,6 +177,14 @@ where
             paused: true,
             next_word_ms: now_ms,
         };
+        info!(
+            "ui-nav: enter reading paused selected_book={} paragraph={}/{} chapter={}/{}",
+            selected_book.saturating_add(1),
+            self.content.paragraph_index(),
+            self.content.paragraph_total().max(1),
+            self.current_chapter_index().saturating_add(1),
+            self.content.chapter_count().max(1)
+        );
         self.paused_since_ms = Some(now_ms);
         self.last_pause_anim_slot = None;
         self.start_transition(AnimationKind::SlideRight, now_ms, ANIM_NAV_MS);

@@ -240,9 +240,26 @@ fn same_resume_paragraph(a: ResumeState, b: ResumeState) -> bool {
         && a.paragraph_in_chapter == b.paragraph_in_chapter
 }
 
+fn apply_resume_chapter_hint<IN>(app: &mut ReaderApp<SdCatalogSource, IN>, resume: ResumeState)
+where
+    IN: readily_core::input::InputProvider,
+{
+    let hinted_total = resume.chapter_index.saturating_add(1).max(1);
+    let _ = app.with_content_mut(|content| {
+        content.set_catalog_stream_chapter_hint(
+            resume.selected_book,
+            resume.chapter_index,
+            hinted_total,
+        )
+    });
+}
+
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    esp_println::println!("panic: {}", info);
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -648,6 +665,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         if let Some(mut snapshot) = restore_wake_snapshot {
             if let Some(resume) = db_resume {
+                apply_resume_chapter_hint(&mut app, resume);
                 snapshot.resume = resume;
                 info!(
                     "wake resume merged from sd-db selected_book={} chapter={} paragraph={} word={}",
@@ -671,6 +689,7 @@ async fn main(_spawner: Spawner) -> ! {
                 info!("wake snapshot restore failed; using default app state");
             }
         } else if let Some(resume) = db_resume {
+            apply_resume_chapter_hint(&mut app, resume);
             if app.import_resume_state(resume, 0) {
                 restored = true;
                 info!(
@@ -689,6 +708,7 @@ async fn main(_spawner: Spawner) -> ! {
             info!("woke from deep sleep without restorable snapshot/progress");
         }
     } else if let Some(resume) = db_resume {
+        apply_resume_chapter_hint(&mut app, resume);
         if app.import_resume_state(resume, 0) {
             info!(
                 "boot resume restored from sd-db selected_book={} chapter={} paragraph={} word={}",

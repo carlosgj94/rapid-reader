@@ -2,7 +2,7 @@
 
 use core::str;
 
-use log::debug;
+use log::{debug, info};
 
 use crate::{
     content::{
@@ -23,6 +23,7 @@ const WPM_STEP: u16 = 10;
 const WORD_BUFFER_BYTES: usize = 96;
 const MAX_LIBRARY_ITEMS: usize = 12;
 const EXIT_DOUBLE_PRESS_MS: u64 = 450;
+const EXIT_DOUBLE_PRESS_MIN_MS: u64 = 120;
 
 const ANIM_MENU_MS: u16 = 180;
 const ANIM_SCREEN_MS: u16 = 220;
@@ -165,3 +166,6 @@ include!("input.rs");
 include!("runtime.rs");
 include!("navigation.rs");
 include!("word_buffer.rs");
+
+#[cfg(test)]
+mod tests;

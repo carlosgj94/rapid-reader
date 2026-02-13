@@ -125,7 +125,61 @@ where
                     return TickResult::NoRender;
                 }
                 Ok(AdvanceWordResult::EndOfText) => {
-                    self.enter_library(selected_book, now_ms);
+                    let paragraph_index = self.content.paragraph_index();
+                    let paragraph_total = self.content.paragraph_total().max(1);
+                    let waiting_for_refill = self.content.is_waiting_for_refill();
+                    info!(
+                        "ui-nav: reading end-of-text -> paused selected_book={} paragraph={}/{} waiting_for_refill={}",
+                        selected_book,
+                        paragraph_index,
+                        paragraph_total,
+                        waiting_for_refill
+                    );
+
+                    // If we reached end before rendering any word, treat it as invalid resume/load
+                    // position and request chapter 1 so reopening a finished/invalid state starts over.
+                    if self.paragraph_word_index == 0 {
+                        match self.content.seek_chapter(0) {
+                            Ok(true) => {
+                                info!(
+                                    "ui-nav: reading end-of-text -> restart request selected_book={} chapter=1 reason=no_word_rendered",
+                                    selected_book
+                                );
+                                self.word_buffer.set("LOAD");
+                                self.ui = UiState::Reading {
+                                    selected_book,
+                                    paused: true,
+                                    next_word_ms: now_ms,
+                                };
+                                self.last_reading_press_ms = None;
+                                self.paused_since_ms = Some(now_ms);
+                                self.last_pause_anim_slot = None;
+                                self.pending_redraw = false;
+                                return TickResult::RenderRequested;
+                            }
+                            Ok(false) => {}
+                            Err(_) => {
+                                info!(
+                                    "ui-nav: reading end-of-text -> restart request failed selected_book={} chapter=1",
+                                    selected_book
+                                );
+                            }
+                        }
+                    }
+
+                    // Defensive behavior: avoid kicking back to library on transient end-of-chunk
+                    // races. Keep the user in reading (paused) so refill/navigation can recover.
+                    if self.word_buffer.is_empty() {
+                        self.word_buffer.set("END");
+                    }
+                    self.ui = UiState::Reading {
+                        selected_book,
+                        paused: true,
+                        next_word_ms: now_ms,
+                    };
+                    self.last_reading_press_ms = None;
+                    self.paused_since_ms = Some(now_ms);
+                    self.last_pause_anim_slot = None;
                     self.pending_redraw = false;
                     return TickResult::RenderRequested;
                 }

@@ -65,6 +65,15 @@ where
         return Ok(false);
     };
 
+    if manifest
+        .entries
+        .iter()
+        .any(|entry| entry.first_resource.as_str().trim().is_empty())
+    {
+        info!("sd-db: manifest invalid (missing first_resource); fallback to SD scan");
+        return Ok(false);
+    }
+
     let load = content.set_catalog_entries_from_iter(
         manifest
             .entries

@@ -181,10 +181,17 @@ where
             InputEvent::Press => {
                 let double_press = self
                     .last_reading_press_ms
-                    .is_some_and(|last| now_ms.saturating_sub(last) <= EXIT_DOUBLE_PRESS_MS);
+                    .and_then(|last| now_ms.checked_sub(last))
+                    .is_some_and(|delta| {
+                        (EXIT_DOUBLE_PRESS_MIN_MS..=EXIT_DOUBLE_PRESS_MS).contains(&delta)
+                    });
                 self.last_reading_press_ms = Some(now_ms);
 
                 if double_press {
+                    info!(
+                        "ui-nav: reading double-press -> library selected_book={}",
+                        selected_book
+                    );
                     self.last_reading_press_ms = None;
                     self.enter_library(selected_book, now_ms);
                     return;

@@ -19,6 +19,9 @@ use super::{
     SdBookStreamState,
 };
 
+const SD_REFILL_SEEK_ATTEMPTS: u8 = 3;
+const SD_REFILL_SEEK_RETRY_DELAY_MS: u32 = 24;
+
 pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
     app: &mut ReaderApp<SdCatalogSource, IN>,
     sd_stream_states: &mut HeaplessVec<SdBookStreamState, SD_SCAN_MAX_EPUBS>,
@@ -107,31 +110,54 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
             stream_state.short_name,
             target_chapter.saturating_add(1)
         );
-        match probe_and_read_epub_text_chunk_at_chapter::<_, _, _, SD_TEXT_PATH_BYTES>(
-            sd_spi,
-            sd_cs,
-            sd_delay,
-            SD_BOOKS_DIR,
-            stream_state.short_name.as_str(),
-            target_chapter,
-            &mut text_chunk,
-        ) {
-            Ok(text_probe) => {
-                debug!(
-                    "sd: refill seek probe short_name={} status={:?} resource={} chapter={}/{} chapter_label={:?} start_offset={} bytes_read={} end={}",
-                    stream_state.short_name,
-                    text_probe.status,
-                    text_probe.text_resource,
-                    text_probe.chapter_index.saturating_add(1),
-                    text_probe.chapter_total.max(1),
-                    text_probe.chapter_label.as_str(),
-                    text_probe.start_offset,
-                    text_probe.bytes_read,
-                    text_probe.end_of_resource
-                );
-                selected_probe = Some((text_probe, true));
+        let mut last_seek_error: Option<SdProbeError<BUS::Error, CS::Error>> = None;
+        for attempt in 1..=SD_REFILL_SEEK_ATTEMPTS {
+            match probe_and_read_epub_text_chunk_at_chapter::<_, _, _, SD_TEXT_PATH_BYTES>(
+                sd_spi,
+                sd_cs,
+                sd_delay,
+                SD_BOOKS_DIR,
+                stream_state.short_name.as_str(),
+                target_chapter,
+                &mut text_chunk,
+            ) {
+                Ok(text_probe) => {
+                    debug!(
+                        "sd: refill seek probe short_name={} attempt={}/{} status={:?} resource={} chapter={}/{} chapter_label={:?} start_offset={} bytes_read={} end={}",
+                        stream_state.short_name,
+                        attempt,
+                        SD_REFILL_SEEK_ATTEMPTS,
+                        text_probe.status,
+                        text_probe.text_resource,
+                        text_probe.chapter_index.saturating_add(1),
+                        text_probe.chapter_total.max(1),
+                        text_probe.chapter_label.as_str(),
+                        text_probe.start_offset,
+                        text_probe.bytes_read,
+                        text_probe.end_of_resource
+                    );
+                    selected_probe = Some((text_probe, true));
+                    last_seek_error = None;
+                    break;
+                }
+                Err(err) => {
+                    last_seek_error = Some(err);
+                    if attempt < SD_REFILL_SEEK_ATTEMPTS {
+                        info!(
+                            "sd: refill seek retry short_name={} target_chapter={} attempt={}/{}",
+                            stream_state.short_name,
+                            target_chapter.saturating_add(1),
+                            attempt,
+                            SD_REFILL_SEEK_ATTEMPTS
+                        );
+                        sd_delay.delay_ms(SD_REFILL_SEEK_RETRY_DELAY_MS);
+                    }
+                }
             }
-            Err(err) => {
+        }
+
+        if selected_probe.is_none() {
+            if let Some(err) = last_seek_error {
                 match err {
                     SdProbeError::ChipSelect(_) => {
                         info!("sd: refill seek failed (chip-select pin)");
@@ -146,10 +172,10 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
                         info!("sd: refill seek failed (filesystem): {:?}", fs_err);
                     }
                 }
-                let _ = app
-                    .with_content_mut(|content| content.mark_catalog_stream_exhausted(book_index));
-                exhausted = true;
             }
+            let _ =
+                app.with_content_mut(|content| content.mark_catalog_stream_exhausted(book_index));
+            exhausted = true;
         }
     } else {
         for _ in 0..4 {

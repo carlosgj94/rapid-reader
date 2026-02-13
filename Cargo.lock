@@ -695,7 +695,6 @@ dependencies = [
  "esp-metadata-generated",
  "esp-sync",
  "esp-wifi-sys",
- "log",
 ]
 
 [[package]]
@@ -737,7 +736,6 @@ dependencies = [
  "esp-wifi-sys",
  "heapless 0.9.2",
  "instability",
- "log",
  "num-derive",
  "num-traits",
  "portable-atomic",
@@ -833,7 +831,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89b6544f6f0cb86169d1f93ba2101a8d50358a040c5043676ed86b793e09b12c"
 dependencies = [
  "anyhow",
- "log",
 ]
 
 [[package]]
