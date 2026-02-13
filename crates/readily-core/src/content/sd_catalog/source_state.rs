@@ -70,6 +70,87 @@ impl SdCatalogSource {
             .unwrap_or("")
     }
 
+    pub(super) fn selected_stream_heading_offset_for_navigation(&self) -> usize {
+        if !self.selected_is_stream_mode() {
+            return 0;
+        }
+
+        let paragraph_total = self.selected_paragraph_count();
+        if paragraph_total < 2 {
+            return 0;
+        }
+
+        let Some(first_paragraph) = self.selected_paragraph_at(0) else {
+            return 0;
+        };
+        let chapter_label = self.selected_stream_chapter_label();
+
+        if Self::heading_matches_chapter_label(first_paragraph, chapter_label) {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn heading_matches_chapter_label(first_paragraph: &str, chapter_label: &str) -> bool {
+        let first = Self::trim_heading_token(first_paragraph);
+        let label = Self::trim_heading_token(chapter_label);
+        !first.is_empty() && !label.is_empty() && first.eq_ignore_ascii_case(label)
+    }
+
+    fn trim_heading_token(mut source: &str) -> &str {
+        source = source.trim();
+        loop {
+            let mut changed = false;
+
+            if let Some(first) = source.chars().next()
+                && Self::is_heading_trim_char(first)
+            {
+                source = source.get(first.len_utf8()..).unwrap_or("");
+                source = source.trim_start();
+                changed = true;
+            }
+
+            if let Some(last) = source.chars().next_back()
+                && Self::is_heading_trim_char(last)
+            {
+                let end = source.len().saturating_sub(last.len_utf8());
+                source = source.get(..end).unwrap_or("");
+                source = source.trim_end();
+                changed = true;
+            }
+
+            if !changed || source.is_empty() {
+                break;
+            }
+        }
+        source
+    }
+
+    fn is_heading_trim_char(ch: char) -> bool {
+        matches!(
+            ch,
+            '.' | ','
+                | ':'
+                | ';'
+                | '-'
+                | '–'
+                | '—'
+                | '"'
+                | '\''
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+        )
+    }
+
     pub(super) fn selected_paragraph_count(&self) -> usize {
         if let Some(chunk_text) = self.selected_chunk_text() {
             return Self::chunk_paragraph_count(chunk_text);

@@ -144,6 +144,51 @@ fn stream_detects_multiple_paragraphs_from_html_blocks() {
 }
 
 #[test]
+fn stream_chapter_at_skips_heading_only_first_paragraph() {
+    let mut src = SdCatalogSource::new();
+    src.set_catalog_entries_from_iter([("Book One", false)]);
+    src.set_catalog_text_chunk_from_bytes(
+        0,
+        b"<html><body><h1>I</h1><p>Primer parrafo.</p><p>Segundo parrafo.</p></body></html>",
+        false,
+        "OEBPS/chapter-one.xhtml",
+    )
+    .unwrap();
+    src.set_catalog_stream_chapter_metadata(0, 0, 9, Some("I"))
+        .unwrap();
+    src.select_text(0).unwrap();
+
+    let chapter = src.chapter_at(0).expect("chapter must exist");
+    assert_eq!(chapter.start_paragraph, 1);
+    assert_eq!(chapter.paragraph_count, 2);
+    assert_eq!(
+        src.paragraph_preview(chapter.start_paragraph),
+        Some("Primer parrafo.")
+    );
+}
+
+#[test]
+fn stream_chapter_at_keeps_first_paragraph_when_heading_differs() {
+    let mut src = SdCatalogSource::new();
+    src.set_catalog_entries_from_iter([("Book One", false)]);
+    src.set_catalog_text_chunk_from_bytes(
+        0,
+        b"<html><body><h1>Prologue</h1><p>Primer parrafo.</p><p>Segundo parrafo.</p></body></html>",
+        false,
+        "OEBPS/chapter-one.xhtml",
+    )
+    .unwrap();
+    src.set_catalog_stream_chapter_metadata(0, 0, 9, Some("I"))
+        .unwrap();
+    src.select_text(0).unwrap();
+
+    let chapter = src.chapter_at(0).expect("chapter must exist");
+    assert_eq!(chapter.start_paragraph, 0);
+    assert_eq!(chapter.paragraph_count, 3);
+    assert_eq!(src.paragraph_preview(0), Some("Prologue"));
+}
+
+#[test]
 fn stream_resource_transitions_advance_current_chapter() {
     let mut src = SdCatalogSource::new();
     src.set_catalog_entries_from_iter([("Book One", false)]);
@@ -290,6 +335,14 @@ fn stream_seek_current_chapter_queues_refill_and_requires_reload() {
 
     assert!(src.chapter_data_ready(0));
     assert_eq!(src.chapter_at(0).map(|chapter| chapter.label), Some("I"));
+    assert_eq!(
+        src.chapter_at(0).map(|chapter| chapter.start_paragraph),
+        Some(1)
+    );
+    assert_eq!(
+        src.chapter_at(0).map(|chapter| chapter.paragraph_count),
+        Some(1)
+    );
     assert_eq!(src.paragraph_preview(0), Some("I"));
     assert_eq!(
         src.paragraph_preview(1),
@@ -613,11 +666,24 @@ mod epub_fixture_audit {
                     .map(|entry| entry.label),
                 Some(chapter.label.as_str())
             );
+            let expected_start =
+                if paragraph_total > 1 && preview_0.eq_ignore_ascii_case(chapter.label.as_str()) {
+                    1u16
+                } else {
+                    0u16
+                };
+            let expected_selectable = paragraph_total.saturating_sub(expected_start).max(1);
+            assert_eq!(
+                storage
+                    .chapter_at(chapter_position)
+                    .map(|entry| entry.start_paragraph),
+                Some(expected_start)
+            );
             assert_eq!(
                 storage
                     .chapter_at(chapter_position)
                     .map(|entry| entry.paragraph_count),
-                Some(paragraph_total)
+                Some(expected_selectable)
             );
 
             std::println!(

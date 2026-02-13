@@ -38,10 +38,14 @@ impl NavigationCatalog for SdCatalogSource {
                 .selected_stream_chapter_index()
                 .min(total.saturating_sub(1));
             if index == current {
-                let paragraph_count = self.selected_paragraph_count().max(1);
+                let paragraph_total = self.selected_paragraph_count().max(1);
+                let heading_offset = self
+                    .selected_stream_heading_offset_for_navigation()
+                    .min(paragraph_total.saturating_sub(1));
+                let paragraph_count = paragraph_total.saturating_sub(heading_offset).max(1);
                 return Some(ChapterInfo {
                     label: self.selected_stream_chapter_label(),
-                    start_paragraph: 0,
+                    start_paragraph: heading_offset as u16,
                     paragraph_count: paragraph_count.clamp(1, u16::MAX as usize) as u16,
                 });
             }
