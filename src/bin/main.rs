@@ -18,8 +18,10 @@ use embassy_time::{Duration as EmbassyDuration, Timer, WithTimeout};
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
-    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull, RtcPin},
+    rtc_cntl::{SocResetReason, reset_reason, wakeup_cause},
     spi::master::Spi,
+    system::Cpu,
     time::{Duration as HalDuration, Instant, Rate},
     timer::timg::TimerGroup,
 };
@@ -30,6 +32,7 @@ use ls027b7dh01::FrameBuffer;
 use readily_core::{
     app::{ReaderApp, ReaderConfig, TickResult},
     content::sd_catalog::{SD_CATALOG_MAX_TITLES, SD_CATALOG_TITLE_BYTES, SdCatalogSource},
+    render::Screen,
     settings::SettingsStore,
 };
 use readily_hal_esp32s3::{
@@ -45,6 +48,8 @@ use settings_sync::SettingsSyncState;
 
 #[path = "main/initial_catalog.rs"]
 mod initial_catalog;
+#[path = "main/power.rs"]
+mod power;
 #[path = "main/sd_refill.rs"]
 mod sd_refill;
 #[path = "main/settings_sync.rs"]
@@ -78,6 +83,8 @@ const PING_INTERVAL_SECS: u64 = 5;
 const PING_IDLE_INTERVAL_SECS: u64 = 20;
 const PING_TIMEOUT_MS: u64 = 1_200;
 const DHCP_TIMEOUT_SECS: u64 = 15;
+const SLEEP_INACTIVITY_TIMEOUT_MS: u64 = 120_000;
+const SLEEP_NOTICE_MS: u64 = 120;
 
 const WIFI_SSID: &str = env!(
     "READILY_WIFI_SSID",
@@ -257,6 +264,13 @@ async fn main(_spawner: Spawner) -> ! {
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+    let boot_reset_reason = reset_reason(Cpu::ProCpu);
+    let boot_wakeup_cause = wakeup_cause();
+    let woke_from_deep_sleep = boot_reset_reason == Some(SocResetReason::CoreDeepSleep);
+    info!(
+        "boot reset_reason={:?} wakeup_cause={:?}",
+        boot_reset_reason, boot_wakeup_cause
+    );
 
     // esp-radio requires an allocator.
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
@@ -265,8 +279,11 @@ async fn main(_spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0);
 
     // Wiring used by this demo:
-    // CLK=GPIO13, DI=GPIO14, CS=GPIO15, DISP=GPIO7, EMD=GPIO9
-    let disp = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+    // CLK=GPIO13, DI=GPIO14, CS=GPIO15, DISP=GPIO2, EMD=GPIO9
+    let disp_pin = peripherals.GPIO2;
+    // Release any prior deep-sleep pad hold before driving DISP high again.
+    disp_pin.rtcio_pad_hold(false);
+    let disp = Output::new(disp_pin, Level::Low, OutputConfig::default());
     let emd = Output::new(peripherals.GPIO9, Level::Low, OutputConfig::default());
     let cs = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
 
@@ -284,7 +301,7 @@ async fn main(_spawner: Spawner) -> ! {
 
     let mut display = SharpDisplay::new(spi, disp, emd, cs);
     let mut display_fault_logged = false;
-    esp_println::println!("display: init begin (CLK=13 DI=14 CS=15 DISP=7 EMD=9)");
+    esp_println::println!("display: init begin (CLK=13 DI=14 CS=15 DISP=2 EMD=9)");
     if let Err(err) = display.initialize(&mut delay) {
         esp_println::println!("display: initialize failed");
         info!("display initialize failed: {:?}", err);
@@ -382,10 +399,12 @@ async fn main(_spawner: Spawner) -> ! {
             None
         }
     };
+    let mut restore_wake_snapshot = None;
 
     if let Some(store) = settings_store.as_mut() {
         match store.load() {
             Ok(Some(saved)) => {
+                restore_wake_snapshot = saved.wake_snapshot;
                 app.apply_persisted_settings(saved);
                 info!("settings restored from flash");
             }
@@ -395,6 +414,25 @@ async fn main(_spawner: Spawner) -> ! {
             Err(_) => {
                 info!("failed to read saved settings; using defaults");
             }
+        }
+    }
+
+    if woke_from_deep_sleep {
+        if let Some(snapshot) = restore_wake_snapshot {
+            if app.import_wake_snapshot(snapshot, 0) {
+                info!(
+                    "wake snapshot restored context={:?} selected_book={} chapter={} paragraph={} word={}",
+                    snapshot.ui_context,
+                    snapshot.resume.selected_book.saturating_add(1),
+                    snapshot.resume.chapter_index.saturating_add(1),
+                    snapshot.resume.paragraph_in_chapter.saturating_add(1),
+                    snapshot.resume.word_index.max(1)
+                );
+            } else {
+                info!("wake snapshot restore failed; using default app state");
+            }
+        } else {
+            info!("woke from deep sleep without wake snapshot");
         }
     }
 
@@ -451,7 +489,7 @@ async fn main(_spawner: Spawner) -> ! {
         "Reader started: target_wpm={} dot_pause_ms={} comma_pause_ms={} spi_hz={}",
         reader_config.wpm, reader_config.dot_pause_ms, reader_config.comma_pause_ms, DISPLAY_SPI_HZ
     );
-    info!("Display pins: CLK=GPIO13 DI=GPIO14 CS=GPIO15 DISP=GPIO7 EMD=GPIO9");
+    info!("Display pins: CLK=GPIO13 DI=GPIO14 CS=GPIO15 DISP=GPIO2 EMD=GPIO9");
     info!("Encoder pins: CLK=GPIO10 DT=GPIO11 SW=GPIO12");
     info!("SD pins: CS=GPIO8 SCK=GPIO4 MOSI=GPIO40 MISO=GPIO41");
     info!(
@@ -518,6 +556,37 @@ async fn main(_spawner: Spawner) -> ! {
 
             settings_sync.track_current(app.persisted_settings(), now_ms);
             settings_sync.flush_if_due(settings_store.as_mut(), now_ms);
+
+            if app.inactivity_sleep_due(now_ms, SLEEP_INACTIVITY_TIMEOUT_MS) {
+                let snapshot = app
+                    .persisted_settings()
+                    .with_wake_snapshot(app.export_wake_snapshot());
+                if let Some(store) = settings_store.as_mut() {
+                    if store.save(&snapshot).is_ok() {
+                        info!("sleep: persisted settings and wake snapshot");
+                    } else {
+                        info!("sleep: failed to persist wake snapshot before deep sleep");
+                    }
+                }
+                info!(
+                    "sleep: entering deep sleep after {}ms inactivity",
+                    SLEEP_INACTIVITY_TIMEOUT_MS
+                );
+                renderer.render(
+                    Screen::Status {
+                        title: TITLE,
+                        wpm: snapshot.wpm,
+                        line1: "SLEEPING...",
+                        line2: "PRESS TO WAKE",
+                        style: snapshot.style,
+                        animation: None,
+                    },
+                    &mut frame,
+                );
+                let _ = display.flush_frame(&frame, &mut delay);
+                Timer::after_millis(SLEEP_NOTICE_MS).await;
+                power::enter_deep_sleep(&mut display, &mut sd_spi, &mut sd_cs);
+            }
 
             report_words = report_words.saturating_add(app.drain_word_updates() as u64);
 

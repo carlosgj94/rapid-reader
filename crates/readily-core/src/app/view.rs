@@ -41,6 +41,8 @@ where
             last_reading_press_ms: None,
             paused_since_ms: None,
             last_pause_anim_slot: None,
+            last_input_activity_ms: 0,
+            pending_wake_restore: None,
         }
     }
 
@@ -436,6 +438,277 @@ where
         self.style = settings.style;
         self.config.wpm = settings.wpm.clamp(self.config.min_wpm, self.config.max_wpm);
         self.pending_redraw = true;
+    }
+
+    pub fn sleep_eligible(&self) -> bool {
+        !matches!(
+            self.ui,
+            UiState::Reading {
+                paused: false,
+                ..
+            }
+        )
+    }
+
+    pub fn inactivity_sleep_due(&self, now_ms: u64, timeout_ms: u64) -> bool {
+        self.sleep_eligible()
+            && now_ms.saturating_sub(self.last_input_activity_ms) >= timeout_ms
+    }
+
+    pub fn export_resume_state(&self) -> Option<ResumeState> {
+        let title_total = self.total_title_count();
+        if title_total == 0 {
+            return None;
+        }
+
+        let chapter_index = self.current_chapter_index();
+        let paragraph_global = self.content.paragraph_index().saturating_sub(1);
+        let paragraph_in_chapter = self
+            .content
+            .chapter_at(chapter_index)
+            .map(|chapter| {
+                let start = chapter.start_paragraph;
+                let end = start.saturating_add(chapter.paragraph_count.saturating_sub(1));
+                if (start..=end).contains(&paragraph_global) {
+                    paragraph_global.saturating_sub(start)
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+
+        let (word_index, _) = self.content.paragraph_progress();
+        Some(ResumeState {
+            selected_book: self.content.selected_index().min(title_total.saturating_sub(1)),
+            chapter_index,
+            paragraph_in_chapter,
+            word_index: word_index.max(1),
+        })
+    }
+
+    pub fn export_wake_snapshot(&self) -> Option<WakeSnapshot> {
+        let resume = self.export_resume_state()?;
+        let ui_context = match self.ui {
+            UiState::Library { cursor } => SleepUiContext::Library { cursor },
+            UiState::Settings { cursor, editing } => SleepUiContext::Settings { cursor, editing },
+            UiState::Reading { paused: true, .. } => SleepUiContext::ReadingPaused,
+            UiState::Reading { paused: false, .. } => return None,
+            UiState::NavigateChapter { chapter_cursor, .. } => {
+                SleepUiContext::NavigateChapter { chapter_cursor }
+            }
+            UiState::NavigateChapterLoading { chapter_index, .. } => {
+                SleepUiContext::NavigateChapter {
+                    chapter_cursor: chapter_index,
+                }
+            }
+            UiState::NavigateParagraph {
+                chapter_index,
+                paragraph_cursor,
+                ..
+            } => SleepUiContext::NavigateParagraph {
+                chapter_index,
+                paragraph_in_chapter: self.paragraph_in_chapter_from_cursor(
+                    chapter_index,
+                    paragraph_cursor,
+                ),
+            },
+            UiState::Countdown { selected_book, .. } => SleepUiContext::Library {
+                cursor: selected_book.min(self.settings_item_index()),
+            },
+            UiState::Status { .. } => SleepUiContext::Library {
+                cursor: self.content.selected_index().min(self.settings_item_index()),
+            },
+        };
+
+        Some(WakeSnapshot { ui_context, resume })
+    }
+
+    pub fn import_wake_snapshot(&mut self, snapshot: WakeSnapshot, now_ms: u64) -> bool {
+        self.import_resume_for_context(snapshot.resume, snapshot.ui_context, now_ms)
+    }
+
+    pub fn import_resume_state(&mut self, resume: ResumeState, now_ms: u64) -> bool {
+        self.import_resume_for_context(resume, SleepUiContext::ReadingPaused, now_ms)
+    }
+
+    fn import_resume_for_context(
+        &mut self,
+        mut resume: ResumeState,
+        context: SleepUiContext,
+        now_ms: u64,
+    ) -> bool {
+        let title_total = self.total_title_count();
+        if title_total == 0 {
+            return false;
+        }
+
+        resume.selected_book = resume.selected_book.min(title_total.saturating_sub(1));
+        if self.content.select_text(resume.selected_book).is_err() {
+            return false;
+        }
+
+        let chapter_total = self.content.chapter_count().max(1);
+        resume.chapter_index = resume.chapter_index.min(chapter_total.saturating_sub(1));
+        self.pending_wake_restore = None;
+
+        let requires_chapter_data = matches!(
+            context,
+            SleepUiContext::ReadingPaused
+                | SleepUiContext::NavigateChapter { .. }
+                | SleepUiContext::NavigateParagraph { .. }
+        );
+
+        if requires_chapter_data {
+            match self.content.seek_chapter(resume.chapter_index) {
+                Ok(true) => {
+                    if self.content.chapter_data_ready(resume.chapter_index) {
+                        if !self.apply_resume_context(resume, context, now_ms) {
+                            return false;
+                        }
+                    } else {
+                        self.pending_wake_restore = Some(PendingWakeRestore { resume, context });
+                        self.enter_chapter_loading(resume.selected_book, resume.chapter_index, now_ms);
+                    }
+                }
+                Ok(false) => {
+                    if !self.apply_resume_context(resume, context, now_ms) {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
+        } else if !self.apply_resume_context(resume, context, now_ms) {
+            return false;
+        }
+
+        self.last_input_activity_ms = now_ms;
+        self.pending_redraw = true;
+        true
+    }
+
+    fn apply_resume_context(
+        &mut self,
+        resume: ResumeState,
+        context: SleepUiContext,
+        now_ms: u64,
+    ) -> bool {
+        match context {
+            SleepUiContext::ReadingPaused => self.apply_resume_location(resume, now_ms),
+            SleepUiContext::Library { cursor } => {
+                self.enter_library(cursor.min(self.settings_item_index()), now_ms);
+                true
+            }
+            SleepUiContext::Settings { cursor, editing } => {
+                let cursor = cursor.min(SettingsRow::COUNT.saturating_sub(1));
+                self.enter_settings(cursor, editing, now_ms);
+                true
+            }
+            SleepUiContext::NavigateChapter { chapter_cursor } => {
+                if !self.apply_resume_cursor(resume) {
+                    return false;
+                }
+                self.enter_chapter_navigation(resume.selected_book, chapter_cursor, now_ms);
+                true
+            }
+            SleepUiContext::NavigateParagraph {
+                chapter_index,
+                paragraph_in_chapter,
+            } => {
+                if !self.apply_resume_cursor(resume) {
+                    return false;
+                }
+
+                let chapter_total = self.content.chapter_count().max(1);
+                let chapter_index = chapter_index.min(chapter_total.saturating_sub(1));
+                let paragraph_cursor = self
+                    .content
+                    .chapter_at(chapter_index)
+                    .map(|chapter| {
+                        let chapter_start = chapter.start_paragraph;
+                        let paragraph_rel =
+                            paragraph_in_chapter.min(chapter.paragraph_count.saturating_sub(1));
+                        chapter_start.saturating_add(paragraph_rel)
+                    })
+                    .unwrap_or_else(|| self.content.paragraph_index().saturating_sub(1));
+
+                self.enter_paragraph_navigation(
+                    resume.selected_book,
+                    chapter_index,
+                    paragraph_cursor,
+                    now_ms,
+                );
+                true
+            }
+        }
+    }
+
+    fn apply_resume_location(&mut self, resume: ResumeState, now_ms: u64) -> bool {
+        if !self.apply_resume_cursor(resume) {
+            return false;
+        }
+
+        self.last_reading_press_ms = None;
+        self.ui = UiState::Reading {
+            selected_book: resume.selected_book,
+            paused: true,
+            next_word_ms: now_ms,
+        };
+        self.paused_since_ms = Some(now_ms);
+        self.last_pause_anim_slot = None;
+        self.start_transition(AnimationKind::Fade, now_ms, ANIM_SCREEN_MS);
+        self.pending_redraw = true;
+        true
+    }
+
+    fn apply_resume_cursor(&mut self, resume: ResumeState) -> bool {
+        let (chapter_start, chapter_count) = self
+            .content
+            .chapter_at(resume.chapter_index)
+            .map(|chapter| (chapter.start_paragraph, chapter.paragraph_count.max(1)))
+            .unwrap_or((0, self.content.paragraph_total().max(1)));
+        let paragraph_rel = resume
+            .paragraph_in_chapter
+            .min(chapter_count.saturating_sub(1));
+        let target_paragraph = chapter_start.saturating_add(paragraph_rel);
+
+        if self.content.seek_paragraph(target_paragraph).is_err() {
+            return false;
+        }
+
+        self.word_buffer.clear();
+        self.paragraph_word_index = 0;
+        self.paragraph_word_total = 1;
+        self.last_ends_clause = false;
+        self.last_ends_sentence = false;
+
+        let target_word = resume.word_index.clamp(1, 512);
+        let mut advanced_any = false;
+        for _ in 0..target_word {
+            match self.advance_word() {
+                Ok(AdvanceWordResult::Advanced) => advanced_any = true,
+                _ => break,
+            }
+        }
+        if !advanced_any {
+            let _ = self.advance_word();
+        }
+
+        self.last_reading_press_ms = None;
+        true
+    }
+
+    fn paragraph_in_chapter_from_cursor(&self, chapter_index: u16, paragraph_cursor: u16) -> u16 {
+        self.content
+            .chapter_at(chapter_index)
+            .map(|chapter| {
+                let chapter_start = chapter.start_paragraph;
+                let chapter_end =
+                    chapter_start.saturating_add(chapter.paragraph_count.saturating_sub(1));
+                paragraph_cursor
+                    .clamp(chapter_start, chapter_end)
+                    .saturating_sub(chapter_start)
+            })
+            .unwrap_or(0)
     }
 
 

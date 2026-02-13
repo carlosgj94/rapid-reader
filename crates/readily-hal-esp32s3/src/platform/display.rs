@@ -130,4 +130,14 @@ where
 
         Ok(())
     }
+
+    /// Drives panel control pins to a quiescent off state before deep sleep.
+    pub fn disable_output(
+        &mut self,
+    ) -> SharpDisplayResult<SPI::Error, DISP::Error, EMD::Error, CS::Error> {
+        self.cs.set_low().map_err(DisplayError::Cs)?;
+        self.emd.set_low().map_err(DisplayError::Emd)?;
+        self.disp.set_low().map_err(DisplayError::Disp)?;
+        Ok(())
+    }
 }

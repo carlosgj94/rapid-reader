@@ -13,7 +13,7 @@ use crate::{
         AnimationKind, AnimationSpec, FontFamily, FontSize, MenuItemKind, MenuItemView, Screen,
         SettingRowView, SettingValue, VisualStyle,
     },
-    settings::PersistedSettings,
+    settings::{PersistedSettings, ResumeState, SleepUiContext, WakeSnapshot},
     text_policy::{
         chapter_number_label, preview_compact, preview_limited, section_secondary_label,
     },
@@ -127,6 +127,12 @@ enum AdvanceWordResult {
     EndOfText,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingWakeRestore {
+    resume: ResumeState,
+    context: SleepUiContext,
+}
+
 pub struct ReaderApp<WS, IN>
 where
     WS: WordSource + TextCatalog + SelectableWordSource + ParagraphNavigator + NavigationCatalog,
@@ -150,6 +156,8 @@ where
     last_reading_press_ms: Option<u64>,
     paused_since_ms: Option<u64>,
     last_pause_anim_slot: Option<u32>,
+    last_input_activity_ms: u64,
+    pending_wake_restore: Option<PendingWakeRestore>,
 }
 
 include!("view.rs");

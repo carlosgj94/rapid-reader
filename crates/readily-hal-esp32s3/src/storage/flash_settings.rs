@@ -8,15 +8,20 @@ use esp_rom_sys::rom::spiflash::{
 };
 use readily_core::{
     render::{FontFamily, FontSize, VisualStyle},
-    settings::{PersistedSettings, SettingsStore},
+    settings::{PersistedSettings, ResumeState, SettingsStore, SleepUiContext, WakeSnapshot},
 };
 
 const FLASH_SECTOR_SIZE: u32 = 4096;
 const DEFAULT_FLASH_CAPACITY_BYTES: usize = 16 * 1024 * 1024;
 
 const SETTINGS_MAGIC: u32 = 0x3153_4452; // "RDS1"
-const SETTINGS_VERSION: u8 = 1;
-const SETTINGS_RECORD_LEN: usize = 16;
+const SETTINGS_VERSION_V1: u8 = 1;
+const SETTINGS_VERSION_V2: u8 = 2;
+const SETTINGS_VERSION_V3: u8 = 3;
+const SETTINGS_VERSION: u8 = SETTINGS_VERSION_V3;
+const SETTINGS_RECORD_V1_LEN: usize = 16;
+const SETTINGS_RECORD_V3_LEN: usize = 36;
+const SETTINGS_RECORD_LEN: usize = SETTINGS_RECORD_V3_LEN;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FlashSettingsError {
@@ -234,40 +239,161 @@ impl SettingsStore for FlashSettingsStore {
         }
 
         let version = buf[4];
-        if version != SETTINGS_VERSION {
-            return Ok(None);
+        match version {
+            SETTINGS_VERSION_V1 => {
+                let checksum_start = SETTINGS_RECORD_V1_LEN.saturating_sub(4);
+                let expected_checksum = u32::from_le_bytes([
+                    buf[checksum_start],
+                    buf[checksum_start + 1],
+                    buf[checksum_start + 2],
+                    buf[checksum_start + 3],
+                ]);
+                let checksum = checksum32(&buf[..checksum_start]);
+                if checksum != expected_checksum {
+                    return Err(FlashSettingsError::Corrupted);
+                }
+
+                let font_family = match buf[5] {
+                    0 => FontFamily::Serif,
+                    1 => FontFamily::Pixel,
+                    _ => return Err(FlashSettingsError::Corrupted),
+                };
+
+                let font_size = match buf[6] {
+                    0 => FontSize::Small,
+                    1 => FontSize::Medium,
+                    2 => FontSize::Large,
+                    _ => return Err(FlashSettingsError::Corrupted),
+                };
+
+                let inverted = (buf[7] & 0x01) != 0;
+                let wpm = u16::from_le_bytes([buf[8], buf[9]]);
+
+                Ok(Some(PersistedSettings::new(
+                    wpm,
+                    VisualStyle {
+                        font_family,
+                        font_size,
+                        inverted,
+                    },
+                )))
+            }
+            SETTINGS_VERSION_V2 => {
+                let expected_checksum = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+                let checksum = checksum32(&buf[..24]);
+                if checksum != expected_checksum {
+                    return Err(FlashSettingsError::Corrupted);
+                }
+
+                let font_family = match buf[5] {
+                    0 => FontFamily::Serif,
+                    1 => FontFamily::Pixel,
+                    _ => return Err(FlashSettingsError::Corrupted),
+                };
+
+                let font_size = match buf[6] {
+                    0 => FontSize::Small,
+                    1 => FontSize::Medium,
+                    2 => FontSize::Large,
+                    _ => return Err(FlashSettingsError::Corrupted),
+                };
+
+                let inverted = (buf[7] & 0x01) != 0;
+                let wpm = u16::from_le_bytes([buf[8], buf[9]]);
+                let resume_flags = u16::from_le_bytes([buf[12], buf[13]]);
+                let resume = if (resume_flags & 0x0001) != 0 {
+                    Some(ResumeState {
+                        selected_book: u16::from_le_bytes([buf[14], buf[15]]),
+                        chapter_index: u16::from_le_bytes([buf[16], buf[17]]),
+                        paragraph_in_chapter: u16::from_le_bytes([buf[18], buf[19]]),
+                        word_index: u16::from_le_bytes([buf[20], buf[21]]).max(1),
+                    })
+                } else {
+                    None
+                };
+
+                Ok(Some(PersistedSettings {
+                    wpm,
+                    style: VisualStyle {
+                        font_family,
+                        font_size,
+                        inverted,
+                    },
+                    wake_snapshot: resume.map(|resume| WakeSnapshot {
+                        ui_context: SleepUiContext::ReadingPaused,
+                        resume,
+                    }),
+                }))
+            }
+            SETTINGS_VERSION_V3 => {
+                let expected_checksum = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
+                let checksum = checksum32(&buf[..32]);
+                if checksum != expected_checksum {
+                    return Err(FlashSettingsError::Corrupted);
+                }
+
+                let font_family = match buf[5] {
+                    0 => FontFamily::Serif,
+                    1 => FontFamily::Pixel,
+                    _ => return Err(FlashSettingsError::Corrupted),
+                };
+
+                let font_size = match buf[6] {
+                    0 => FontSize::Small,
+                    1 => FontSize::Medium,
+                    2 => FontSize::Large,
+                    _ => return Err(FlashSettingsError::Corrupted),
+                };
+
+                let inverted = (buf[7] & 0x01) != 0;
+                let wpm = u16::from_le_bytes([buf[8], buf[9]]);
+                let wake_flags = u16::from_le_bytes([buf[10], buf[11]]);
+                let wake_snapshot = if (wake_flags & 0x0001) != 0 {
+                    let context_kind = buf[12];
+                    let context_flags = buf[13];
+                    let context_a = u16::from_le_bytes([buf[14], buf[15]]);
+                    let context_b = u16::from_le_bytes([buf[16], buf[17]]);
+                    let resume = ResumeState {
+                        selected_book: u16::from_le_bytes([buf[18], buf[19]]),
+                        chapter_index: u16::from_le_bytes([buf[20], buf[21]]),
+                        paragraph_in_chapter: u16::from_le_bytes([buf[22], buf[23]]),
+                        word_index: u16::from_le_bytes([buf[24], buf[25]]).max(1),
+                    };
+
+                    let ui_context = match context_kind {
+                        0 => SleepUiContext::ReadingPaused,
+                        1 => SleepUiContext::Library { cursor: context_a },
+                        2 => SleepUiContext::Settings {
+                            cursor: context_a.min(u8::MAX as u16) as u8,
+                            editing: (context_flags & 0x01) != 0,
+                        },
+                        3 => SleepUiContext::NavigateChapter {
+                            chapter_cursor: context_a,
+                        },
+                        4 => SleepUiContext::NavigateParagraph {
+                            chapter_index: context_a,
+                            paragraph_in_chapter: context_b,
+                        },
+                        _ => return Err(FlashSettingsError::Corrupted),
+                    };
+
+                    Some(WakeSnapshot { ui_context, resume })
+                } else {
+                    None
+                };
+
+                Ok(Some(PersistedSettings {
+                    wpm,
+                    style: VisualStyle {
+                        font_family,
+                        font_size,
+                        inverted,
+                    },
+                    wake_snapshot,
+                }))
+            }
+            _ => Ok(None),
         }
-
-        let expected_checksum = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        let checksum = checksum32(&buf[..12]);
-        if checksum != expected_checksum {
-            return Err(FlashSettingsError::Corrupted);
-        }
-
-        let font_family = match buf[5] {
-            0 => FontFamily::Serif,
-            1 => FontFamily::Pixel,
-            _ => return Err(FlashSettingsError::Corrupted),
-        };
-
-        let font_size = match buf[6] {
-            0 => FontSize::Small,
-            1 => FontSize::Medium,
-            2 => FontSize::Large,
-            _ => return Err(FlashSettingsError::Corrupted),
-        };
-
-        let inverted = (buf[7] & 0x01) != 0;
-        let wpm = u16::from_le_bytes([buf[8], buf[9]]);
-
-        Ok(Some(PersistedSettings::new(
-            wpm,
-            VisualStyle {
-                font_family,
-                font_size,
-                inverted,
-            },
-        )))
     }
 
     fn save(&mut self, settings: &PersistedSettings) -> Result<(), Self::Error> {
@@ -285,10 +411,38 @@ impl SettingsStore for FlashSettingsStore {
         };
         buf[7] = if settings.style.inverted { 1 } else { 0 };
         buf[8..10].copy_from_slice(&settings.wpm.to_le_bytes());
-        buf[10] = 0;
-        buf[11] = 0;
-        let checksum = checksum32(&buf[..12]);
-        buf[12..16].copy_from_slice(&checksum.to_le_bytes());
+        if let Some(snapshot) = settings.wake_snapshot {
+            let (context_kind, context_flags, context_a, context_b) = match snapshot.ui_context {
+                SleepUiContext::ReadingPaused => (0u8, 0u8, 0u16, 0u16),
+                SleepUiContext::Library { cursor } => (1u8, 0u8, cursor, 0u16),
+                SleepUiContext::Settings { cursor, editing } => {
+                    (2u8, if editing { 1u8 } else { 0u8 }, cursor as u16, 0u16)
+                }
+                SleepUiContext::NavigateChapter { chapter_cursor } => {
+                    (3u8, 0u8, chapter_cursor, 0u16)
+                }
+                SleepUiContext::NavigateParagraph {
+                    chapter_index,
+                    paragraph_in_chapter,
+                } => (4u8, 0u8, chapter_index, paragraph_in_chapter),
+            };
+
+            buf[10..12].copy_from_slice(&1u16.to_le_bytes());
+            buf[12] = context_kind;
+            buf[13] = context_flags;
+            buf[14..16].copy_from_slice(&context_a.to_le_bytes());
+            buf[16..18].copy_from_slice(&context_b.to_le_bytes());
+            buf[18..20].copy_from_slice(&snapshot.resume.selected_book.to_le_bytes());
+            buf[20..22].copy_from_slice(&snapshot.resume.chapter_index.to_le_bytes());
+            buf[22..24].copy_from_slice(&snapshot.resume.paragraph_in_chapter.to_le_bytes());
+            buf[24..26].copy_from_slice(&snapshot.resume.word_index.max(1).to_le_bytes());
+            buf[26..32].copy_from_slice(&[0u8; 6]);
+        } else {
+            buf[10..12].copy_from_slice(&0u16.to_le_bytes());
+            buf[12..32].copy_from_slice(&[0u8; 20]);
+        }
+        let checksum = checksum32(&buf[..32]);
+        buf[32..36].copy_from_slice(&checksum.to_le_bytes());
 
         self.flash.erase_sector(self.settings_sector_addr)?;
         self.flash

@@ -6,7 +6,11 @@ where
     fn process_inputs(&mut self, now_ms: u64) {
         loop {
             match self.input.poll_event() {
-                Ok(Some(event)) => self.apply_input_event(event, now_ms),
+                Ok(Some(event)) => {
+                    self.last_input_activity_ms = now_ms;
+                    self.pending_wake_restore = None;
+                    self.apply_input_event(event, now_ms);
+                }
                 Ok(None) => break,
                 Err(_) => {
                     self.set_status("INPUT ERROR", "CHECK PROVIDER", now_ms);

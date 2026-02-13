@@ -13,6 +13,22 @@ where
         };
 
         if self.content.chapter_data_ready(chapter_index) {
+            if let Some(pending_restore) = self.pending_wake_restore
+                && pending_restore.resume.selected_book == selected_book
+                && pending_restore.resume.chapter_index == chapter_index
+            {
+                self.pending_wake_restore = None;
+                if self.apply_resume_context(
+                    pending_restore.resume,
+                    pending_restore.context,
+                    now_ms,
+                ) {
+                    return TickResult::RenderRequested;
+                }
+                self.set_status("RESUME ERROR", "LOAD POSITION", now_ms);
+                return TickResult::RenderRequested;
+            }
+
             let initial_cursor = self.initial_paragraph_cursor_for_chapter(chapter_index);
             self.enter_paragraph_navigation(selected_book, chapter_index, initial_cursor, now_ms);
             return TickResult::RenderRequested;
