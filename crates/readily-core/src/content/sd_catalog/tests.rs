@@ -248,6 +248,56 @@ fn stream_seek_chapter_emits_targeted_refill_request() {
 }
 
 #[test]
+fn stream_seek_current_chapter_queues_refill_and_requires_reload() {
+    let mut src = SdCatalogSource::new();
+    src.set_catalog_entries_from_iter([("Book One", false)]);
+    src.set_catalog_text_chunk_from_bytes(
+        0,
+        b"<html><body><p>Project Gutenberg metadata block.</p></body></html>",
+        false,
+        "OEBPS/0000-front.xhtml",
+    )
+    .unwrap();
+    src.set_catalog_stream_chapter_metadata(0, 0, 9, Some("I"))
+        .unwrap();
+    src.select_text(0).unwrap();
+
+    assert!(src.chapter_data_ready(0));
+    assert_eq!(
+        src.paragraph_preview(0),
+        Some("Project Gutenberg metadata block.")
+    );
+
+    assert!(src.seek_chapter(0).unwrap());
+    assert!(!src.chapter_data_ready(0));
+    assert_eq!(
+        src.take_chunk_refill_request(),
+        Some(SdChunkRefillRequest {
+            book_index: 0,
+            target_chapter: Some(0)
+        })
+    );
+
+    src.set_catalog_text_chunk_from_bytes(
+        0,
+        b"<html><body><h1>I</h1><p>In my younger and more vulnerable years...</p></body></html>",
+        false,
+        "OEBPS/0001-chapter.xhtml",
+    )
+    .unwrap();
+    src.set_catalog_stream_chapter_metadata(0, 0, 9, Some("I"))
+        .unwrap();
+
+    assert!(src.chapter_data_ready(0));
+    assert_eq!(src.chapter_at(0).map(|chapter| chapter.label), Some("I"));
+    assert_eq!(src.paragraph_preview(0), Some("I"));
+    assert_eq!(
+        src.paragraph_preview(1),
+        Some("In my younger and more vulnerable years...")
+    );
+}
+
+#[test]
 fn stream_chapter_data_ready_tracks_refill_and_loaded_state() {
     let mut src = SdCatalogSource::new();
     src.set_catalog_entries_from_iter([("Book One", false)]);

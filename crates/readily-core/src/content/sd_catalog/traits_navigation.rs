@@ -118,27 +118,6 @@ impl NavigationCatalog for SdCatalogSource {
             self.waiting_for_refill
         );
 
-        if chapter_index == current {
-            self.waiting_for_refill = false;
-            if let Some(refill_requested) =
-                self.catalog_refill_requested.get_mut(self.selected_book)
-            {
-                *refill_requested = false;
-            }
-            if let Some(seek_target) = self.catalog_stream_seek_target.get_mut(self.selected_book) {
-                *seek_target = NO_CHAPTER_SEEK_TARGET;
-            }
-            self.reset_read_pointer();
-            debug!(
-                "sd-nav: seek_chapter no-op selected_book={} chapter={}/{} path={}",
-                self.selected_book,
-                chapter_index.saturating_add(1),
-                total,
-                self.selected_stream_path()
-            );
-            return Ok(true);
-        }
-
         let Some(chapter_slot) = self
             .catalog_stream_chapter_index
             .get_mut(self.selected_book)
