@@ -44,10 +44,13 @@ use readily_hal_esp32s3::{
 };
 use static_cell::StaticCell;
 
+use loading::{LoadingCoordinator, LoadingMode};
 use settings_sync::SettingsSyncState;
 
 #[path = "main/initial_catalog.rs"]
 mod initial_catalog;
+#[path = "main/loading.rs"]
+mod loading;
 #[path = "main/power.rs"]
 mod power;
 #[path = "main/sd_refill.rs"]
@@ -361,6 +364,15 @@ async fn main(_spawner: Spawner) -> ! {
     let mut sd_spi_speed_index = 0usize;
 
     let mut renderer = RsvpRenderer::new(ORP_ANCHOR_PERCENT);
+    let loading_mode = if woke_from_deep_sleep {
+        LoadingMode::WakeFromDeepSleep
+    } else {
+        LoadingMode::ColdBoot
+    };
+    let mut loading = LoadingCoordinator::new(loading_mode);
+    let loading_start = Instant::now();
+    let mut frame = FrameBuffer::new();
+
     let mut content = SdCatalogSource::new();
     let mut sd_stream_states: HeaplessVec<SdBookStreamState, SD_SCAN_MAX_EPUBS> =
         HeaplessVec::new();
@@ -378,6 +390,19 @@ async fn main(_spawner: Spawner) -> ! {
                 .with_frequency(Rate::from_hz(speed_hz))
                 .with_mode(esp_hal::spi::Mode::_0);
             spi.apply_config(&speed_config).is_ok()
+        },
+        |event, renderer| {
+            let now_ms = loading_start.elapsed().as_millis();
+            if loading.on_event(now_ms, event) {
+                renderer.render_loading(loading.view(now_ms), &mut frame);
+                if let Err(err) = display.flush_frame(&frame, &mut delay)
+                    && !display_fault_logged
+                {
+                    esp_println::println!("display: loading flush failed");
+                    info!("display loading flush failed: {:?}", err);
+                    display_fault_logged = true;
+                }
+            }
         },
     )
     .await;
@@ -476,7 +501,6 @@ async fn main(_spawner: Spawner) -> ! {
         0x5A17_2B34_D099_EE11,
     );
 
-    let mut frame = FrameBuffer::new();
     let mut settings_sync = SettingsSyncState::new(app.persisted_settings());
     let mut last_connectivity_revision = u32::MAX;
     let mut display_first_flush_logged = false;

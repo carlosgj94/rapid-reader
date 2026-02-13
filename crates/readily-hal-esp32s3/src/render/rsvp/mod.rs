@@ -17,6 +17,7 @@ mod countdown;
 mod glyph;
 mod header;
 mod library;
+mod loading;
 mod navigation;
 mod primitives;
 mod settings;
@@ -24,9 +25,11 @@ mod text;
 
 #[allow(unused_imports)]
 use self::{
-    countdown::*, glyph::*, header::*, library::*, navigation::*, primitives::*, settings::*,
-    text::*,
+    countdown::*, glyph::*, header::*, library::*, loading::*, navigation::*, primitives::*,
+    settings::*, text::*,
 };
+
+pub use self::loading::LoadingView;
 
 const SETTINGS_ROWS_VISIBLE: usize = 5;
 const MENU_ROW_HEIGHT: usize = 28;
@@ -133,6 +136,12 @@ impl RsvpRenderer {
         self.cover_thumbs
             .get(slot)
             .filter(|thumb| thumb.loaded && thumb.width > 0 && thumb.height > 0)
+    }
+
+    pub fn render_loading(&mut self, view: LoadingView<'_>, frame: &mut FrameBuffer) {
+        let (bg_on, fg_on) = palette(VisualStyle::default());
+        clear_frame(frame, bg_on);
+        draw_loading_stage(frame, view, self.connectivity, fg_on);
     }
 }
 

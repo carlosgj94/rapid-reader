@@ -17,10 +17,10 @@ use super::{
     SD_BOOKS_DIR, SD_COVER_MEDIA_BYTES, SD_COVER_THUMB_BYTES, SD_COVER_THUMB_HEIGHT,
     SD_COVER_THUMB_WIDTH, SD_PROBE_ATTEMPTS, SD_PROBE_RETRY_DELAY_MS, SD_SCAN_MAX_CANDIDATES,
     SD_SCAN_MAX_EPUBS, SD_SCAN_NAME_BYTES, SD_SPI_HZ_CANDIDATES, SD_TEXT_CHUNK_BYTES,
-    SD_TEXT_PATH_BYTES, SD_TEXT_PREVIEW_BYTES, SdBookStreamState,
+    SD_TEXT_PATH_BYTES, SD_TEXT_PREVIEW_BYTES, SdBookStreamState, loading::LoadingEvent,
 };
 
-pub(super) async fn preload_initial_catalog<BUS, CS, DELAY, F>(
+pub(super) async fn preload_initial_catalog<BUS, CS, DELAY, F, P>(
     content: &mut SdCatalogSource,
     renderer: &mut RsvpRenderer,
     sd_stream_states: &mut HeaplessVec<SdBookStreamState, SD_SCAN_MAX_EPUBS>,
@@ -29,6 +29,7 @@ pub(super) async fn preload_initial_catalog<BUS, CS, DELAY, F>(
     sd_delay: &mut DELAY,
     start_speed_index: usize,
     mut try_set_speed: F,
+    mut on_progress: P,
 ) -> usize
 where
     BUS: SpiBus<u8>,
@@ -37,9 +38,11 @@ where
     BUS::Error: Debug,
     CS::Error: Debug,
     F: FnMut(&mut BUS, usize) -> bool,
+    P: FnMut(LoadingEvent, &mut RsvpRenderer),
 {
     let mut sd_spi_speed_index = start_speed_index;
     let mut initial_scan_result = None;
+    on_progress(LoadingEvent::Begin, renderer);
     'boot_speed_scan: for speed_index in sd_spi_speed_index..SD_SPI_HZ_CANDIDATES.len() {
         let speed_hz = SD_SPI_HZ_CANDIDATES[speed_index];
 
@@ -52,6 +55,14 @@ where
         }
 
         for attempt in 1..=SD_PROBE_ATTEMPTS {
+            on_progress(
+                LoadingEvent::ProbeAttempt {
+                    speed_index,
+                    attempt,
+                    max_attempts: SD_PROBE_ATTEMPTS,
+                },
+                renderer,
+            );
             match probe_and_scan_epubs::<
                 _,
                 _,
@@ -64,6 +75,7 @@ where
                 Ok(scan) => {
                     sd_spi_speed_index = speed_index;
                     initial_scan_result = Some(scan);
+                    on_progress(LoadingEvent::ProbeSuccess { speed_index }, renderer);
                     info!(
                         "sd: initial catalog probe ok (attempt={} spi_hz={})",
                         attempt, speed_hz
@@ -91,7 +103,21 @@ where
                     }
 
                     if attempt < SD_PROBE_ATTEMPTS {
-                        Timer::after_millis(SD_PROBE_RETRY_DELAY_MS).await;
+                        let mut waited_ms = 0u64;
+                        while waited_ms < SD_PROBE_RETRY_DELAY_MS {
+                            let remaining_ms = SD_PROBE_RETRY_DELAY_MS.saturating_sub(waited_ms);
+                            on_progress(
+                                LoadingEvent::ProbeRetryTick {
+                                    speed_index,
+                                    attempt,
+                                    remaining_ms,
+                                },
+                                renderer,
+                            );
+                            let tick_ms = remaining_ms.min(40);
+                            Timer::after_millis(tick_ms).await;
+                            waited_ms = waited_ms.saturating_add(tick_ms);
+                        }
                     }
                 }
             }
@@ -105,6 +131,13 @@ where
                     scan.epub_entries
                         .iter()
                         .map(|entry| (entry.display_title.as_str(), entry.has_cover)),
+                );
+                on_progress(
+                    LoadingEvent::ScanResult {
+                        books_dir_found: true,
+                        books_total: catalog_load.loaded,
+                    },
+                    renderer,
                 );
                 info!(
                     "sd: initial catalog loaded card_bytes={} books_dir={} epub_total={} listed={} titles_loaded={} scan_truncated={} title_truncated={} spi_hz={}",
@@ -131,6 +164,14 @@ where
                         .take(catalog_load.loaded as usize)
                         .enumerate()
                     {
+                        let book_index = index as u16 + 1;
+                        on_progress(
+                            LoadingEvent::BookText {
+                                index: book_index,
+                                total: catalog_load.loaded.max(1),
+                            },
+                            renderer,
+                        );
                         let mut stream_state = SdBookStreamState {
                             short_name: epub.short_name.clone(),
                             text_resource: HeaplessString::new(),
@@ -260,6 +301,13 @@ where
                             },
                         }
 
+                        on_progress(
+                            LoadingEvent::BookCover {
+                                index: book_index,
+                                total: catalog_load.loaded.max(1),
+                            },
+                            renderer,
+                        );
                         let mut cover_thumb = [0u8; SD_COVER_THUMB_BYTES];
                         match probe_and_read_epub_cover_thumbnail::<
                             _,
@@ -358,6 +406,13 @@ where
                     );
                 }
             } else {
+                on_progress(
+                    LoadingEvent::ScanResult {
+                        books_dir_found: false,
+                        books_total: 0,
+                    },
+                    renderer,
+                );
                 info!(
                     "sd: initial catalog fallback to built-in titles; books_dir={} missing",
                     SD_BOOKS_DIR
@@ -365,6 +420,7 @@ where
             }
         }
         None => {
+            on_progress(LoadingEvent::FallbackNoCatalog, renderer);
             info!(
                 "sd: initial catalog fallback after trying all spi_hz candidates ({}, {}, {}, {})",
                 SD_SPI_HZ_CANDIDATES[0],
@@ -375,5 +431,6 @@ where
         }
     }
 
+    on_progress(LoadingEvent::Finished, renderer);
     sd_spi_speed_index
 }
