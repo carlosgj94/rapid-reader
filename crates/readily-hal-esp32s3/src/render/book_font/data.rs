@@ -1,18 +1,6 @@
-// Auto-generated serif bitmap font for RSVP word rendering.
-// Source font: NimbusRoman-Regular.otf
-// Raster size: 42px
+use super::SerifGlyph;
 
-pub const FONT_HEIGHT: usize = 43;
-
-#[derive(Clone, Copy)]
-pub struct SerifGlyph {
-    pub left: i8,
-    pub width: u8,
-    pub advance: u8,
-    pub rows: [u64; FONT_HEIGHT],
-}
-
-pub static GLYPHS: [SerifGlyph; 95] = [
+pub(super) static GLYPHS: [SerifGlyph; 95] = [
     /* ' ' */
     SerifGlyph {
         left: 0,
@@ -4859,12 +4847,3 @@ pub static GLYPHS: [SerifGlyph; 95] = [
         ],
     },
 ];
-
-pub fn glyph(c: char) -> &'static SerifGlyph {
-    let idx = c as usize;
-    if (32..=126).contains(&idx) {
-        &GLYPHS[idx - 32]
-    } else {
-        &GLYPHS[(b'?' - 32) as usize]
-    }
-}

@@ -1,7 +1,5 @@
 //! Input abstraction layer.
 
-pub mod mock;
-
 /// Logical actions consumed by the reader app.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {

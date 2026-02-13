@@ -36,6 +36,7 @@ embassy-futures  = "0.1.2"
 static_cell      = "2.1.1"
 esp-println      = { version = "0.16.1", features = ["esp32s3", "log-04"] }
 heapless         = "0.8.0"
+embedded-hal     = "1.0.0"
 ls027b7dh01 = { path = "crates/ls027b7dh01" }
 readily-core = { path = "crates/readily-core" }
 readily-hal-esp32s3 = { path = "crates/readily-hal-esp32s3" }

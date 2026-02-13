@@ -1,4 +1,4 @@
-pub fn count_words(text: &str) -> usize {
+pub(super) fn count_words(text: &str) -> usize {
     let mut count = 0usize;
     let mut cursor = 0usize;
 
@@ -10,7 +10,7 @@ pub fn count_words(text: &str) -> usize {
     count
 }
 
-pub fn next_word_at(text: &str, mut cursor: usize) -> Option<(&str, usize)> {
+pub(super) fn next_word_at(text: &str, mut cursor: usize) -> Option<(&str, usize)> {
     let bytes = text.as_bytes();
     let len = bytes.len();
 
@@ -29,7 +29,7 @@ pub fn next_word_at(text: &str, mut cursor: usize) -> Option<(&str, usize)> {
     Some((&text[start..cursor], cursor))
 }
 
-pub fn first_words_excerpt(text: &str, max_words: usize) -> &str {
+pub(super) fn first_words_excerpt(text: &str, max_words: usize) -> &str {
     if text.is_empty() || max_words == 0 {
         return "";
     }

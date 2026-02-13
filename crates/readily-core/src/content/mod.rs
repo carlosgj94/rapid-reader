@@ -1,8 +1,6 @@
 //! Content sources for RSVP rendering.
 
-pub mod epub;
-pub mod sd_stub;
-pub mod static_source;
+pub mod sd_catalog;
 mod text_utils;
 
 /// One token emitted by a [`WordSource`].
