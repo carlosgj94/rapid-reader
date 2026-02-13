@@ -193,6 +193,33 @@ impl NavigationCatalog for SdCatalogSource {
         Ok(true)
     }
 
+    fn chapter_data_ready(&self, chapter_index: u16) -> bool {
+        if !self.selected_is_stream_mode() {
+            return true;
+        }
+
+        let total = self.selected_stream_chapter_total_hint();
+        if chapter_index >= total {
+            return false;
+        }
+
+        let current = self
+            .selected_stream_chapter_index()
+            .min(total.saturating_sub(1));
+        if chapter_index != current || self.waiting_for_refill {
+            return false;
+        }
+
+        if self.selected_paragraph_count() > 0 {
+            return true;
+        }
+
+        self.catalog_stream_terminal
+            .get(self.selected_book)
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn paragraph_preview(&self, paragraph_index: u16) -> Option<&str> {
         self.selected_paragraph_at(paragraph_index as usize)
     }

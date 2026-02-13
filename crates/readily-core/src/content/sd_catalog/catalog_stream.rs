@@ -85,7 +85,8 @@ impl SdCatalogSource {
             sanitize_epub_chunk(&parse_input[..parse_len], html_state, treat_as_plain_text);
         html_tail.clear();
         if let Some(start) = tail_start {
-            for &byte in &parse_input[start..parse_len] {
+            let carry_start = Self::carry_start_for_tail(&parse_input[..parse_len], start);
+            for &byte in &parse_input[carry_start..parse_len] {
                 if html_tail.push(byte).is_err() {
                     break;
                 }
@@ -191,6 +192,24 @@ impl SdCatalogSource {
         }
 
         Ok(SdCatalogTextLoadResult { loaded, truncated })
+    }
+
+    fn carry_start_for_tail(parse_input: &[u8], tail_start: usize) -> usize {
+        if tail_start == 0 || tail_start > parse_input.len() {
+            return tail_start.min(parse_input.len());
+        }
+
+        let mut carry_start = tail_start;
+        while carry_start > 0 {
+            let prev = parse_input[carry_start - 1];
+            let part_of_word =
+                prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' || prev >= 0x80;
+            if !part_of_word {
+                break;
+            }
+            carry_start -= 1;
+        }
+        carry_start
     }
 
     pub fn mark_catalog_stream_exhausted(&mut self, index: u16) -> Result<(), SdCatalogError> {
@@ -305,11 +324,12 @@ impl SdCatalogSource {
             .filter(|path| !path.is_empty())
     }
 
-    pub fn set_catalog_stream_chapter_hint(
+    pub fn set_catalog_stream_chapter_metadata(
         &mut self,
         index: u16,
         chapter_index: u16,
         chapter_total: u16,
+        chapter_label: Option<&str>,
     ) -> Result<(), SdCatalogError> {
         let idx = index as usize;
         let Some(chapter_idx_slot) = self.catalog_stream_chapter_index.get_mut(idx) else {
@@ -318,16 +338,37 @@ impl SdCatalogSource {
         let Some(chapter_total_slot) = self.catalog_stream_chapter_total_hint.get_mut(idx) else {
             return Err(SdCatalogError::InvalidTextIndex);
         };
+        let Some(chapter_label_slot) = self.catalog_stream_chapter_label.get_mut(idx) else {
+            return Err(SdCatalogError::InvalidTextIndex);
+        };
 
         let total = chapter_total.max(1);
         *chapter_total_slot = total;
         *chapter_idx_slot = chapter_index.min(total.saturating_sub(1));
+        if let Some(label) = chapter_label.filter(|value| !value.trim().is_empty()) {
+            chapter_label_slot.clear();
+            for ch in label.chars() {
+                if chapter_label_slot.push(ch).is_err() {
+                    break;
+                }
+            }
+        }
         debug!(
-            "sd-stream: chapter-hint idx={} chapter={}/{}",
+            "sd-stream: chapter-hint idx={} chapter={}/{} label={:?}",
             idx,
             chapter_idx_slot.saturating_add(1),
-            *chapter_total_slot
+            *chapter_total_slot,
+            chapter_label_slot.as_str()
         );
         Ok(())
+    }
+
+    pub fn set_catalog_stream_chapter_hint(
+        &mut self,
+        index: u16,
+        chapter_index: u16,
+        chapter_total: u16,
+    ) -> Result<(), SdCatalogError> {
+        self.set_catalog_stream_chapter_metadata(index, chapter_index, chapter_total, None)
     }
 }

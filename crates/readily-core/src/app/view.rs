@@ -50,6 +50,7 @@ where
         let rendered = match self.ui {
             UiState::Countdown { .. } => self.tick_countdown(now_ms),
             UiState::Reading { .. } => self.tick_reading(now_ms),
+            UiState::NavigateChapterLoading { .. } => self.tick_chapter_loading(now_ms),
             UiState::Library { .. }
             | UiState::Settings { .. }
             | UiState::NavigateChapter { .. }
@@ -263,6 +264,58 @@ where
                     wpm: self.config.wpm,
                     current_chapter: current_chapter.saturating_add(1),
                     target_chapter: chapter_cursor.saturating_add(1),
+                    chapter_total,
+                    current_label,
+                    target_label,
+                    current_secondary,
+                    target_secondary,
+                    style: self.style,
+                    animation,
+                });
+            }
+            UiState::NavigateChapterLoading {
+                selected_book,
+                chapter_index,
+            } => {
+                let title = self.content.title_at(selected_book).unwrap_or("Untitled");
+                let chapter_total = self.content.chapter_count().max(1);
+                let chapter_index = chapter_index.min(chapter_total.saturating_sub(1));
+                let current_chapter = self.current_chapter_index();
+                let current_label_raw = self
+                    .content
+                    .chapter_at(current_chapter)
+                    .map(|c| c.label)
+                    .unwrap_or("Current");
+                let target_label_raw = self
+                    .content
+                    .chapter_at(chapter_index)
+                    .map(|c| c.label)
+                    .unwrap_or("Target");
+
+                let mut current_label_buf = [0u8; NAV_LABEL_BYTES];
+                let mut target_label_buf = [0u8; NAV_LABEL_BYTES];
+                let mut current_secondary_buf = [0u8; NAV_LABEL_BYTES];
+                let mut target_secondary_buf = [0u8; NAV_LABEL_BYTES];
+                let current_label = preview_compact(current_label_raw, &mut current_label_buf);
+                let target_label = preview_compact(target_label_raw, &mut target_label_buf);
+                let current_secondary = section_secondary_label(
+                    current_chapter.saturating_add(1),
+                    chapter_total,
+                    "Current",
+                    &mut current_secondary_buf,
+                );
+                let target_secondary = section_secondary_label(
+                    chapter_index.saturating_add(1),
+                    chapter_total,
+                    "Loading chapter...",
+                    &mut target_secondary_buf,
+                );
+
+                f(Screen::NavigateChapters {
+                    title,
+                    wpm: self.config.wpm,
+                    current_chapter: current_chapter.saturating_add(1),
+                    target_chapter: chapter_index.saturating_add(1),
                     chapter_total,
                     current_label,
                     target_label,

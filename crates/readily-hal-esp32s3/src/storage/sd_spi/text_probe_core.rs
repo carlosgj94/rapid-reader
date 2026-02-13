@@ -314,11 +314,38 @@ fn find_text_entry_by_chapter_index<
     file: &mut embedded_sdmmc::File<'_, D, T, MAX_DIRS, MAX_FILES, MAX_VOLUMES>,
     file_size: u32,
     target_chapter: u16,
-) -> Result<Option<ChapterEntry<PATH_BYTES>>, embedded_sdmmc::Error<D::Error>>
+) -> Result<Option<ChapterProbeTarget<PATH_BYTES>>, embedded_sdmmc::Error<D::Error>>
 where
     D: embedded_sdmmc::BlockDevice,
     T: TimeSource,
 {
+    let mut toc_resource = String::<PATH_BYTES>::new();
+    let mut toc_fragment = String::<ZIP_PATH_BYTES>::new();
+    let mut toc_label = String::<SD_CHAPTER_LABEL_BYTES>::new();
+    let mut toc_index = 0u16;
+    let mut toc_total = 1u16;
+    if let Some(entry) = find_toc_chapter_entry_at_index::<_, _, _, _, _, PATH_BYTES>(
+        file,
+        file_size,
+        target_chapter,
+        &mut toc_resource,
+        &mut toc_fragment,
+        &mut toc_label,
+        &mut toc_index,
+        &mut toc_total,
+    )? {
+        let start_offset = find_fragment_offset_in_zip_entry(file, entry, toc_fragment.as_str())?
+            .unwrap_or(0);
+        return Ok(Some(ChapterProbeTarget {
+            entry,
+            resource: toc_resource,
+            chapter_index: toc_index,
+            chapter_total: toc_total.max(1),
+            chapter_label: toc_label,
+            start_offset,
+        }));
+    }
+
     let mut opf_buf = [0u8; ZIP_OPF_BYTES];
     if let Some((opf_entry, opf_path)) =
         find_opf_entry_and_path::<_, _, _, _, _, PATH_BYTES>(file, file_size)?
@@ -337,12 +364,41 @@ where
                 &mut chapter_total,
             ) && let Some(entry) = find_entry_by_path(file, file_size, chapter_path.as_bytes())?
             {
-                return Ok(Some((entry, chapter_path, chapter_index, chapter_total)));
+                return Ok(Some(ChapterProbeTarget {
+                    entry,
+                    resource: chapter_path,
+                    chapter_index,
+                    chapter_total: chapter_total.max(1),
+                    chapter_label: String::new(),
+                    start_offset: 0,
+                }));
             }
         }
     }
 
-    cdir_text_entry_at::<_, _, _, _, _, PATH_BYTES>(file, file_size, target_chapter)
+    let Some((entry, resource, chapter_index, chapter_total)) =
+        cdir_text_entry_at::<_, _, _, _, _, PATH_BYTES>(file, file_size, target_chapter)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ChapterProbeTarget {
+        entry,
+        resource,
+        chapter_index,
+        chapter_total: chapter_total.max(1),
+        chapter_label: String::new(),
+        start_offset: 0,
+    }))
+}
+
+#[derive(Debug)]
+struct ChapterProbeTarget<const PATH_BYTES: usize> {
+    entry: ZipEntryRef,
+    resource: String<PATH_BYTES>,
+    chapter_index: u16,
+    chapter_total: u16,
+    chapter_label: String<SD_CHAPTER_LABEL_BYTES>,
+    start_offset: u32,
 }
 
 /// Probe card + mount FAT + read a first text chunk from one EPUB file.
@@ -409,8 +465,10 @@ where
     let mut result = SdEpubTextChunkResult {
         card_size_bytes,
         text_resource: String::new(),
+        start_offset: 0,
         chapter_index: 0,
         chapter_total: 1,
+        chapter_label: String::new(),
         compression: 0,
         bytes_read: 0,
         end_of_resource: false,
@@ -452,7 +510,7 @@ where
     }
 
     let file_size = file.length();
-    if let Some((entry, resource, chapter_index, chapter_total)) =
+    if let Some(target) =
         find_text_entry_by_chapter_index::<_, _, _, _, _, PATH_BYTES>(
             &mut file,
             file_size,
@@ -460,14 +518,17 @@ where
         )
         .map_err(SdProbeError::Filesystem)?
     {
-        result.compression = entry.compression;
-        result.text_resource = resource;
-        result.chapter_index = chapter_index;
-        result.chapter_total = chapter_total.max(1);
+        result.compression = target.entry.compression;
+        result.text_resource = target.resource;
+        result.start_offset = target.start_offset;
+        result.chapter_index = target.chapter_index;
+        result.chapter_total = target.chapter_total.max(1);
+        result.chapter_label = target.chapter_label;
 
-        if matches!(entry.compression, 0 | 8) {
+        if matches!(target.entry.compression, 0 | 8) {
             let (bytes_read, end_of_resource) =
-                read_zip_entry_chunk(&mut file, entry, 0, out).map_err(SdProbeError::Filesystem)?;
+                read_zip_entry_chunk(&mut file, target.entry, target.start_offset, out)
+                    .map_err(SdProbeError::Filesystem)?;
             result.bytes_read = bytes_read;
             result.end_of_resource = end_of_resource;
             result.status = if bytes_read > 0 || end_of_resource {
@@ -487,4 +548,3 @@ where
 
     Ok(result)
 }
-

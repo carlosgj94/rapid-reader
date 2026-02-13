@@ -82,6 +82,10 @@ enum UiState {
         selected_book: u16,
         chapter_cursor: u16,
     },
+    NavigateChapterLoading {
+        selected_book: u16,
+        chapter_index: u16,
+    },
     NavigateParagraph {
         selected_book: u16,
         chapter_index: u16,

@@ -159,7 +159,9 @@ where
                                             break;
                                         }
                                     }
-                                    stream_state.next_offset = text_probe.bytes_read as u32;
+                                    stream_state.next_offset = text_probe
+                                        .start_offset
+                                        .saturating_add(text_probe.bytes_read as u32);
                                     stream_state.end_of_resource = text_probe.end_of_resource;
                                     stream_state.ready = !stream_state.text_resource.is_empty();
                                     match content.set_catalog_text_chunk_from_bytes(
@@ -169,10 +171,11 @@ where
                                         text_probe.text_resource.as_str(),
                                     ) {
                                         Ok(applied) => {
-                                            let _ = content.set_catalog_stream_chapter_hint(
+                                            let _ = content.set_catalog_stream_chapter_metadata(
                                                 index as u16,
                                                 text_probe.chapter_index,
                                                 text_probe.chapter_total,
+                                                Some(text_probe.chapter_label.as_str()),
                                             );
                                             if applied.loaded {
                                                 text_chunks_loaded =
@@ -183,11 +186,13 @@ where
                                                     text_chunks_truncated.saturating_add(1);
                                             }
                                             info!(
-                                                "sd: initial text chunk short_name={} resource={} chapter={}/{} compression={} bytes_read={} end={} applied_loaded={} applied_truncated={} preview={:?}",
+                                                "sd: initial text chunk short_name={} resource={} chapter={}/{} chapter_label={:?} start_offset={} compression={} bytes_read={} end={} applied_loaded={} applied_truncated={} preview={:?}",
                                                 epub.short_name,
                                                 text_probe.text_resource,
                                                 text_probe.chapter_index.saturating_add(1),
                                                 text_probe.chapter_total.max(1),
+                                                text_probe.chapter_label.as_str(),
+                                                text_probe.start_offset,
                                                 text_probe.compression,
                                                 text_probe.bytes_read,
                                                 text_probe.end_of_resource,

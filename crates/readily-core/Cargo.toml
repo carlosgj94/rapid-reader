@@ -7,3 +7,6 @@ rust-version = "1.88"
 [dependencies]
 heapless = "0.8.0"
 log = "0.4.27"
+
+[dev-dependencies]
+miniz_oxide = { version = "0.8.9", default-features = false }

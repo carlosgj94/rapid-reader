@@ -69,6 +69,24 @@ where
         self.pending_redraw = true;
     }
 
+    fn enter_chapter_loading(&mut self, selected_book: u16, chapter_index: u16, now_ms: u64) {
+        self.last_reading_press_ms = None;
+        self.last_pause_anim_slot = None;
+        let chapter_total = self.content.chapter_count().max(1);
+        debug!(
+            "ui-nav: enter chapter loading selected_book={} chapter_index={}/{}",
+            selected_book,
+            chapter_index.saturating_add(1),
+            chapter_total
+        );
+        self.ui = UiState::NavigateChapterLoading {
+            selected_book,
+            chapter_index: chapter_index.min(chapter_total.saturating_sub(1)),
+        };
+        self.start_transition(AnimationKind::Pulse, now_ms, 900);
+        self.pending_redraw = true;
+    }
+
     fn enter_paragraph_navigation(
         &mut self,
         selected_book: u16,
@@ -189,6 +207,22 @@ where
         }
 
         0
+    }
+
+    fn initial_paragraph_cursor_for_chapter(&self, chapter_index: u16) -> u16 {
+        let Some(chapter) = self.content.chapter_at(chapter_index) else {
+            return 0;
+        };
+
+        let current_paragraph = self.content.paragraph_index().saturating_sub(1);
+        let chapter_start = chapter.start_paragraph;
+        let chapter_end = chapter_start.saturating_add(chapter.paragraph_count.saturating_sub(1));
+
+        if (chapter_start..=chapter_end).contains(&current_paragraph) {
+            current_paragraph
+        } else {
+            chapter_start
+        }
     }
 
     fn current_chapter_index(&self) -> u16 {

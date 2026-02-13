@@ -36,6 +36,10 @@ where
                 selected_book,
                 chapter_cursor,
             } => self.apply_chapter_navigation_input(selected_book, chapter_cursor, event, now_ms),
+            UiState::NavigateChapterLoading {
+                selected_book,
+                chapter_index,
+            } => self.apply_chapter_loading_input(selected_book, chapter_index, event, now_ms),
             UiState::NavigateParagraph {
                 selected_book,
                 chapter_index,
@@ -294,62 +298,31 @@ where
                 self.pending_redraw = true;
             }
             InputEvent::Press => {
-                let Some(chapter) = self.content.chapter_at(chapter_cursor) else {
+                let Some(chapter_info) = self.content.chapter_at(chapter_cursor) else {
                     self.set_status("NAVIGATION ERROR", "CHAPTER INVALID", now_ms);
                     return;
                 };
 
-                let current_paragraph = self.content.paragraph_index().saturating_sub(1);
-                let chapter_start = chapter.start_paragraph;
-                let chapter_end =
-                    chapter_start.saturating_add(chapter.paragraph_count.saturating_sub(1));
-
-                let initial_cursor = if (chapter_start..=chapter_end).contains(&current_paragraph) {
-                    current_paragraph
-                } else {
-                    chapter_start
-                };
-
                 debug!(
-                    "ui-nav: chapter press selected_book={} chapter_cursor={}/{} label={:?} start_paragraph={} paragraph_count={} current_paragraph={} initial_cursor={}",
+                    "ui-nav: chapter press selected_book={} chapter_cursor={}/{} label={:?}",
                     selected_book,
                     chapter_cursor.saturating_add(1),
                     chapter_total,
-                    chapter.label,
-                    chapter_start,
-                    chapter.paragraph_count,
-                    current_paragraph,
-                    initial_cursor
+                    chapter_info.label,
                 );
 
                 match self.content.seek_chapter(chapter_cursor) {
                     Ok(true) => {
                         debug!(
-                            "ui-nav: chapter press seek accepted selected_book={} chapter_cursor={}/{} -> direct-reading",
+                            "ui-nav: chapter press seek accepted selected_book={} chapter_cursor={}/{}",
                             selected_book,
                             chapter_cursor.saturating_add(1),
                             chapter_total
                         );
-                        self.word_buffer.clear();
-                        self.paragraph_word_index = 0;
-                        self.paragraph_word_total = 1;
-                        self.last_ends_clause = false;
-                        self.last_ends_sentence = false;
-                        let _ = self.advance_word();
-                        self.ui = UiState::Reading {
-                            selected_book,
-                            paused: true,
-                            next_word_ms: now_ms,
-                        };
-                        self.paused_since_ms = Some(now_ms);
-                        self.last_pause_anim_slot = None;
-                        self.start_transition(AnimationKind::SlideRight, now_ms, ANIM_NAV_MS);
-                        self.pending_redraw = true;
-                        return;
                     }
                     Ok(false) => {
                         debug!(
-                            "ui-nav: chapter press seek unsupported selected_book={} chapter_cursor={}/{} -> paragraph-navigation",
+                            "ui-nav: chapter press seek unsupported selected_book={} chapter_cursor={}/{}",
                             selected_book,
                             chapter_cursor.saturating_add(1),
                             chapter_total
@@ -367,14 +340,34 @@ where
                     }
                 }
 
-                self.enter_paragraph_navigation(
-                    selected_book,
-                    chapter_cursor,
-                    initial_cursor,
-                    now_ms,
-                );
+                if self.content.chapter_data_ready(chapter_cursor) {
+                    let initial_cursor = self.initial_paragraph_cursor_for_chapter(chapter_cursor);
+                    self.enter_paragraph_navigation(
+                        selected_book,
+                        chapter_cursor,
+                        initial_cursor,
+                        now_ms,
+                    );
+                } else {
+                    self.enter_chapter_loading(selected_book, chapter_cursor, now_ms);
+                }
             }
         }
+    }
+
+    fn apply_chapter_loading_input(
+        &mut self,
+        selected_book: u16,
+        chapter_index: u16,
+        event: InputEvent,
+        _now_ms: u64,
+    ) {
+        debug!(
+            "ui-nav: chapter loading ignored input selected_book={} chapter_index={} event={:?}",
+            selected_book,
+            chapter_index.saturating_add(1),
+            event
+        );
     }
 
     fn apply_paragraph_navigation_input(

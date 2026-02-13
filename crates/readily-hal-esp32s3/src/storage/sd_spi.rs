@@ -90,8 +90,10 @@ pub enum SdEpubTextChunkStatus {
 pub struct SdEpubTextChunkResult<const PATH_BYTES: usize> {
     pub card_size_bytes: u64,
     pub text_resource: String<PATH_BYTES>,
+    pub start_offset: u32,
     pub chapter_index: u16,
     pub chapter_total: u16,
+    pub chapter_label: String<SD_CHAPTER_LABEL_BYTES>,
     pub compression: u16,
     pub bytes_read: usize,
     pub end_of_resource: bool,
@@ -330,6 +332,7 @@ const ZIP_CONTAINER_BYTES: usize = 1024;
 const ZIP_OPF_BYTES: usize = 8192;
 const ZIP_PATH_BYTES: usize = 192;
 const ZIP_MEDIA_BYTES: usize = 32;
+pub const SD_CHAPTER_LABEL_BYTES: usize = 48;
 const ZIP_COVER_BYTES: usize = 12288;
 const ZIP_MAX_CDIR_ENTRIES: usize = 512;
 const ZIP_DEFLATE_INPUT_BYTES: usize = 320;
@@ -370,10 +373,12 @@ type CoverFallbackEntryResult<DErr, const PATH_BYTES: usize, const MEDIA_BYTES: 
 include!("sd_spi/text_xml.rs");
 include!("sd_spi/media_manifest.rs");
 include!("sd_spi/spine_index.rs");
+include!("sd_spi/toc_index.rs");
 include!("sd_spi/cdir.rs");
 include!("sd_spi/png_pbm.rs");
 include!("sd_spi/jpeg.rs");
 include!("sd_spi/io_entry.rs");
+include!("sd_spi/chapter_seek.rs");
 include!("sd_spi/text_probe_core.rs");
 include!("sd_spi/cover_probe.rs");
 include!("sd_spi/stream_scan.rs");

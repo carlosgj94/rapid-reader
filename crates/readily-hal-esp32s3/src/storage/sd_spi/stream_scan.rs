@@ -37,8 +37,10 @@ where
     let mut result = SdEpubTextChunkResult {
         card_size_bytes,
         text_resource: String::new(),
+        start_offset,
         chapter_index: 0,
         chapter_total: 1,
+        chapter_label: String::new(),
         compression: 0,
         bytes_read: 0,
         end_of_resource: false,
@@ -98,11 +100,17 @@ where
     if let Some((entry, resource)) = selected_entry {
         result.compression = entry.compression;
         result.text_resource = resource;
-        if let Ok(Some((chapter_index, chapter_total))) =
-            spine_position_for_resource(&mut file, file_size, result.text_resource.as_str())
+        let mut chapter_label = String::<SD_CHAPTER_LABEL_BYTES>::new();
+        if let Ok(Some((chapter_index, chapter_total))) = chapter_position_for_resource(
+            &mut file,
+            file_size,
+            result.text_resource.as_str(),
+            &mut chapter_label,
+        )
         {
             result.chapter_index = chapter_index;
             result.chapter_total = chapter_total;
+            result.chapter_label = chapter_label;
         }
 
         if matches!(entry.compression, 0 | 8) {
@@ -161,8 +169,10 @@ where
     let mut result = SdEpubTextChunkResult {
         card_size_bytes,
         text_resource: String::new(),
+        start_offset: 0,
         chapter_index: 0,
         chapter_total: 1,
+        chapter_label: String::new(),
         compression: 0,
         bytes_read: 0,
         end_of_resource: false,
@@ -210,11 +220,17 @@ where
     {
         result.compression = entry.compression;
         result.text_resource = resource;
-        if let Ok(Some((chapter_index, chapter_total))) =
-            spine_position_for_resource(&mut file, file_size, result.text_resource.as_str())
+        let mut chapter_label = String::<SD_CHAPTER_LABEL_BYTES>::new();
+        if let Ok(Some((chapter_index, chapter_total))) = chapter_position_for_resource(
+            &mut file,
+            file_size,
+            result.text_resource.as_str(),
+            &mut chapter_label,
+        )
         {
             result.chapter_index = chapter_index;
             result.chapter_total = chapter_total;
+            result.chapter_label = chapter_label;
         }
 
         if matches!(entry.compression, 0 | 8) {

@@ -118,12 +118,14 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
         ) {
             Ok(text_probe) => {
                 debug!(
-                    "sd: refill seek probe short_name={} status={:?} resource={} chapter={}/{} bytes_read={} end={}",
+                    "sd: refill seek probe short_name={} status={:?} resource={} chapter={}/{} chapter_label={:?} start_offset={} bytes_read={} end={}",
                     stream_state.short_name,
                     text_probe.status,
                     text_probe.text_resource,
                     text_probe.chapter_index.saturating_add(1),
                     text_probe.chapter_total.max(1),
+                    text_probe.chapter_label.as_str(),
+                    text_probe.start_offset,
                     text_probe.bytes_read,
                     text_probe.end_of_resource
                 );
@@ -185,12 +187,14 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
             match refill_result {
                 Ok(text_probe) => {
                     debug!(
-                        "sd: refill probe result short_name={} status={:?} resource={} chapter={}/{} bytes_read={} end={}",
+                        "sd: refill probe result short_name={} status={:?} resource={} chapter={}/{} chapter_label={:?} start_offset={} bytes_read={} end={}",
                         stream_state.short_name,
                         text_probe.status,
                         text_probe.text_resource,
                         text_probe.chapter_index.saturating_add(1),
                         text_probe.chapter_total.max(1),
+                        text_probe.chapter_label.as_str(),
+                        text_probe.start_offset,
                         text_probe.bytes_read,
                         text_probe.end_of_resource
                     );
@@ -273,16 +277,19 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
             text_probe.end_of_resource,
             text_probe.text_resource.as_str(),
         )?;
-        let _ = content.set_catalog_stream_chapter_hint(
+        let _ = content.set_catalog_stream_chapter_metadata(
             book_index,
             text_probe.chapter_index,
             text_probe.chapter_total,
+            Some(text_probe.chapter_label.as_str()),
         );
         Ok::<_, SdCatalogError>(applied)
     }) {
         Ok(applied) => {
             if moved_flag {
-                stream_state.next_offset = text_probe.bytes_read as u32;
+                stream_state.next_offset = text_probe
+                    .start_offset
+                    .saturating_add(text_probe.bytes_read as u32);
             } else {
                 stream_state.next_offset = stream_state
                     .next_offset
@@ -297,11 +304,13 @@ pub(super) fn handle_pending_refill<IN, BUS, CS, DELAY, F>(
             }
             stream_state.ready = !stream_state.text_resource.is_empty();
             debug!(
-                "sd: refill apply short_name={} resource={} chapter={}/{} bytes_read={} end={} applied_loaded={} applied_truncated={} next_offset={} next_ready={}",
+                "sd: refill apply short_name={} resource={} chapter={}/{} chapter_label={:?} start_offset={} bytes_read={} end={} applied_loaded={} applied_truncated={} next_offset={} next_ready={}",
                 stream_state.short_name,
                 stream_state.text_resource,
                 text_probe.chapter_index.saturating_add(1),
                 text_probe.chapter_total.max(1),
+                text_probe.chapter_label.as_str(),
+                text_probe.start_offset,
                 text_probe.bytes_read,
                 text_probe.end_of_resource,
                 applied.loaded,

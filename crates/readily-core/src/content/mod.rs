@@ -88,6 +88,11 @@ pub trait NavigationCatalog: WordSource {
         Ok(false)
     }
 
+    /// Whether paragraph data for the given chapter is currently ready.
+    fn chapter_data_ready(&self, _chapter_index: u16) -> bool {
+        true
+    }
+
     /// Preview string for a paragraph (zero-based index).
     fn paragraph_preview(&self, paragraph_index: u16) -> Option<&str>;
 }

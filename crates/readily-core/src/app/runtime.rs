@@ -3,6 +3,29 @@ where
     WS: WordSource + TextCatalog + SelectableWordSource + ParagraphNavigator + NavigationCatalog,
     IN: InputProvider,
 {
+    fn tick_chapter_loading(&mut self, now_ms: u64) -> TickResult {
+        let (selected_book, chapter_index) = match self.ui {
+            UiState::NavigateChapterLoading {
+                selected_book,
+                chapter_index,
+            } => (selected_book, chapter_index),
+            _ => return TickResult::NoRender,
+        };
+
+        if self.content.chapter_data_ready(chapter_index) {
+            let initial_cursor = self.initial_paragraph_cursor_for_chapter(chapter_index);
+            self.enter_paragraph_navigation(selected_book, chapter_index, initial_cursor, now_ms);
+            return TickResult::RenderRequested;
+        }
+
+        if self.pending_redraw {
+            self.pending_redraw = false;
+            return TickResult::RenderRequested;
+        }
+
+        TickResult::NoRender
+    }
+
     fn tick_countdown(&mut self, now_ms: u64) -> TickResult {
         if self.pending_redraw {
             self.pending_redraw = false;
