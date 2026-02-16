@@ -42,6 +42,12 @@ Design rule:
 
 ## Hardware Wiring (Current Firmware Defaults)
 
+### Full Board Schematic
+
+![Readily KiCad schematic](docs/assets/schematics.png)
+
+KiCad project files live under `kicad/readily/` (main schematic: `kicad/readily/readily.kicad_sch`).
+
 ### Display (Sharp LS027 breakout)
 
 | Breakout Pin | Firmware Signal | ESP32-S3 GPIO |
