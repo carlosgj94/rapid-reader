@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "Pins01x09")(type "KiCad")(uri "${KIPRJMOD}/modules/Pins01x09.pretty")(options "")(descr ""))
+)
