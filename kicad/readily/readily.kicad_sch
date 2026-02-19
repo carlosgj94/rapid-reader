@@ -2112,6 +2112,299 @@
 			)
 			(embedded_fonts no)
 		)
+		(symbol "ED08905M-FE15C7.0-C10-2053:ED08905M-FE15C7_0-C10-2053"
+			(pin_names
+				(offset 1.016)
+			)
+			(exclude_from_sim no)
+			(in_bom yes)
+			(on_board yes)
+			(property "Reference" "U"
+				(at 0 9.62 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Value" "ED08905M-FE15C7_0-C10-2053"
+				(at 0 -9.62 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+				)
+			)
+			(property "Footprint" "JLCImport:ED08905M-FE15C7_0-C10-2053"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(property "Datasheet" "https://atta.szlcsc.com/upload/public/pdf/source/20231010/08DF4ED4D74BD216E9F3C5DD72D7D396.pdf"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(property "Description" "-30℃~+70℃ 1mA 20/20 5V Incremental Right-Angle Two-phase output Plugin Rotary Encoders ROHS"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(property "LCSC" "C18213469"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(property "Manufacturer" "CTR"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(property "Manufacturer Part" "ED08905M-FE15C7.0-C10-2053"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(property "ki_keywords" "C18213469 CTR ED08905M-FE15C7.0-C10-2053 SW-TH_CTR_ED08905M-FE15C7.0-C10-2053"
+				(at 0 0 0)
+				(effects
+					(font
+						(size 1.27 1.27)
+					)
+					(hide yes)
+				)
+			)
+			(symbol "ED08905M-FE15C7_0-C10-2053_0_1"
+				(rectangle
+					(start -5.08 5.08)
+					(end 5.08 -5.08)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type background)
+					)
+				)
+				(circle
+					(center -3.81 3.81)
+					(radius 0.635)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center -3.81 -3.81)
+					(radius 0.635)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center 0 0)
+					(radius 1.905)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center 0 0)
+					(radius 2.54)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center 3.81 3.81)
+					(radius 0.635)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(circle
+					(center 3.81 -3.81)
+					(radius 0.635)
+					(stroke
+						(width 0.254)
+						(type solid)
+					)
+					(fill
+						(type none)
+					)
+				)
+				(pin unspecified line
+					(at -7.62 0 0)
+					(length 2.54)
+					(name "S1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "S1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin unspecified line
+					(at -2.54 7.62 270)
+					(length 2.54)
+					(name "2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin unspecified line
+					(at -2.54 -7.62 90)
+					(length 2.54)
+					(name "B"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "B"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin unspecified line
+					(at 0 -7.62 90)
+					(length 2.54)
+					(name "C"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "C"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin unspecified line
+					(at 2.54 7.62 270)
+					(length 2.54)
+					(name "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "1"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin unspecified line
+					(at 2.54 -7.62 90)
+					(length 2.54)
+					(name "A"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "A"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+				(pin unspecified line
+					(at 7.62 0 180)
+					(length 2.54)
+					(name "S2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+					(number "S2"
+						(effects
+							(font
+								(size 1.27 1.27)
+							)
+						)
+					)
+				)
+			)
+			(embedded_fonts no)
+		)
 		(symbol "Power_Protection:TPD2EUSB30"
 			(pin_names
 				(offset 0)
@@ -3524,388 +3817,6 @@
 			)
 			(embedded_fonts no)
 		)
-		(symbol "RotatoryEncoder:PEC11R-4220F-S0024"
-			(pin_names
-				(offset 1.016)
-			)
-			(exclude_from_sim no)
-			(in_bom yes)
-			(on_board yes)
-			(property "Reference" "S"
-				(at -7.62 10.922 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify left bottom)
-				)
-			)
-			(property "Value" "PEC11R-4220F-S0024"
-				(at -7.62 -12.7 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify left bottom)
-				)
-			)
-			(property "Footprint" "PEC11R-4220F-S0024:XDCR_PEC11R-4220F-S0024"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Datasheet" ""
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(property "Description" ""
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(hide yes)
-				)
-			)
-			(property "MF" "Bourns"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Description_1" "Encoder, Rotary, 24 Detents, 20 mm Shaft, Switch | Bourns PEC11R-4220F-S0024"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "CREATOR" "ASHISH"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Price" "None"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Package" "None"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Check_prices" "https://www.snapeda.com/parts/PEC11R-4220F-S0024/Bourns/view-part/?ref=eda"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "STANDARD" "Manufacturer Recommendations"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "PARTREV" "11/23"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "VERIFIER" "KARTHIK"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "SnapEDA_Link" "https://www.snapeda.com/parts/PEC11R-4220F-S0024/Bourns/view-part/?ref=snap"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "MP" "PEC11R-4220F-S0024"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Purchase-URL" "https://www.snapeda.com/api/url_track_click_mouser/?unipart_id=48710&manufacturer=Bourns&part_name=PEC11R-4220F-S0024&search_term=None"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "Availability" "In Stock"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(property "MANUFACTURER" "Bourns"
-				(at 0 0 0)
-				(effects
-					(font
-						(size 1.27 1.27)
-					)
-					(justify bottom)
-					(hide yes)
-				)
-			)
-			(symbol "PEC11R-4220F-S0024_0_0"
-				(rectangle
-					(start -7.62 -10.16)
-					(end 7.62 10.16)
-					(stroke
-						(width 0.254)
-						(type default)
-					)
-					(fill
-						(type background)
-					)
-				)
-				(polyline
-					(pts
-						(xy -2.54 5.08) (xy -7.62 5.08)
-					)
-					(stroke
-						(width 0.254)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-				(polyline
-					(pts
-						(xy -2.54 5.08) (xy 2.794 7.2136)
-					)
-					(stroke
-						(width 0.254)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-				(circle
-					(center 2.54 5.08)
-					(radius 0.3302)
-					(stroke
-						(width 0.254)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-				(polyline
-					(pts
-						(xy 7.62 5.08) (xy 2.921 5.08)
-					)
-					(stroke
-						(width 0.254)
-						(type default)
-					)
-					(fill
-						(type none)
-					)
-				)
-				(pin passive line
-					(at -12.7 5.08 0)
-					(length 5.08)
-					(name "~"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "1"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-				(pin passive line
-					(at -12.7 0 0)
-					(length 5.08)
-					(name "COM"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "C"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-				(pin passive line
-					(at 12.7 5.08 180)
-					(length 5.08)
-					(name "~"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "2"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-				(pin passive line
-					(at 12.7 0 180)
-					(length 5.08)
-					(name "A"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "A"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-				(pin passive line
-					(at 12.7 -2.54 180)
-					(length 5.08)
-					(name "B"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "B"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-				(pin passive line
-					(at 12.7 -7.62 180)
-					(length 5.08)
-					(name "SHIELD"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "SH1"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-				(pin passive line
-					(at 12.7 -7.62 180)
-					(length 5.08)
-					(hide yes)
-					(name "SHIELD"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-					(number "SH2"
-						(effects
-							(font
-								(size 1.016 1.016)
-							)
-						)
-					)
-				)
-			)
-			(embedded_fonts no)
-		)
 		(symbol "Switch:SW_SPST"
 			(pin_names
 				(offset 0)
@@ -4697,7 +4608,7 @@
 	(text_box "Rotatory Encoder"
 		(exclude_from_sim no)
 		(at 134.62 15.24 0)
-		(size 48.26 34.29)
+		(size 41.91 31.75)
 		(margins 0.9525 0.9525 0.9525 0.9525)
 		(stroke
 			(width 0)
@@ -5970,50 +5881,6 @@
 			)
 		)
 	)
-	(global_label "GND"
-		(shape input)
-		(at 170.18 31.75 0)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left)
-		)
-		(uuid "0e08af95-3c5a-48ca-aae2-1d7a2e6d7f14")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 177.0357 31.75 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-				(hide yes)
-			)
-		)
-	)
-	(global_label "GND"
-		(shape input)
-		(at 170.18 44.45 0)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left)
-		)
-		(uuid "0eb971e8-1b68-445c-8a40-48de4994b079")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 177.0357 44.45 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
-				(hide yes)
-			)
-		)
-	)
 	(global_label "D-"
 		(shape input)
 		(at 90.17 144.78 0)
@@ -6124,6 +5991,28 @@
 			)
 		)
 	)
+	(global_label "GND"
+		(shape input)
+		(at 154.94 43.18 0)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "2c1a160c-eb6c-4fc3-a970-6f0102288722")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 161.7957 43.18 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+				(hide yes)
+			)
+		)
+	)
 	(global_label "BAT_CHG"
 		(shape input)
 		(at 100.33 99.06 270)
@@ -6142,6 +6031,50 @@
 					(size 1.27 1.27)
 				)
 				(justify right)
+				(hide yes)
+			)
+		)
+	)
+	(global_label "RT_CLK"
+		(shape input)
+		(at 162.56 33.02 0)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "3cf9a1a8-7444-43df-bccf-f44d81321e1c")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 172.3185 33.02 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+				(hide yes)
+			)
+		)
+	)
+	(global_label "RT_DT"
+		(shape input)
+		(at 162.56 38.1 0)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "3d68d36c-924e-4f4f-9350-9e2f4e86667c")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 170.988 38.1 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
 				(hide yes)
 			)
 		)
@@ -6186,28 +6119,6 @@
 					(size 1.27 1.27)
 				)
 				(justify right)
-				(hide yes)
-			)
-		)
-	)
-	(global_label "RT_DT"
-		(shape input)
-		(at 170.18 39.37 0)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify left)
-		)
-		(uuid "46d63d07-a041-4ca4-8733-6aeac5223012")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 178.608 39.37 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify left)
 				(hide yes)
 			)
 		)
@@ -6278,9 +6189,9 @@
 			)
 		)
 	)
-	(global_label "RT_CLK"
+	(global_label "GND"
 		(shape input)
-		(at 170.18 36.83 0)
+		(at 154.94 27.94 0)
 		(fields_autoplaced yes)
 		(effects
 			(font
@@ -6288,9 +6199,9 @@
 			)
 			(justify left)
 		)
-		(uuid "78cd6020-717e-4541-91c8-ff3b484c0657")
+		(uuid "6b2197ab-be4b-4fdf-941c-8055d4ab70e5")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 179.9385 36.83 0)
+			(at 161.7957 27.94 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -6542,6 +6453,28 @@
 			)
 		)
 	)
+	(global_label "GND"
+		(shape input)
+		(at 147.32 38.1 180)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right)
+		)
+		(uuid "a9f0bccc-61a1-43fa-93e4-cc897b508df0")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 140.4643 38.1 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+				(hide yes)
+			)
+		)
+	)
 	(global_label "SYS_OUT"
 		(shape input)
 		(at 246.38 83.82 0)
@@ -6720,7 +6653,7 @@
 	)
 	(global_label "RT_SW"
 		(shape input)
-		(at 144.78 31.75 180)
+		(at 147.32 33.02 180)
 		(fields_autoplaced yes)
 		(effects
 			(font
@@ -6728,9 +6661,9 @@
 			)
 			(justify right)
 		)
-		(uuid "c96ae16e-604f-4fb5-95b0-5b4c15063e8f")
+		(uuid "cbfe9678-16d5-4da2-b8d5-db2e3b8dc44c")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 135.9287 31.75 0)
+			(at 138.4687 33.02 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -6784,6 +6717,28 @@
 			)
 		)
 	)
+	(global_label "GND"
+		(shape input)
+		(at 162.56 35.56 0)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "d74c1167-0e9f-4fba-b5dd-1cc6c2eb0222")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 169.4157 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+				(hide yes)
+			)
+		)
+	)
 	(global_label "BAT_NTC"
 		(shape input)
 		(at 224.79 128.27 180)
@@ -6819,28 +6774,6 @@
 		(uuid "e9f3990c-733d-4214-b934-2d3f24330aaf")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
 			(at 152.4 184.7766 90)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify right)
-				(hide yes)
-			)
-		)
-	)
-	(global_label "GND"
-		(shape input)
-		(at 144.78 36.83 180)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify right)
-		)
-		(uuid "fc4213ef-3d21-4784-b08e-8be2603d529a")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 137.9243 36.83 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -9146,230 +9079,6 @@
 		)
 	)
 	(symbol
-		(lib_id "RotatoryEncoder:PEC11R-4220F-S0024")
-		(at 157.48 36.83 0)
-		(unit 1)
-		(exclude_from_sim no)
-		(in_bom yes)
-		(on_board yes)
-		(dnp no)
-		(fields_autoplaced yes)
-		(uuid "9c8f9320-f296-4f31-8f27-9595a26ef5f3")
-		(property "Reference" "S1"
-			(at 157.48 21.59 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-			)
-		)
-		(property "Value" "PEC11R-4220F-S0024"
-			(at 157.48 24.13 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-			)
-		)
-		(property "Footprint" "RotatoryEncoder:XDCR_PEC11R-4220F-S0024"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Datasheet" ""
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "Description" ""
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(hide yes)
-			)
-		)
-		(property "MF" "Bourns"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Description_1" "Encoder, Rotary, 24 Detents, 20 mm Shaft, Switch | Bourns PEC11R-4220F-S0024"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "CREATOR" "ASHISH"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Price" "None"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Package" "None"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Check_prices" "https://www.snapeda.com/parts/PEC11R-4220F-S0024/Bourns/view-part/?ref=eda"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "STANDARD" "Manufacturer Recommendations"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "PARTREV" "11/23"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "VERIFIER" "KARTHIK"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "SnapEDA_Link" "https://www.snapeda.com/parts/PEC11R-4220F-S0024/Bourns/view-part/?ref=snap"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "MP" "PEC11R-4220F-S0024"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Purchase-URL" "https://www.snapeda.com/api/url_track_click_mouser/?unipart_id=48710&manufacturer=Bourns&part_name=PEC11R-4220F-S0024&search_term=None"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "Availability" "In Stock"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(property "MANUFACTURER" "Bourns"
-			(at 157.48 36.83 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify bottom)
-				(hide yes)
-			)
-		)
-		(pin "B"
-			(uuid "5efc857d-15c7-4c47-a567-a9ac6d254c43")
-		)
-		(pin "SH2"
-			(uuid "936c74ea-a7e6-478e-9c1f-93a27da54c21")
-		)
-		(pin "A"
-			(uuid "629e9b77-453a-4361-ac96-92c6ce6872a6")
-		)
-		(pin "C"
-			(uuid "e0d05963-0edc-4782-a077-cf7f8c1ad219")
-		)
-		(pin "1"
-			(uuid "a4aee028-c18e-4fac-be92-b63b2eaecb4a")
-		)
-		(pin "2"
-			(uuid "75de6283-5227-4c22-b0e2-db0dac402f37")
-		)
-		(pin "SH1"
-			(uuid "856fbcfd-9962-46da-8db7-0c8a11ae7676")
-		)
-		(instances
-			(project "readily"
-				(path "/7a0c6d24-d9a6-4139-a9d3-5084207ee7b9"
-					(reference "S1")
-					(unit 1)
-				)
-			)
-		)
-	)
-	(symbol
 		(lib_id "Connector:Conn_01x09_Socket")
 		(at 149.86 168.91 90)
 		(unit 1)
@@ -10146,6 +9855,117 @@
 			(project "readily"
 				(path "/7a0c6d24-d9a6-4139-a9d3-5084207ee7b9"
 					(reference "R6")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "ED08905M-FE15C7.0-C10-2053:ED08905M-FE15C7_0-C10-2053")
+		(at 154.94 35.56 90)
+		(unit 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(uuid "dd9b4461-e670-4176-9344-0b279d85ca82")
+		(property "Reference" "U5"
+			(at 153.67 22.86 90)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Value" "ED08905M-FE15C7_0-C10-2053"
+			(at 139.446 25.146 90)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Footprint" "JLCPCB Import:ED08905M-FE15C7_0-C10-2053"
+			(at 154.94 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(hide yes)
+			)
+		)
+		(property "Datasheet" "https://atta.szlcsc.com/upload/public/pdf/source/20231010/08DF4ED4D74BD216E9F3C5DD72D7D396.pdf"
+			(at 154.94 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(hide yes)
+			)
+		)
+		(property "Description" "-30℃~+70℃ 1mA 20/20 5V Incremental Right-Angle Two-phase output Plugin Rotary Encoders ROHS"
+			(at 154.94 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(hide yes)
+			)
+		)
+		(property "LCSC" "C18213469"
+			(at 154.94 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(hide yes)
+			)
+		)
+		(property "Manufacturer" "CTR"
+			(at 154.94 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(hide yes)
+			)
+		)
+		(property "Manufacturer Part" "ED08905M-FE15C7.0-C10-2053"
+			(at 154.94 35.56 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(hide yes)
+			)
+		)
+		(pin "B"
+			(uuid "5f279f0c-05da-42df-9fc0-ffbec1d2cf70")
+		)
+		(pin "A"
+			(uuid "92ecfcb4-a15b-4a45-934e-6bb2d1f127f8")
+		)
+		(pin "1"
+			(uuid "b8ea3867-3c5c-47d1-baf5-8c6177a03155")
+		)
+		(pin "C"
+			(uuid "d0975d55-19a7-4b5a-b8e1-b2e2a8d88563")
+		)
+		(pin "2"
+			(uuid "f5768e74-baf6-444b-8931-62a7581efac9")
+		)
+		(pin "S2"
+			(uuid "429a05d3-fda5-47cb-95e8-aca6712af034")
+		)
+		(pin "S1"
+			(uuid "f93f6b39-832b-4c37-ae17-5617ac775477")
+		)
+		(instances
+			(project "readily"
+				(path "/7a0c6d24-d9a6-4139-a9d3-5084207ee7b9"
+					(reference "U5")
 					(unit 1)
 				)
 			)
