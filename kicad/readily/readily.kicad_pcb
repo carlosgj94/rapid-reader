@@ -7,6 +7,12 @@
 		(legacy_teardrops no)
 	)
 	(paper "A4")
+	(title_block
+		(title "Readily")
+		(date "2026-02-19")
+		(rev "v0.1.0")
+		(company "Carlos Juar.eth")
+	)
 	(layers
 		(0 "F.Cu" signal)
 		(2 "B.Cu" signal)
