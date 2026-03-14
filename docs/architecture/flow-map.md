@@ -8,6 +8,7 @@ Primary ownership:
 
 - `src/bin/main.rs`: top-level boot sequence, hardware bring-up, settings restore, wake restore
 - `src/bin/main/loading.rs`: loading phases and progress text
+- `src/bin/main/resume_sync.rs`: resume metadata helpers shared by boot restore and runtime save
 - `src/bin/main/initial_catalog.rs`: SD scan, first text preload, first cover preload
 - `src/bin/main/book_db.rs`: SD-side manifest and resume cache
 - `crates/readily-core/src/content/sd_catalog/*`: in-memory catalog state loaded by the boot path
@@ -49,6 +50,8 @@ Primary ownership:
 - `crates/readily-core/src/settings.rs`: persisted settings and wake snapshot types
 - `crates/readily-core/src/app/view.rs`: exported and imported resume/wake state
 - `src/bin/main/settings_sync.rs`: debounced flash save for settings
+- `src/bin/main/resume_sync.rs`: debounced/forced resume save policy
+- `src/bin/main/ui_loop.rs`: runtime orchestration for render, persistence, inactivity sleep
 - `src/bin/main/book_db.rs`: resume persistence in the SD-side DB
 - `src/bin/main/power.rs`: deep sleep entry
 - `src/bin/main.rs`: inactivity policy and restore precedence
@@ -60,7 +63,15 @@ Primary ownership:
 - `crates/readily-hal-esp32s3/src/render/rsvp/mod.rs`: renderer state and screen dispatch
 - `crates/readily-hal-esp32s3/src/render/rsvp/*.rs`: per-screen composition and shared primitives
 - `crates/ls027b7dh01/src/*`: framebuffer and panel protocol
-- `src/bin/main.rs`: flush scheduling and connectivity-driven redraw decisions
+- `src/bin/main/loading.rs`: loading-screen render/flush helper
+- `src/bin/main/ui_loop.rs`: flush scheduling and connectivity-driven redraw decisions
+
+## Network Background Tasks
+
+Primary ownership:
+
+- `src/bin/main/network_runtime.rs`: Wi-Fi reconnect loop, DHCP wait, ping loop, connectivity state
+- `src/bin/main.rs`: Wi-Fi peripheral bring-up and task assembly
 
 ## Low-Level Reference
 

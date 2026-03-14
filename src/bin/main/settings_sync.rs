@@ -1,7 +1,7 @@
 use readily_core::settings::{PersistedSettings, SettingsStore};
 use readily_hal_esp32s3::storage::flash_settings::FlashSettingsStore;
 
-use super::SETTINGS_SAVE_DEBOUNCE_MS;
+const SETTINGS_SAVE_DEBOUNCE_MS: u64 = 1_500;
 
 pub(super) struct SettingsSyncState {
     last_saved: PersistedSettings,

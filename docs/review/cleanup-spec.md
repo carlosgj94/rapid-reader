@@ -18,13 +18,17 @@ Guiding rules:
 
 ## Priority 0: `src/bin/main.rs` Must Become An Orchestrator
 
+Current status:
+
+- Done in the current codebase. Network tasks, UI runtime orchestration, resume sync, and loading
+  flush helpers now live in focused `src/bin/main/*` modules instead of staying inlined in
+  `main.rs`.
+
 Current problem:
 
-- `main.rs` still owns board bring-up, Wi-Fi retry loops, ping loop, boot restore logic, local
-  persistence policy, inactivity sleep policy, rendering flush policy, and several runtime
-  constants.
-- The file is readable only because pieces were already extracted into `src/bin/main/*`, but the
-  remaining top-level still carries too many unrelated decisions.
+- `main.rs` still owns board bring-up, boot restore sequencing, Wi-Fi setup, and catalog preload.
+- The file is now materially smaller, but boot-time restore/config work is still denser than the
+  rest of the orchestration layers.
 
 Target state:
 
@@ -35,12 +39,11 @@ Target state:
 
 Concrete cleanup targets:
 
-- Extract Wi-Fi and ping loops out of `main.rs`.
-- Extract the UI runtime loop that coordinates refill, render, settings sync, resume sync, and
-  sleep.
-- Move resume-sync helper types out of `main.rs`.
-- Remove repeated loading-frame flush blocks behind a single helper so boot code stops duplicating
-  the same display error path.
+- Keep Wi-Fi/ping loops, UI runtime, resume sync, and loading flush logic out of `main.rs`.
+- Continue pushing boot-only restore/config helpers into named modules if `main.rs` starts growing
+  again.
+- Keep constants colocated with the subsystem that owns them instead of moving them back into the
+  root file header.
 
 Acceptance bar:
 

@@ -1,7 +1,13 @@
-use core::fmt::Write;
+use core::{fmt::Debug, fmt::Write};
 
+use embedded_hal::{delay::DelayNs, digital::OutputPin, spi::SpiBus};
 use heapless::String as HeaplessString;
-use readily_hal_esp32s3::render::rsvp::LoadingView;
+use log::info;
+use ls027b7dh01::FrameBuffer;
+use readily_hal_esp32s3::{
+    platform::display::SharpDisplay,
+    render::rsvp::{LoadingView, RsvpRenderer},
+};
 
 use super::SD_SPI_HZ_CANDIDATES;
 
@@ -263,6 +269,40 @@ impl LoadingCoordinator {
     {
         self.detail.clear();
         build(&mut self.detail);
+    }
+}
+
+pub(super) fn render_loading_event<DSPI, DISP, EMD, CS, D>(
+    loading: &mut LoadingCoordinator,
+    event: LoadingEvent,
+    renderer: &mut RsvpRenderer,
+    frame: &mut FrameBuffer,
+    display: &mut SharpDisplay<DSPI, DISP, EMD, CS>,
+    delay: &mut D,
+    display_fault_logged: &mut bool,
+    now_ms: u64,
+) where
+    DSPI: SpiBus<u8>,
+    DISP: OutputPin,
+    EMD: OutputPin,
+    CS: OutputPin,
+    D: DelayNs,
+    DSPI::Error: Debug,
+    DISP::Error: Debug,
+    EMD::Error: Debug,
+    CS::Error: Debug,
+{
+    if !loading.on_event(now_ms, event) {
+        return;
+    }
+
+    renderer.render_loading(loading.view(now_ms), frame);
+    if let Err(err) = display.flush_frame(frame, delay)
+        && !*display_fault_logged
+    {
+        esp_println::println!("display: loading flush failed");
+        info!("display loading flush failed: {:?}", err);
+        *display_fault_logged = true;
     }
 }
 
