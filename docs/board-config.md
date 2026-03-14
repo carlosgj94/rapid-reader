@@ -1,30 +1,58 @@
-# Board Integration Contract (ESP32-S3 + LS027B7DH01)
+# Board Integration Contract
 
-This project splits responsibilities as:
-- `crates/ls027b7dh01`: reusable no_std driver and framebuffer logic
-- `src/bin/main.rs`: board glue (pins, SPI peripheral, timing loop)
+This note follows the current firmware wiring in `src/bin/main.rs`.
 
-## Required panel connections
-- `SCLK` -> SPI SCK pin
-- `SI` -> SPI MOSI pin
-- `SCS` -> GPIO pin (active-high CS)
-- `DISP` -> GPIO output pin
-- `EXTCOMIN` -> GPIO output pin
-- `GND`/`VCC` as required by panel breakout hardware
+## Current Wiring
 
-## Runtime requirements
-- Toggle `EXTCOMIN` periodically (default: every 500 ms).
-- Keep this toggling independent from screen redraw cadence.
-- Keep redraw/update logic separate so protocol debugging can proceed in phases.
+### Display (Sharp LS027 path in firmware)
 
-## Bring-up stages in firmware
-- `ExtComHeartbeat`: only DISP + EXTCOMIN control
-- `ClearLoop`: repeatedly issue all-clear
-- `SingleLine`: update specific lines only
-- `FullFrame`: write full framebuffer test patterns
+- `GPIO13` -> `CLK` / display SPI SCK
+- `GPIO14` -> `DI` / display SPI MOSI
+- `GPIO15` -> `CS` / `SCS`
+- `GPIO2` -> `DISP`
+- `GPIO9` -> `EMD` / `EXTCOMIN`
 
-## Pin selection
-`src/bin/main.rs` contains explicit pin constants that can be changed to match actual wiring.
+Current display assumptions:
 
-## SD card wiring
-SD card support is disabled in current firmware.
+- LS027 uses SPI mode 1 in firmware.
+- The board display adapter owns `DISP`, `EMD`, and `CS` pin state for init, frame flush, and
+  deep-sleep shutdown.
+- The display is explicitly disabled before deep sleep.
+
+### SD Card (SPI)
+
+- `GPIO8` -> `CS`
+- `GPIO4` -> `SCK`
+- `GPIO40` -> `MOSI`
+- `GPIO41` -> `MISO`
+
+Current SD assumptions:
+
+- SD support is enabled in current firmware.
+- Boot probes multiple SPI speeds until catalog access succeeds or the configured attempts are
+  exhausted.
+- `/BOOKS` is the current library root.
+
+### Rotary Encoder
+
+- `GPIO10` -> `CLK`
+- `GPIO11` -> `DT`
+- `GPIO12` -> `SW`
+
+Current input assumptions:
+
+- Encoder inputs use pull-ups.
+- Deep sleep wake uses the encoder switch pin.
+
+## Board-Level Runtime Responsibilities
+
+Board glue currently owns:
+
+- peripheral bring-up
+- display init and first frame
+- SD preload and runtime refill wiring
+- flash settings store integration
+- deep sleep entry and wake restore sequencing
+
+Hardware design files still live under `kicad/readily/`, but they are not the primary source of
+truth for runtime behavior in this documentation pass.
