@@ -6473,6 +6473,28 @@
 			)
 		)
 	)
+	(global_label "SYS_OUT"
+		(shape input)
+		(at 223.52 132.08 180)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right)
+		)
+		(uuid "3d03529f-23ef-4cfa-b6ea-8e1e451e4d00")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 212.431 132.08 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+				(hide yes)
+			)
+		)
+	)
 	(global_label "SD_CS"
 		(shape input)
 		(at 198.12 59.69 180)
@@ -6640,28 +6662,6 @@
 		(uuid "8ac5e1f3-1b24-47b7-a3a8-93e664ea455c")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
 			(at 179.411 83.82 0)
-			(effects
-				(font
-					(size 1.27 1.27)
-				)
-				(justify right)
-				(hide yes)
-			)
-		)
-	)
-	(global_label "SYS_OUT"
-		(shape input)
-		(at 223.52 129.54 180)
-		(fields_autoplaced yes)
-		(effects
-			(font
-				(size 1.27 1.27)
-			)
-			(justify right)
-		)
-		(uuid "8d056d9d-406d-4041-9340-a2f4796ee1fc")
-		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 212.431 129.54 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -7717,7 +7717,7 @@
 				(justify right)
 			)
 		)
-		(property "Value" "LED"
+		(property "Value" "White LED"
 			(at 95.25 93.0274 90)
 			(effects
 				(font
@@ -8679,7 +8679,7 @@
 				)
 			)
 		)
-		(property "Footprint" "Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12"
+		(property "Footprint" "JLCImport:TYPE-C16PIN"
 			(at 52.07 152.4 0)
 			(effects
 				(font
@@ -10911,7 +10911,7 @@
 				(justify right)
 			)
 		)
-		(property "Value" "LED"
+		(property "Value" "LED White"
 			(at 109.22 98.1074 90)
 			(effects
 				(font
@@ -11350,7 +11350,7 @@
 	)
 	(symbol
 		(lib_id "power:GND")
-		(at 223.52 132.08 270)
+		(at 223.52 129.54 270)
 		(unit 1)
 		(exclude_from_sim no)
 		(in_bom yes)
@@ -11359,7 +11359,7 @@
 		(fields_autoplaced yes)
 		(uuid "e07a85d8-68c7-4eb9-9e98-cbf5b2d281e1")
 		(property "Reference" "#PWR014"
-			(at 217.17 132.08 0)
+			(at 217.17 129.54 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -11368,7 +11368,7 @@
 			)
 		)
 		(property "Value" "GND"
-			(at 219.71 132.0799 90)
+			(at 219.71 129.5399 90)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -11377,7 +11377,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 223.52 132.08 0)
+			(at 223.52 129.54 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -11386,7 +11386,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 223.52 132.08 0)
+			(at 223.52 129.54 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -11395,7 +11395,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 223.52 132.08 0)
+			(at 223.52 129.54 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -11434,7 +11434,7 @@
 				(justify left)
 			)
 		)
-		(property "Value" "100n"
+		(property "Value" "100nF"
 			(at 185.42 139.6999 0)
 			(effects
 				(font

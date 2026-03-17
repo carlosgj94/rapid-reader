@@ -1,4 +1,4 @@
-27271545449370119
+27278636806048655
 Audio_Module
 Reverb_BTDR-1H
 Digital Reverberation Unit, http://www.belton.co.kr/inc/downfile.php?seq=17&file=pdf (footprint from http://www.uk-electronic.de/PDF/BTDR-1.pdf)
@@ -6971,6 +6971,13 @@ tag connect programming header pogo pins
 0
 14
 14
+Connector_0109
+Pins01x09
+
+
+0
+9
+9
 Connector_AMASS
 AMASS_MR30PW-FB_1x03_P3.50mm_Horizontal
 Connector MR30 Horizontal PCB Female, https://www.tme.eu/Document/4a6895c4a2c7eddf355b391fd904cb53/MR30PW-FB.pdf
@@ -70378,6 +70385,13 @@ C720477 SW-SMD_L3.9-W3.0-P4.45 TS-1088-AR02016 XUNPU
 2
 2
 JLCImport
+TYPE-C16PIN
+-40℃~+85℃ 1 10,000 Cycles 16P 30V 3A Black Female Surface Mount, Right Angle Type-C SMD USB Connectors ROHS
+C393939 SHOU HAN TYPE-C16PIN USB-C-SMD_TYPE-C16PIN
+0
+16
+16
+JLCImport
 WAFER-PH2_0-2PWZ
 -25℃~+85℃ 1 1x2P 2 250V 2A 2P 2mm 4.7mm 6.05mm 6mm Brass PA66 PH Right Angle Tin UL94V-0 White Push-Pull,P=2mm Wire To Board Connector ROHS
 C5359610 CONN-TH_2P-P2.00_GP01-2001WR-2P WAFER-PH2.0-2PWZ XUNPU
@@ -70426,6 +70440,13 @@ C720477 SW-SMD_L3.9-W3.0-P4.45 TS-1088-AR02016 XUNPU
 0
 2
 2
+JLCPCB
+TYPE-C16PIN
+-40℃~+85℃ 1 10,000 Cycles 16P 30V 3A Black Female Surface Mount, Right Angle Type-C SMD USB Connectors ROHS
+C393939 SHOU HAN TYPE-C16PIN USB-C-SMD_TYPE-C16PIN
+0
+16
+16
 JLCPCB
 WAFER-PH2_0-2PWZ
 -25℃~+85℃ 1 1x2P 2 250V 2A 2P 2mm 4.7mm 6.05mm 6mm Brass PA66 PH Right Angle Tin UL94V-0 White Push-Pull,P=2mm Wire To Board Connector ROHS
@@ -98769,6 +98790,13 @@ rotary encoder illuminated switch vertical
 0
 9
 8
+SD_Card
+TF-01A
+<b>TF-01A-6</b><br>
+
+0
+13
+13
 Sensor
 ASAIR_AM2302_P2.54mm_Lead2.75mm_TabDown
 Temperature and humidity module, http://akizukidenshi.com/download/ds/aosong/AM2302.pdf
