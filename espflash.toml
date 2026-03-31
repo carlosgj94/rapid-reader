@@ -1,0 +1,7 @@
+format = "esp-idf"
+
+[idf]
+partition_table = "partitions/motif.csv"
+
+[flash]
+size = "16mb"
