@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-changed=espflash.toml");
+    println!("cargo:rerun-if-changed=partitions/motif.csv");
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
@@ -27,7 +29,7 @@ fn linker_be_nice() {
                 what if what.starts_with("esp_rtos_") => {
                     eprintln!();
                     eprintln!(
-                        "💡 `esp-radio` has no scheduler enabled. Make sure you have initialized `esp-rtos` or provided an external scheduler."
+                        "💡 A runtime feature expects `esp-rtos` to be initialized. Make sure you have started `esp-rtos` or provided an external scheduler."
                     );
                     eprintln!();
                 }

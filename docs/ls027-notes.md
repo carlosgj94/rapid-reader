@@ -1,4 +1,4 @@
-# LS027B7DH01 Notes (Bring-Up Contract)
+# LS027B7DH01 Notes
 
 Source: `LS027B7DH01_Rev_Jun_2010.pdf`.
 

@@ -1,0 +1,7 @@
+# Motif ESP32-S3 partition table for N16 flash devices.
+# Name,         Type, SubType, Offset,   Size,      Flags
+nvs,            data, nvs,      0x9000,   0x5000,
+phy_init,       data, phy,      0xf000,   0x1000,
+factory,        app,  factory,  0x10000,  0x800000,
+motif_state,    0x40, 0x00,     0x810000, 0x40000,
+motif_outbox,   0x41, 0x00,     0x850000, 0x40000,

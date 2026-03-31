@@ -1,0 +1,27 @@
+[package]
+name = "platform-esp32s3"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+app-runtime = { path = "../app-runtime" }
+domain = { path = "../domain" }
+services = { path = "../services" }
+embassy-executor = { version = "0.9.1", features = ["log"] }
+embassy-futures = "0.1.2"
+embassy-sync = "0.7.2"
+embassy-time = "0.5.0"
+embedded-storage = "0.3.1"
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3", "log-04"] }
+esp-hal = { version = "~1.0", features = ["esp32s3", "log-04", "unstable"] }
+esp-rtos = { version = "0.2.0", features = ["esp32s3", "esp-alloc", "embassy", "log-04"] }
+esp-storage = { version = "0.8.1", features = ["esp32s3"] }
+esp-alloc = "0.9.0"
+embedded-hal = "1.0.0"
+heapless = "0.9.1"
+log = "0.4.27"
+ls027b7dh01 = { path = "../ls027b7dh01" }

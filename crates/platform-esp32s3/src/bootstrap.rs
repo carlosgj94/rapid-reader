@@ -1,0 +1,439 @@
+use ::domain::{
+    device::{BootState, DeviceState, PairingState},
+    runtime::{BootstrapSnapshot, Effect, Event},
+    sleep::{SleepModel, SleepState},
+    store::Store,
+};
+use ::services::{input::InputService, sleep::SleepService};
+use app_runtime::{AppRuntime, Screen};
+use embassy_executor::Spawner;
+use embassy_futures::select::{Either5, select5};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
+};
+use embassy_time::{Duration, Instant, Ticker, Timer};
+use embedded_hal::delay::DelayNs;
+use esp_hal::{
+    clock::CpuClock,
+    delay::Delay,
+    gpio::{AnyPin, Level, Output, OutputConfig, Pin, RtcPin},
+    rtc_cntl::{Rtc, SocResetReason, reset_reason, wakeup_cause},
+    spi::master::Spi,
+    system::Cpu,
+    time::Rate,
+    timer::timg::TimerGroup,
+};
+use log::info;
+use ls027b7dh01::{
+    FrameBuffer,
+    protocol::{HEIGHT, WIDTH},
+};
+
+use crate::{
+    board::BoardConfig, display::PlatformDisplay, input::PlatformInputService,
+    sleep::enter_deep_sleep_with_button, storage::PlatformStorageService,
+};
+
+const DISPLAY_SPI_HZ: u32 = 1_000_000;
+const HEARTBEAT_MS: u64 = 1_000;
+const INPUT_POLL_MS: u64 = 2;
+const APP_EVENT_QUEUE_CAPACITY: usize = 16;
+const PLATFORM_COMMAND_QUEUE_CAPACITY: usize = 4;
+
+static APP_EVENT_CH: Channel<CriticalSectionRawMutex, TimedEvent, APP_EVENT_QUEUE_CAPACITY> =
+    Channel::new();
+static PLATFORM_CMD_CH: Channel<
+    CriticalSectionRawMutex,
+    PlatformCommand,
+    PLATFORM_COMMAND_QUEUE_CAPACITY,
+> = Channel::new();
+static SCREEN_SIGNAL: Signal<CriticalSectionRawMutex, Screen> = Signal::new();
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct TimedEvent {
+    event: Event,
+    at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PlatformCommand {
+    RequestDeepSleep,
+}
+
+#[embassy_executor::task]
+async fn app_task(snapshot: BootstrapSnapshot) {
+    let mut store = Store::from_bootstrap(snapshot);
+    let mut app = AppRuntime::new();
+
+    info!("settings loaded={:?}", store.settings);
+    SCREEN_SIGNAL.signal(app.tick());
+
+    loop {
+        let timed_event = APP_EVENT_CH.receive().await;
+
+        if let Event::InputGestureReceived(gesture) = timed_event.event {
+            app.handle_input_gesture(gesture);
+        }
+
+        let effect = store
+            .handle_event(timed_event.event, timed_event.at_ms)
+            .unwrap_or(Effect::Noop);
+        SCREEN_SIGNAL.signal(app.tick());
+
+        if effect == Effect::EnterDeepSleep {
+            PLATFORM_CMD_CH
+                .send(PlatformCommand::RequestDeepSleep)
+                .await;
+        }
+    }
+}
+
+pub async fn run_minimal(spawner: Spawner) -> ! {
+    let board = BoardConfig::new();
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    let boot_reset_reason = reset_reason(Cpu::ProCpu);
+    let boot_wakeup_cause = wakeup_cause();
+    let woke_from_deep_sleep = boot_reset_reason == Some(SocResetReason::CoreDeepSleep);
+    info!(
+        "boot reset_reason={:?} wakeup_cause={:?} wake={}",
+        boot_reset_reason, boot_wakeup_cause, woke_from_deep_sleep
+    );
+
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 64 * 1024);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0);
+
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    let mut storage = PlatformStorageService::mount(peripherals.FLASH);
+    let persisted_settings = match storage.read_persisted_settings_sync() {
+        Ok(settings) => settings,
+        Err(err) => {
+            info!("settings hydrate failed: {:?}", err);
+            None
+        }
+    };
+    let storage_health = storage.health_snapshot();
+    info!("storage health={:?}", storage_health);
+
+    let boot_ms = Instant::now().as_millis();
+    let boot_state = if woke_from_deep_sleep {
+        BootState::DeepSleepWake
+    } else {
+        BootState::ColdBoot
+    };
+    let snapshot = BootstrapSnapshot::new(
+        DeviceState {
+            pairing: PairingState::Unpaired,
+            boot: boot_state,
+        },
+        boot_ms,
+        persisted_settings,
+        storage_health,
+    );
+
+    spawner.spawn(app_task(snapshot)).unwrap();
+
+    let mut input = PlatformInputService::new(
+        peripherals.GPIO10.degrade(),
+        peripherals.GPIO11.degrade(),
+        peripherals.GPIO12.degrade(),
+        woke_from_deep_sleep,
+    );
+    let mut sleep = crate::sleep::PlatformSleepService::new();
+    sleep.hydrate_from_boot(woke_from_deep_sleep, boot_ms);
+    if let Some(settings) = persisted_settings {
+        sleep.configure_inactivity_timeout(settings.inactivity_timeout_ms);
+    }
+
+    publish_event(Event::BootCompleted, boot_ms);
+    if woke_from_deep_sleep {
+        publish_event(Event::WokeFromDeepSleep, boot_ms);
+    }
+
+    let disp_pin = peripherals.GPIO2;
+    disp_pin.rtcio_pad_hold(false);
+    let emd_pin = peripherals.GPIO9;
+    emd_pin.rtcio_pad_hold(false);
+    let disp = Output::new(disp_pin, Level::Low, OutputConfig::default());
+    let emd = Output::new(emd_pin, Level::Low, OutputConfig::default());
+    let cs = Output::new(peripherals.GPIO15, Level::Low, OutputConfig::default());
+
+    let spi_config = esp_hal::spi::master::Config::default()
+        .with_frequency(Rate::from_hz(DISPLAY_SPI_HZ))
+        .with_mode(esp_hal::spi::Mode::_1);
+    let spi = Spi::new(peripherals.SPI2, spi_config)
+        .unwrap()
+        .with_sck(peripherals.GPIO13)
+        .with_mosi(peripherals.GPIO14);
+
+    let mut delay = Delay::new();
+    let mut display = PlatformDisplay::new(spi, disp, emd, cs);
+
+    if let Err(err) = display.initialize(&mut delay) {
+        info!("display initialize failed: {:?}", err);
+    }
+    if let Err(err) = display.clear_all(&mut delay) {
+        info!("display clear failed: {:?}", err);
+    }
+
+    log_gpio_contract(&board);
+
+    let mut frame = FrameBuffer::new();
+    let mut heartbeat_on = true;
+    let mut active_screen = Screen::Boot;
+    flush_idle_frame(
+        &mut display,
+        &mut frame,
+        &mut delay,
+        heartbeat_on,
+        active_screen,
+    );
+
+    let mut input_tick = Ticker::every(Duration::from_millis(INPUT_POLL_MS));
+    let mut heartbeat_tick = Ticker::every(Duration::from_millis(HEARTBEAT_MS));
+
+    loop {
+        let sleep_deadline = next_sleep_deadline(sleep.model());
+
+        match select5(
+            input_tick.next(),
+            heartbeat_tick.next(),
+            Timer::at(sleep_deadline),
+            PLATFORM_CMD_CH.receive(),
+            SCREEN_SIGNAL.wait(),
+        )
+        .await
+        {
+            Either5::First(_) => {
+                let now_ms = Instant::now().as_millis();
+                input.sample(now_ms);
+
+                let dropped = input.take_dropped_gesture_count();
+                if dropped > 0 {
+                    info!("input dropped_gestures={}", dropped);
+                }
+
+                while let Some(gesture) = input.pop_gesture() {
+                    info!("input gesture={:?}", gesture);
+                    sleep.note_activity(now_ms);
+                    publish_event(Event::InputGestureReceived(gesture), now_ms);
+                }
+            }
+            Either5::Second(_) => {
+                heartbeat_on = !heartbeat_on;
+                flush_idle_frame(
+                    &mut display,
+                    &mut frame,
+                    &mut delay,
+                    heartbeat_on,
+                    active_screen,
+                );
+            }
+            Either5::Third(_) => {
+                enter_low_power_sleep(
+                    &board,
+                    &mut display,
+                    &mut delay,
+                    &mut input,
+                    &mut sleep,
+                    &mut rtc,
+                );
+            }
+            Either5::Fourth(command) => match command {
+                PlatformCommand::RequestDeepSleep => {
+                    enter_low_power_sleep(
+                        &board,
+                        &mut display,
+                        &mut delay,
+                        &mut input,
+                        &mut sleep,
+                        &mut rtc,
+                    );
+                }
+            },
+            Either5::Fifth(screen) => {
+                active_screen = screen;
+                info!("app screen={:?}", active_screen);
+                flush_idle_frame(
+                    &mut display,
+                    &mut frame,
+                    &mut delay,
+                    heartbeat_on,
+                    active_screen,
+                );
+            }
+        }
+    }
+}
+
+fn publish_event(event: Event, at_ms: u64) {
+    if APP_EVENT_CH.try_send(TimedEvent { event, at_ms }).is_err() {
+        info!("app event dropped: {:?}", event);
+    }
+}
+
+fn next_sleep_deadline(model: &SleepModel) -> Instant {
+    if matches!(model.state, SleepState::SleepRequested) {
+        return Instant::now();
+    }
+
+    Instant::from_millis(
+        model
+            .last_activity_ms
+            .saturating_add(model.config.inactivity_timeout_ms),
+    )
+}
+
+fn flush_idle_frame<SPI, DISP, EMD, CS, D>(
+    display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
+    frame: &mut FrameBuffer,
+    delay: &mut D,
+    heartbeat_on: bool,
+    screen: Screen,
+) where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DISP: embedded_hal::digital::OutputPin,
+    EMD: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    D: DelayNs,
+{
+    draw_idle_frame(frame, heartbeat_on, screen);
+    if let Err(err) = display.flush_frame(frame, delay) {
+        info!("display flush failed: {:?}", err);
+        let _ = display.disable_output();
+    }
+}
+
+fn enter_low_power_sleep<SPI, DISP, EMD, CS, D>(
+    board: &BoardConfig,
+    display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
+    delay: &mut D,
+    input: &mut PlatformInputService<'_>,
+    sleep: &mut crate::sleep::PlatformSleepService,
+    rtc: &mut Rtc<'_>,
+) -> !
+where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DISP: embedded_hal::digital::OutputPin,
+    EMD: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    D: DelayNs,
+{
+    let now_ms = Instant::now().as_millis();
+    info!(
+        "sleep due now_ms={} last_activity_ms={} wake_reason={:?}",
+        now_ms,
+        sleep.model().last_activity_ms,
+        sleep.model().last_wake_reason
+    );
+    if let Err(err) = display.enter_low_power(delay) {
+        info!("display low-power transition failed: {:?}", err);
+    }
+    hold_display_sleep_pins(board);
+    let wake_button = input.take_wake_button();
+    enter_deep_sleep_with_button(sleep, rtc, wake_button);
+}
+
+fn draw_idle_frame(frame: &mut FrameBuffer, heartbeat_on: bool, screen: Screen) {
+    frame.clear(false);
+
+    for x in 0..WIDTH {
+        let _ = frame.set_pixel(x, 0, true);
+        let _ = frame.set_pixel(x, HEIGHT - 1, true);
+    }
+
+    for y in 0..HEIGHT {
+        let _ = frame.set_pixel(0, y, true);
+        let _ = frame.set_pixel(WIDTH - 1, y, true);
+    }
+
+    for x in 32..(WIDTH - 32) {
+        let _ = frame.set_pixel(x, HEIGHT / 2, true);
+    }
+
+    for y in 48..(HEIGHT - 48) {
+        let _ = frame.set_pixel(WIDTH / 2, y, true);
+    }
+
+    let heartbeat_x = WIDTH / 2;
+    let heartbeat_y = HEIGHT / 2;
+    for dy in 0..8 {
+        for dx in 0..8 {
+            let _ = frame.set_pixel(heartbeat_x + dx - 4, heartbeat_y + dy - 4, heartbeat_on);
+        }
+    }
+
+    let marker_x = 8;
+    let marker_y = 8;
+    let marker_width = match screen {
+        Screen::Boot => 6,
+        Screen::Queue => 12,
+        Screen::Reader => 18,
+        Screen::Settings => 24,
+    };
+
+    for y in marker_y..(marker_y + 4) {
+        for x in marker_x..(marker_x + marker_width) {
+            let _ = frame.set_pixel(x, y, true);
+        }
+    }
+}
+
+fn log_gpio_contract(board: &BoardConfig) {
+    info!(
+        "display gpio clk={} di={} cs={} disp={} emd={}",
+        board.display_clk_gpio,
+        board.display_di_gpio,
+        board.display_cs_gpio,
+        board.display_disp_gpio,
+        board.display_emd_gpio
+    );
+    info!(
+        "sd gpio cs={} sck={} mosi={} miso={}",
+        board.sd_cs_gpio, board.sd_sck_gpio, board.sd_mosi_gpio, board.sd_miso_gpio
+    );
+    info!(
+        "encoder gpio clk={} dt={} sw={}",
+        board.encoder_clk_gpio, board.encoder_dt_gpio, board.encoder_sw_gpio
+    );
+    info!(
+        "sleep wake gpio={} inactivity_ms=30000",
+        board.sleep_wake_gpio
+    );
+}
+
+fn hold_display_sleep_pins(board: &BoardConfig) {
+    unsafe {
+        let disp_pin = AnyPin::steal(board.display_disp_gpio);
+        disp_pin.rtcio_pad_hold(true);
+
+        let emd_pin = AnyPin::steal(board.display_emd_gpio);
+        emd_pin.rtcio_pad_hold(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::sleep::{SleepConfig, WakeReason};
+
+    #[test]
+    fn requested_sleep_uses_immediate_deadline() {
+        let mut model = SleepModel::new(SleepConfig::new(30_000));
+        model.request_sleep();
+
+        assert!(next_sleep_deadline(&model) <= Instant::now());
+    }
+
+    #[test]
+    fn inactivity_deadline_tracks_last_activity() {
+        let mut model = SleepModel::new(SleepConfig::new(30_000));
+        model.mark_woke(WakeReason::ColdBoot, 1_000);
+
+        assert_eq!(next_sleep_deadline(&model), Instant::from_millis(31_000));
+    }
+}

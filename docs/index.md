@@ -1,38 +1,81 @@
-# Docs Index
+# Motif Technical Documentation
 
-Current-state documentation for the firmware in this repository.
+This documentation set defines the target architecture for the next implementation phase and the
+current implementation baseline where concrete subsystems already exist.
 
-These notes describe what the device does today and how the current codebase is divided. Future
-features should get their own notes when they exist.
+The codebase is still intentionally thin, but it is no longer only a bare bring-up binary. The
+current firmware now includes:
 
-## Read This First
+- an embassy-shaped runtime split between platform ownership and app/store processing
+- a working rotary-encoder gesture pipeline
+- deep sleep and wake handling tied to inactivity and the encoder switch
+- a durable internal-flash storage engine for compact records and an outbox queue
+- a boot-hydrated live store with real `device`, `settings`, `sleep`, `input`, and `storage`
+  state
+- skeletal provisioning interfaces for BLE-first onboarding
 
-- [`../README.md`](../README.md): quick project entrypoint
-- [`behavior/boot-library.md`](behavior/boot-library.md): cold boot, wake boot, and library flow
-- [`behavior/rsvp-reading.md`](behavior/rsvp-reading.md): countdown, reading loop, pause, and WPM
-- [`behavior/navigation.md`](behavior/navigation.md): chapter and paragraph selection flow
-- [`behavior/runtime-behaviors.md`](behavior/runtime-behaviors.md): persistence, resume, sleep,
-  and visible edge cases
+The docs below call out when a section describes the current implementation versus the longer-term
+target shape.
 
-## Architecture And Ownership
+## Product Definition
 
-- [`architecture/ownership.md`](architecture/ownership.md): crate boundaries and ownership rules
-- [`architecture/flow-map.md`](architecture/flow-map.md): where each user flow lives in code
-- [`pipeline-map.md`](pipeline-map.md): low-level SD, EPUB, storage, and UI file map
+Motif is a dedicated RSVP reading device for internet articles on ESP32-S3 hardware with a Sharp
+LS027 memory LCD.
 
-## Hardware References
+The target product loop is:
 
-- [`board-config.md`](board-config.md): current firmware wiring and integration contract
-- [`ls027-notes.md`](ls027-notes.md): Sharp LS027 protocol and bring-up notes
+1. Sync a user's personal saved articles and editorial feeds from the backend.
+2. Cache normalized article packages locally.
+3. Format those packages into RSVP-ready reading structures on device.
+4. Render a fast, motion-capable reader UI with offline-first behavior.
+5. Persist reading progress locally and sync it back when the network is available.
 
-## Review And Cleanup
+## Reading Order
 
-- [`review/cleanup-spec.md`](review/cleanup-spec.md): prioritized structural cleanup plan
+1. [Architecture Overview](architecture/overview.md)
+2. [Article Lifecycle](flows/article-lifecycle.md)
+3. [Rust Implementation Guidelines](architecture/rust-implementation.md)
+4. [Store](modules/store.md)
+5. [Settings](modules/settings.md)
+6. [Provisioning](modules/provisioning.md)
+7. [App And UI Runtime](modules/app-ui.md)
+8. [Wi-Fi](modules/wifi.md)
+9. [Backend Sync](modules/backend-sync.md)
+10. [Formatter And Content Pipeline](modules/formatter.md)
+11. [Storage](modules/storage.md)
+12. [Input](modules/input.md)
+13. [Sleep](modules/sleep.md)
+14. [Power Placeholder](modules/power.md)
 
-## Intent
+## System At A Glance
 
-- Small notes over one large spec.
-- Current behavior over future roadmap.
-- Code ownership and flow tracing over narrative prose.
-- Enough detail for a future engineer or agent to modify the firmware without rediscovering the
-  architecture from scratch.
+- The app runtime is declarative and component-based rather than screen-by-screen imperative code.
+- The store is the single authoritative runtime state container, but domain ownership stays split
+  by slice and module.
+- Provisioning owns first-time setup and reprovisioning.
+- Wi-Fi only manages connectivity.
+- Backend sync manages pairing, manifests, article packages, and progress exchange.
+- Formatter owns the transformation from canonical article data to RSVP-ready reading units.
+- Internal storage and SD storage have distinct responsibilities.
+- Hardware-specific implementation stays at the platform edge.
+
+## Current Implemented Baseline
+
+Today the codebase concretely implements:
+
+- the workspace split across `domain`, `app-runtime`, `services`, `platform-esp32s3`, and
+  `ls027b7dh01`
+- an embassy-based runtime handoff between the platform loop and an `app_task`
+- typed input gestures for the rotary encoder
+- inactivity-based deep sleep with button wake
+- internal flash partitions `motif_state` and `motif_outbox`
+- persisted settings hydration into the live store and platform sleep service
+- skeletal provisioning interfaces and BLE-first onboarding documentation
+
+The codebase does not yet implement the full queue, reader, Wi-Fi, backend sync, or formatter
+systems described elsewhere in these docs.
+
+## Current Hardware References
+
+- [Board Integration Contract](board-config.md)
+- [LS027 Notes](ls027-notes.md)
