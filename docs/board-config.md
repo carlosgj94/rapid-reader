@@ -1,10 +1,10 @@
 # Board Integration Contract
 
-This note follows the current firmware wiring in `src/bin/main.rs`.
+This note documents the GPIO wiring kept in the stripped firmware source.
 
 ## Current Wiring
 
-### Display (Sharp LS027 path in firmware)
+### Display
 
 - `GPIO13` -> `CLK` / display SPI SCK
 - `GPIO14` -> `DI` / display SPI MOSI
@@ -15,11 +15,11 @@ This note follows the current firmware wiring in `src/bin/main.rs`.
 Current display assumptions:
 
 - LS027 uses SPI mode 1 in firmware.
-- The board display adapter owns `DISP`, `EMD`, and `CS` pin state for init, frame flush, and
-  deep-sleep shutdown.
-- The display is explicitly disabled before deep sleep.
+- The stripped firmware initializes the panel, clears it once, and then refreshes a minimal
+  heartbeat frame.
+- `DISP`, `EMD`, and `CS` are driven directly from `src/bin/main.rs`.
 
-### SD Card (SPI)
+### SD Card
 
 - `GPIO8` -> `CS`
 - `GPIO4` -> `SCK`
@@ -28,10 +28,8 @@ Current display assumptions:
 
 Current SD assumptions:
 
-- SD support is enabled in current firmware.
-- Boot probes multiple SPI speeds until catalog access succeeds or the configured attempts are
-  exhausted.
-- `/BOOKS` is the current library root.
+- These GPIOs remain documented for the next rebuild stage.
+- The stripped firmware does not currently initialize or use the SD card path.
 
 ### Rotary Encoder
 
@@ -41,18 +39,15 @@ Current SD assumptions:
 
 Current input assumptions:
 
-- Encoder inputs use pull-ups.
-- Deep sleep wake uses the encoder switch pin.
+- These GPIOs remain documented for the next rebuild stage.
+- The stripped firmware does not currently initialize or use the encoder path.
 
-## Board-Level Runtime Responsibilities
+## Board-Level Responsibilities
 
-Board glue currently owns:
+The retained firmware owns:
 
-- peripheral bring-up
-- display init and first frame
-- SD preload and runtime refill wiring
-- flash settings store integration
-- deep sleep entry and wake restore sequencing
+- minimal ESP32-S3 bring-up
+- LS027 init and framebuffer flush
+- GPIO contract logging for display, SD, and encoder pins
 
-Hardware design files still live under `kicad/readily/`, but they are not the primary source of
-truth for runtime behavior in this documentation pass.
+Hardware design files under `kicad/readily/` are left untouched by this reset.

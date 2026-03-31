@@ -1,24 +1,13 @@
 # READILY
 
-Embedded Rust RSVP reader for ESP32-S3 and a Sharp memory LCD.
+Embedded Rust firmware for an ESP32-S3 board with a Sharp LS027 memory LCD.
 
-The source of truth for current firmware behavior and current code ownership lives under
-[`docs/index.md`](docs/index.md). The docs describe what the device does today, not future
-features.
+This repository is intentionally stripped down to a barebones compile target:
 
-## Workspace Layout
+- `src/bin/main.rs` contains the minimal board bring-up and display heartbeat loop
+- `crates/ls027b7dh01` contains the reusable LS027 driver primitives
 
-```text
-src/bin/main.rs                  board wiring, boot/runtime orchestration, sleep, network
-crates/readily-core              hardware-agnostic app state, content traits, screen models
-crates/readily-hal-esp32s3       ESP32-S3 input, rendering, storage, display adapters
-crates/ls027b7dh01               Sharp LS027 protocol, framebuffer, panel primitives
-```
-
-Keep the boundary strict:
-
-- `readily-core` stays hardware-agnostic.
-- Board-specific code stays in `src/bin/main.rs` or `readily-hal-esp32s3`.
+The older app, contracts, HAL, SD, network, and reader runtime layers have been removed.
 
 ## Build And Flash
 
@@ -38,16 +27,7 @@ cargo check --offline
 cargo clippy --offline --workspace --lib
 ```
 
-## Docs
+## Hardware Docs
 
-- [`docs/index.md`](docs/index.md): docs hub
-- [`docs/behavior/boot-library.md`](docs/behavior/boot-library.md): boot and library flow
-- [`docs/behavior/rsvp-reading.md`](docs/behavior/rsvp-reading.md): reading loop and controls
-- [`docs/behavior/navigation.md`](docs/behavior/navigation.md): chapter and paragraph navigation
-- [`docs/behavior/runtime-behaviors.md`](docs/behavior/runtime-behaviors.md): settings, resume,
-  sleep, and current edge cases
-- [`docs/architecture/ownership.md`](docs/architecture/ownership.md): crate and module ownership
-- [`docs/architecture/flow-map.md`](docs/architecture/flow-map.md): behavior-to-code map
-- [`docs/review/cleanup-spec.md`](docs/review/cleanup-spec.md): prioritized cleanup plan
-- [`docs/board-config.md`](docs/board-config.md): current board wiring reference
-- [`docs/ls027-notes.md`](docs/ls027-notes.md): low-level panel protocol notes
+- [`docs/board-config.md`](docs/board-config.md): current GPIO wiring used by the stripped firmware
+- [`docs/ls027-notes.md`](docs/ls027-notes.md): low-level LS027 protocol notes
