@@ -37,6 +37,8 @@ More concretely, the current runtime behaves as follows:
 - app code may request sleep, but the platform layer remains authoritative for actually entering
   deep sleep
 - the current timeout can now be hydrated from persisted settings during boot
+- active RSVP playback suppresses inactivity sleep while the live reader stage is running
+- paused RSVP and paragraph navigation remain eligible for normal inactivity sleep behavior
 
 ## Platform Notes
 
@@ -62,6 +64,8 @@ The platform runtime computes inactivity deadlines with embassy time and enters 
 platform side, not from the store.
 The live store mirrors the hydrated timeout and wake state, but deep sleep is still controlled by
 the platform sleep service.
+The platform deadline logic now also inspects the active prepared screen so only live reader
+playback suppresses inactivity sleep.
 
 ## Display Interaction
 

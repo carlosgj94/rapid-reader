@@ -8,6 +8,26 @@ can actually present.
 It should be open to multiple input sources over time, but it should produce one canonical reading
 pipeline.
 
+## Current Implemented Baseline
+
+Today the formatter path is real, but intentionally scoped to the embedded mock corpus.
+
+The current implementation includes:
+
+- a concrete `ReadingDocument` with RSVP units and paragraph anchors
+- mock `ArticleDocument` inputs derived from the built-in reader scripts
+- apostrophe-aware token handling for common contractions and possessives
+- ORP-style anchor metadata and stage split data for the RSVP renderer
+- dwell-time metadata derived from token length and punctuation boundaries
+
+What does not exist yet:
+
+- backend normalized article packages flowing through this module
+- EPUB or TXT adapters
+- persisted formatter caches
+- formatter warnings or degradation reporting
+- language-specific segmentation beyond the current Latin-script-oriented heuristic
+
 ## Primary Input Model
 
 The primary v1 input is a normalized article package from the backend.
@@ -115,4 +135,3 @@ The formatter does not own:
 - storage placement policy
 - reader UI state
 - physical rendering
-

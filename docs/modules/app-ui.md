@@ -23,18 +23,20 @@ Article detail or diagnostics can be added later, but should not drive the prima
 
 ## Current Implemented Subset
 
-The current `app-runtime` crate is deliberately small.
+The current `app-runtime` crate now owns a real first pass of the target architecture.
 
 Today it owns:
 
 - `Screen`
 - `NavigationState`
-- placeholder screen models
-- `AppRuntime::handle_input_gesture(...)`
+- selector-driven prepared screen composition
+- renderer-ready shells for dashboard, collection, reader, paragraph navigation, and settings
+- transition planning for list movement, reader entry, modal reveal, settings pulses, and
+  paragraph-navigation accents
+- gesture mapping from the encoder into typed UI commands
 
-What it does not yet own is the actual component tree, selector-driven view preparation, or motion
-system described below. `handle_input_gesture(...)` is currently a no-op placeholder, and `tick()`
-returns the active `Screen` only.
+What it does not yet own is a deeper local component state model, region invalidation planning, or
+the final production typography system.
 
 ## Component Model
 

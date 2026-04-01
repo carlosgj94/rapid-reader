@@ -43,19 +43,23 @@ Today it concretely owns:
 - `input`
   last delivered gesture, delivered sequence, and reserved space for dropped-gesture diagnostics
 - `reader`
-  placeholder reader session state
+  active article session, formatter output, playback mode, progress, and paragraph anchors
 - `settings`
-  live user preferences, currently just the inactivity sleep timeout
+  live user preferences including timeout, reading speed, appearance, and topic preferences
 - `sleep`
   inactivity timeout, last activity, wake reason, sleep state
 - `storage`
   mount and free-space health mirror
 
-The current mutation surface is also intentionally narrow:
+The current mutation surface is still smaller than the target architecture, but no longer only a
+bootstrap skeleton:
 
 - `dispatch(Command::RequestDeepSleep)` requests deep sleep
+- `dispatch(Command::Ui(...))` routes encoder gestures through the current screen state
+- settings mutations emit typed persistence effects instead of writing to storage directly
 - `handle_event(Event::InputGestureReceived(...), now_ms)` records the gesture and mirrors
   activity
+- `handle_event(Event::ReaderTick(...), now_ms)` advances timed RSVP playback
 - `Store::from_bootstrap(...)` hydrates device boot state, persisted settings, sleep, and storage
   health before normal events begin
 - `handle_event(Event::WokeFromDeepSleep, now_ms)` updates wake state
@@ -63,7 +67,8 @@ The current mutation surface is also intentionally narrow:
 At startup, the hydrated settings are also logged once so device logs show the effective live
 configuration after defaults and persisted values have been resolved.
 
-This is a bootstrap store, not the finished application state model.
+This is still not the finished application state model, but it now includes a real reader,
+settings persistence effects, and selector-driven UI state.
 
 ## What The Store Must Not Own
 

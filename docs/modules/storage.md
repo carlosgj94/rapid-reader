@@ -175,6 +175,9 @@ What exists now:
 - a mounted flash-backed internal storage engine in `platform-esp32s3`
 - runtime partition discovery by label
 - a real persisted-settings record used during bootstrap hydration
+- an expanded persisted-settings snapshot carrying timeout, RSVP speed, appearance, and topic
+  preferences
+- app-level settings persistence through typed store effects executed by the platform storage path
 - startup configuration now logs the effective hydrated settings after that record is applied
 - recovery, compaction, and queue semantics
 - storage health reporting during boot
@@ -184,4 +187,4 @@ What does not exist yet:
 - a dedicated async storage task
 - Wi-Fi credential records
 - backend token records
-- integration with sync or app-level effects
+- integration with sync and broader app-level persistence beyond settings snapshots

@@ -12,6 +12,9 @@ current firmware now includes:
 - a durable internal-flash storage engine for compact records and an outbox queue
 - a boot-hydrated live store with real `device`, `settings`, `sleep`, `input`, and `storage`
   state
+- a selector-driven app runtime with prepared screens and display-friendly transitions
+- a mock-script-backed RSVP reader with timed playback, pause, paragraph navigation, and chat mode
+- a theme-aware renderer with persisted appearance and reader-preference settings
 - skeletal provisioning interfaces for BLE-first onboarding
 
 The docs below call out when a section describes the current implementation versus the longer-term
@@ -46,6 +49,7 @@ The target product loop is:
 12. [Input](modules/input.md)
 13. [Sleep](modules/sleep.md)
 14. [Power Placeholder](modules/power.md)
+15. [Session Progress: RSVP, Theme, And Persistence](progress/2026-04-01-rsvp-session.md)
 
 ## System At A Glance
 
@@ -70,10 +74,13 @@ Today the codebase concretely implements:
 - inactivity-based deep sleep with button wake
 - internal flash partitions `motif_state` and `motif_outbox`
 - persisted settings hydration into the live store and platform sleep service
+- persistence of user settings snapshots through the storage module and platform effect handling
+- selector-driven prepared screens and renderer transition planning
+- a formatter-backed mock RSVP reading flow with timed reader ticks and paragraph anchors
 - skeletal provisioning interfaces and BLE-first onboarding documentation
 
-The codebase does not yet implement the full queue, reader, Wi-Fi, backend sync, or formatter
-systems described elsewhere in these docs.
+The codebase does not yet implement the full backend-driven content, sync, provisioning, or
+storage-backed reading-progress systems described elsewhere in these docs.
 
 ## Current Hardware References
 

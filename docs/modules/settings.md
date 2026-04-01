@@ -14,7 +14,7 @@ That means pairing and boot origin do not belong here.
 
 ## Current Implementation Boundary
 
-Today the settings path is real, but intentionally narrow.
+Today the settings path is real across live state, persistence, boot hydration, and rendering.
 
 The current implementation includes:
 
@@ -22,13 +22,18 @@ The current implementation includes:
 - a persisted settings record in internal flash
 - bootstrap hydration from flash into the live store
 - platform sleep configuration derived from the hydrated settings
+- typed `Effect::PersistSettings(...)` emission from the store when persisted preferences change
+- platform-side execution of settings writes through the storage module
 - one startup log of the effective loaded settings
 
-The current settings schema contains only:
+The current settings schema contains:
 
 - `inactivity_timeout_ms`
+- `reading_speed_wpm`
+- `appearance`
+- `topics`
 
-The default remains `30_000 ms` when no persisted settings record exists.
+The default remains `30_000 ms` and light theme when no persisted settings record exists.
 
 ## Runtime Ownership
 
@@ -38,6 +43,8 @@ The current source-of-truth split is:
   The live authoritative settings used by the app runtime.
 - internal flash persisted settings record
   The durable copy used to restore settings on boot.
+- platform storage execution
+  The side-effect boundary that applies `PersistSettings` writes emitted by the store.
 
 The live store is the value other modules should observe during runtime.
 Flash is a persistence layer, not the live state owner.
@@ -59,6 +66,7 @@ This guarantees that:
 
 - cold boot and deep-sleep wake use the same hydration path
 - the store and platform sleep timeout agree at startup
+- the renderer sees the hydrated appearance mode immediately
 - defaults are deterministic when no record exists
 
 ## Current Field Semantics
@@ -74,6 +82,27 @@ Current behavior:
 - applied to the platform sleep service during bootstrap
 - defaults to `30_000 ms`
 
+### `reading_speed_wpm`
+
+This is the user's persisted RSVP speed preference.
+
+Current behavior:
+
+- stored as words per minute
+- used by the live reader session and pause-speed adjustments
+- restored through the same persisted settings snapshot as timeout and appearance
+
+### `appearance`
+
+This is the device-wide light or dark theme.
+
+Current behavior:
+
+- stored as a typed enum
+- restored during bootstrap and deep-sleep wake
+- propagated through selectors into the renderer
+- applied by the renderer as a frame-level theme transform
+
 ## Logging
 
 The current firmware logs the effective hydrated settings once during startup.
@@ -86,12 +115,10 @@ This log should reflect the live store value, not merely the raw bytes read from
 
 ## Future Expansion
 
-This module is the intended home for future preferences such as:
+This module remains the intended home for future preferences such as:
 
-- theme mode
 - font family
 - font scale
-- reading-speed preferences
 - future device-level UI behavior
 
 Those should be added as typed fields in the settings model and persisted through the same internal
