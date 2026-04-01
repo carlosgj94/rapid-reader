@@ -1,7 +1,7 @@
 use core::cmp::Ordering;
 
 use ::domain::{
-    settings::PersistedSettings,
+    settings::{AppearanceMode, PersistedSettings, TopicPreferences},
     storage::{
         QueueKind, QueueSeq, RecordKey, RecordNamespace, StorageHealth, StorageRecoveryStatus,
         StorageStatus,
@@ -1410,25 +1410,48 @@ impl RecordCodec for PersistedSettingsCodec {
 
     const KEY: RecordKey = SETTINGS_RECORD_KEY;
     const SCHEMA_VERSION: u16 = 1;
-    const MAX_ENCODED_LEN: usize = 8;
+    const MAX_ENCODED_LEN: usize = 16;
 
     fn encode(value: &Self::Value, out: &mut [u8]) -> Result<usize, StorageCodecError> {
         if out.len() < Self::MAX_ENCODED_LEN {
             return Err(StorageCodecError::BufferTooSmall);
         }
 
+        let topic_bits = value.topics.to_bits();
         out[..8].copy_from_slice(&value.inactivity_timeout_ms.to_le_bytes());
-        Ok(8)
+        out[8..10].copy_from_slice(&value.reading_speed_wpm.to_le_bytes());
+        out[10] = value.appearance.to_byte();
+        out[11] = 0;
+        out[12..16].copy_from_slice(&topic_bits.to_le_bytes());
+        Ok(16)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self::Value, StorageCodecError> {
-        if bytes.len() != 8 {
+        if bytes.len() == 8 {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(bytes);
+            return Ok(PersistedSettings::new(u64::from_le_bytes(raw)));
+        }
+
+        if bytes.len() != 16 {
             return Err(StorageCodecError::InvalidData);
         }
 
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(bytes);
-        Ok(PersistedSettings::new(u64::from_le_bytes(raw)))
+        let mut timeout_raw = [0u8; 8];
+        timeout_raw.copy_from_slice(&bytes[..8]);
+
+        let mut speed_raw = [0u8; 2];
+        speed_raw.copy_from_slice(&bytes[8..10]);
+
+        let mut topic_bits_raw = [0u8; 4];
+        topic_bits_raw.copy_from_slice(&bytes[12..16]);
+
+        Ok(PersistedSettings::with_preferences(
+            u64::from_le_bytes(timeout_raw),
+            u16::from_le_bytes(speed_raw),
+            AppearanceMode::from_byte(bytes[10]),
+            TopicPreferences::from_bits(u32::from_le_bytes(topic_bits_raw)),
+        ))
     }
 }
 
@@ -1751,12 +1774,29 @@ mod tests {
 
     #[test]
     fn persisted_settings_codec_round_trips() {
-        let settings = PersistedSettings::new(45_000);
+        let mut topics = TopicPreferences::new();
+        topics.toggle_chip(0, 1);
+        topics.toggle_chip(3, 6);
+        let settings =
+            PersistedSettings::with_preferences(45_000, 320, AppearanceMode::Dark, topics);
         let mut encoded = [0u8; PersistedSettingsCodec::MAX_ENCODED_LEN];
 
         let len = PersistedSettingsCodec::encode(&settings, &mut encoded).unwrap();
         let decoded = PersistedSettingsCodec::decode(&encoded[..len]).unwrap();
 
         assert_eq!(decoded, settings);
+    }
+
+    #[test]
+    fn persisted_settings_codec_reads_legacy_timeout_only_payload() {
+        let decoded = PersistedSettingsCodec::decode(&45_000u64.to_le_bytes()).unwrap();
+
+        assert_eq!(decoded.inactivity_timeout_ms, 45_000);
+        assert_eq!(
+            decoded.reading_speed_wpm,
+            domain::settings::DEFAULT_READING_SPEED_WPM
+        );
+        assert_eq!(decoded.appearance, AppearanceMode::Light);
+        assert_eq!(decoded.topics, TopicPreferences::new());
     }
 }

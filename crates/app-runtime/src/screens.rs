@@ -1,8 +1,11 @@
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum Screen {
     #[default]
-    Boot,
-    Queue,
+    Dashboard,
+    Saved,
+    Inbox,
+    Recommendations,
     Reader,
+    ParagraphNavigation,
     Settings,
 }

@@ -1,5 +1,6 @@
 use domain::{
-    content::{ArticleDocument, ReadingDocument},
+    content::ArticleDocument,
+    formatter::{ReadingDocument, format_article_document},
     source::SourceKind,
 };
 
@@ -24,10 +25,10 @@ pub struct NoopFormatterService;
 
 impl FormatterService for NoopFormatterService {
     fn status(&self) -> FormatterStatus {
-        FormatterStatus::Uninitialized
+        FormatterStatus::Ready
     }
 
-    fn format(&mut self, _article: &ArticleDocument) -> ReadingDocument {
-        ReadingDocument
+    fn format(&mut self, article: &ArticleDocument) -> ReadingDocument {
+        format_article_document(article)
     }
 }

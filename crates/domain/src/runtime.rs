@@ -3,11 +3,22 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum UiCommand {
+    #[default]
+    Noop,
+    FocusPrevious,
+    FocusNext,
+    Confirm,
+    Back,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum Command {
     #[default]
     Noop,
     Boot,
     RequestDeepSleep,
+    Ui(UiCommand),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -16,6 +27,8 @@ pub enum Event {
     Noop,
     BootCompleted,
     InputGestureReceived(InputGesture),
+    UiTick(u64),
+    ReaderTick(u64),
     WokeFromDeepSleep,
 }
 
@@ -24,6 +37,7 @@ pub enum Effect {
     #[default]
     Noop,
     EnterDeepSleep,
+    PersistSettings(PersistedSettings),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

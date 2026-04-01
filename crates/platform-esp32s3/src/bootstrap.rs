@@ -5,9 +5,9 @@ use ::domain::{
     store::Store,
 };
 use ::services::{input::InputService, sleep::SleepService};
-use app_runtime::{AppRuntime, Screen};
+use app_runtime::{AppRuntime, PreparedScreen, ScreenUpdate, TransitionPlan};
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either5, select5};
+use embassy_futures::select::{Either, Either5, select, select5};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
 };
@@ -24,19 +24,20 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use log::info;
-use ls027b7dh01::{
-    FrameBuffer,
-    protocol::{HEIGHT, WIDTH},
-};
+use ls027b7dh01::FrameBuffer;
 
 use crate::{
-    board::BoardConfig, display::PlatformDisplay, input::PlatformInputService,
-    sleep::enter_deep_sleep_with_button, storage::PlatformStorageService,
+    board::BoardConfig,
+    display::PlatformDisplay,
+    input::PlatformInputService,
+    renderer::{self, AnimationPlayback},
+    sleep::enter_deep_sleep_with_button,
+    storage::PlatformStorageService,
 };
 
 const DISPLAY_SPI_HZ: u32 = 1_000_000;
-const HEARTBEAT_MS: u64 = 1_000;
 const INPUT_POLL_MS: u64 = 2;
+const READER_TICK_MS: u64 = 20;
 const APP_EVENT_QUEUE_CAPACITY: usize = 16;
 const PLATFORM_COMMAND_QUEUE_CAPACITY: usize = 4;
 
@@ -47,7 +48,7 @@ static PLATFORM_CMD_CH: Channel<
     PlatformCommand,
     PLATFORM_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
-static SCREEN_SIGNAL: Signal<CriticalSectionRawMutex, Screen> = Signal::new();
+static SCREEN_SIGNAL: Signal<CriticalSectionRawMutex, ScreenUpdate> = Signal::new();
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct TimedEvent {
@@ -58,6 +59,7 @@ struct TimedEvent {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum PlatformCommand {
     RequestDeepSleep,
+    PersistSettings(domain::settings::PersistedSettings),
 }
 
 #[embassy_executor::task]
@@ -66,24 +68,42 @@ async fn app_task(snapshot: BootstrapSnapshot) {
     let mut app = AppRuntime::new();
 
     info!("settings loaded={:?}", store.settings);
-    SCREEN_SIGNAL.signal(app.tick());
+    let mut last_update = app.tick(&store);
+    SCREEN_SIGNAL.signal(last_update);
 
     loop {
         let timed_event = APP_EVENT_CH.receive().await;
-
-        if let Event::InputGestureReceived(gesture) = timed_event.event {
-            app.handle_input_gesture(gesture);
-        }
-
-        let effect = store
+        let mut effect = store
             .handle_event(timed_event.event, timed_event.at_ms)
             .unwrap_or(Effect::Noop);
-        SCREEN_SIGNAL.signal(app.tick());
 
-        if effect == Effect::EnterDeepSleep {
-            PLATFORM_CMD_CH
-                .send(PlatformCommand::RequestDeepSleep)
-                .await;
+        if let Event::InputGestureReceived(gesture) = timed_event.event {
+            let command = app.handle_input_gesture(gesture);
+            let command_effect = store.dispatch(command).unwrap_or(Effect::Noop);
+            if !matches!(command_effect, Effect::Noop) {
+                effect = command_effect;
+            }
+        }
+
+        let next_update = app.tick(&store);
+        if next_update.screen != last_update.screen || next_update.prepared != last_update.prepared
+        {
+            SCREEN_SIGNAL.signal(next_update);
+            last_update = next_update;
+        }
+
+        match effect {
+            Effect::EnterDeepSleep => {
+                PLATFORM_CMD_CH
+                    .send(PlatformCommand::RequestDeepSleep)
+                    .await;
+            }
+            Effect::PersistSettings(settings) => {
+                PLATFORM_CMD_CH
+                    .send(PlatformCommand::PersistSettings(settings))
+                    .await;
+            }
+            Effect::Noop => {}
         }
     }
 }
@@ -183,25 +203,22 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     log_gpio_contract(&board);
 
     let mut frame = FrameBuffer::new();
-    let mut heartbeat_on = true;
-    let mut active_screen = Screen::Boot;
-    flush_idle_frame(
-        &mut display,
-        &mut frame,
-        &mut delay,
-        heartbeat_on,
-        active_screen,
-    );
+    let mut committed_update: Option<ScreenUpdate> = None;
+    let mut animation: Option<AnimationPlayback> = None;
+    let mut maintenance_ticks = 0u8;
 
     let mut input_tick = Ticker::every(Duration::from_millis(INPUT_POLL_MS));
-    let mut heartbeat_tick = Ticker::every(Duration::from_millis(HEARTBEAT_MS));
+    let mut ui_tick = Ticker::every(Duration::from_millis(renderer::UI_TICK_MS));
+    let mut reader_tick = Ticker::every(Duration::from_millis(READER_TICK_MS));
 
     loop {
-        let sleep_deadline = next_sleep_deadline(sleep.model());
+        let suppress_sleep = current_prepared_screen(animation, committed_update)
+            .is_some_and(|screen| prepared_screen_suppresses_sleep(&screen));
+        let sleep_deadline = next_sleep_deadline(sleep.model(), suppress_sleep);
 
         match select5(
             input_tick.next(),
-            heartbeat_tick.next(),
+            select(ui_tick.next(), reader_tick.next()),
             Timer::at(sleep_deadline),
             PLATFORM_CMD_CH.receive(),
             SCREEN_SIGNAL.wait(),
@@ -223,15 +240,50 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                     publish_event(Event::InputGestureReceived(gesture), now_ms);
                 }
             }
-            Either5::Second(_) => {
-                heartbeat_on = !heartbeat_on;
-                flush_idle_frame(
-                    &mut display,
-                    &mut frame,
-                    &mut delay,
-                    heartbeat_on,
-                    active_screen,
-                );
+            Either5::Second(tick_kind) => {
+                let now_ms = Instant::now().as_millis();
+
+                match tick_kind {
+                    Either::First(_) => {
+                        publish_event(Event::UiTick(now_ms), now_ms);
+
+                        if let Some(active_animation) = animation {
+                            let next_frame = active_animation.advance();
+                            flush_transition_frame(
+                                &mut display,
+                                &mut frame,
+                                &mut delay,
+                                &next_frame,
+                            );
+                            maintenance_ticks = 0;
+
+                            if next_frame.is_complete() {
+                                committed_update = Some(ScreenUpdate {
+                                    screen: next_frame.screen,
+                                    prepared: next_frame.target_screen(),
+                                    transition: TransitionPlan::none(),
+                                });
+                                animation = None;
+                            } else {
+                                animation = Some(next_frame);
+                            }
+                        } else if let Some(update) = committed_update {
+                            maintenance_ticks = maintenance_ticks.saturating_add(1);
+                            if maintenance_ticks >= renderer::MAINTENANCE_REFRESH_TICKS {
+                                flush_prepared_screen(
+                                    &mut display,
+                                    &mut frame,
+                                    &mut delay,
+                                    &update.prepared,
+                                );
+                                maintenance_ticks = 0;
+                            }
+                        }
+                    }
+                    Either::Second(_) => {
+                        publish_event(Event::ReaderTick(now_ms), now_ms);
+                    }
+                }
             }
             Either5::Third(_) => {
                 enter_low_power_sleep(
@@ -254,17 +306,56 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                         &mut rtc,
                     );
                 }
+                PlatformCommand::PersistSettings(settings) => {
+                    sleep.configure_inactivity_timeout(settings.inactivity_timeout_ms);
+                    if let Err(err) = storage.write_persisted_settings_sync(&settings) {
+                        info!("persist settings failed: {:?}", err);
+                    }
+                }
             },
-            Either5::Fifth(screen) => {
-                active_screen = screen;
-                info!("app screen={:?}", active_screen);
-                flush_idle_frame(
-                    &mut display,
-                    &mut frame,
-                    &mut delay,
-                    heartbeat_on,
-                    active_screen,
-                );
+            Either5::Fifth(update) => {
+                let previous_prepared = animation
+                    .map(|active| active.target_screen())
+                    .or(committed_update.map(|committed| committed.prepared));
+
+                info!("app screen={:?}", update.screen);
+
+                if let Some(previous) = previous_prepared {
+                    if update.transition == TransitionPlan::none() {
+                        animation = None;
+                        committed_update = Some(update);
+                        flush_prepared_screen(
+                            &mut display,
+                            &mut frame,
+                            &mut delay,
+                            &update.prepared,
+                        );
+                    } else {
+                        let next_animation = AnimationPlayback::new(previous, update);
+                        flush_transition_frame(
+                            &mut display,
+                            &mut frame,
+                            &mut delay,
+                            &next_animation,
+                        );
+                        maintenance_ticks = 0;
+
+                        if next_animation.is_complete() {
+                            committed_update = Some(ScreenUpdate {
+                                screen: next_animation.screen,
+                                prepared: next_animation.target_screen(),
+                                transition: TransitionPlan::none(),
+                            });
+                            animation = None;
+                        } else {
+                            animation = Some(next_animation);
+                        }
+                    }
+                } else {
+                    committed_update = Some(update);
+                    flush_prepared_screen(&mut display, &mut frame, &mut delay, &update.prepared);
+                    maintenance_ticks = 0;
+                }
             }
         }
     }
@@ -276,9 +367,26 @@ fn publish_event(event: Event, at_ms: u64) {
     }
 }
 
-fn next_sleep_deadline(model: &SleepModel) -> Instant {
+fn current_prepared_screen(
+    animation: Option<AnimationPlayback>,
+    committed_update: Option<ScreenUpdate>,
+) -> Option<PreparedScreen> {
+    animation
+        .map(|active| active.target_screen())
+        .or(committed_update.map(|update| update.prepared))
+}
+
+fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
+    matches!(screen, PreparedScreen::Reader(shell) if shell.pause_modal.is_none())
+}
+
+fn next_sleep_deadline(model: &SleepModel, suppress_inactivity_sleep: bool) -> Instant {
     if matches!(model.state, SleepState::SleepRequested) {
         return Instant::now();
+    }
+
+    if suppress_inactivity_sleep {
+        return Instant::from_millis(u64::MAX);
     }
 
     Instant::from_millis(
@@ -288,12 +396,11 @@ fn next_sleep_deadline(model: &SleepModel) -> Instant {
     )
 }
 
-fn flush_idle_frame<SPI, DISP, EMD, CS, D>(
+fn flush_prepared_screen<SPI, DISP, EMD, CS, D>(
     display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
     frame: &mut FrameBuffer,
     delay: &mut D,
-    heartbeat_on: bool,
-    screen: Screen,
+    screen: &PreparedScreen,
 ) where
     SPI: embedded_hal::spi::SpiBus<u8>,
     DISP: embedded_hal::digital::OutputPin,
@@ -301,7 +408,26 @@ fn flush_idle_frame<SPI, DISP, EMD, CS, D>(
     CS: embedded_hal::digital::OutputPin,
     D: DelayNs,
 {
-    draw_idle_frame(frame, heartbeat_on, screen);
+    renderer::draw_prepared_screen(frame, screen);
+    if let Err(err) = display.flush_frame(frame, delay) {
+        info!("display flush failed: {:?}", err);
+        let _ = display.disable_output();
+    }
+}
+
+fn flush_transition_frame<SPI, DISP, EMD, CS, D>(
+    display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
+    frame: &mut FrameBuffer,
+    delay: &mut D,
+    animation: &AnimationPlayback,
+) where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DISP: embedded_hal::digital::OutputPin,
+    EMD: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    D: DelayNs,
+{
+    renderer::draw_transition_frame(frame, animation);
     if let Err(err) = display.flush_frame(frame, delay) {
         info!("display flush failed: {:?}", err);
         let _ = display.disable_output();
@@ -336,51 +462,6 @@ where
     hold_display_sleep_pins(board);
     let wake_button = input.take_wake_button();
     enter_deep_sleep_with_button(sleep, rtc, wake_button);
-}
-
-fn draw_idle_frame(frame: &mut FrameBuffer, heartbeat_on: bool, screen: Screen) {
-    frame.clear(false);
-
-    for x in 0..WIDTH {
-        let _ = frame.set_pixel(x, 0, true);
-        let _ = frame.set_pixel(x, HEIGHT - 1, true);
-    }
-
-    for y in 0..HEIGHT {
-        let _ = frame.set_pixel(0, y, true);
-        let _ = frame.set_pixel(WIDTH - 1, y, true);
-    }
-
-    for x in 32..(WIDTH - 32) {
-        let _ = frame.set_pixel(x, HEIGHT / 2, true);
-    }
-
-    for y in 48..(HEIGHT - 48) {
-        let _ = frame.set_pixel(WIDTH / 2, y, true);
-    }
-
-    let heartbeat_x = WIDTH / 2;
-    let heartbeat_y = HEIGHT / 2;
-    for dy in 0..8 {
-        for dx in 0..8 {
-            let _ = frame.set_pixel(heartbeat_x + dx - 4, heartbeat_y + dy - 4, heartbeat_on);
-        }
-    }
-
-    let marker_x = 8;
-    let marker_y = 8;
-    let marker_width = match screen {
-        Screen::Boot => 6,
-        Screen::Queue => 12,
-        Screen::Reader => 18,
-        Screen::Settings => 24,
-    };
-
-    for y in marker_y..(marker_y + 4) {
-        for x in marker_x..(marker_x + marker_width) {
-            let _ = frame.set_pixel(x, y, true);
-        }
-    }
 }
 
 fn log_gpio_contract(board: &BoardConfig) {
@@ -426,7 +507,7 @@ mod tests {
         let mut model = SleepModel::new(SleepConfig::new(30_000));
         model.request_sleep();
 
-        assert!(next_sleep_deadline(&model) <= Instant::now());
+        assert!(next_sleep_deadline(&model, false) <= Instant::now());
     }
 
     #[test]
@@ -434,6 +515,76 @@ mod tests {
         let mut model = SleepModel::new(SleepConfig::new(30_000));
         model.mark_woke(WakeReason::ColdBoot, 1_000);
 
-        assert_eq!(next_sleep_deadline(&model), Instant::from_millis(31_000));
+        assert_eq!(
+            next_sleep_deadline(&model, false),
+            Instant::from_millis(31_000)
+        );
+    }
+
+    #[test]
+    fn active_reader_suppresses_inactivity_deadline() {
+        let mut model = SleepModel::new(SleepConfig::new(30_000));
+        model.mark_woke(WakeReason::ColdBoot, 1_000);
+
+        assert_eq!(
+            next_sleep_deadline(&model, true),
+            Instant::from_millis(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn prepared_reader_without_modal_suppresses_sleep() {
+        let screen = PreparedScreen::Reader(app_runtime::components::ReaderShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            stage: app_runtime::components::RsvpStage {
+                title: "TEST",
+                wpm: 260,
+                left_word: domain::text::InlineText::new(),
+                right_word: domain::text::InlineText::new(),
+                preview: domain::text::InlineText::new(),
+                font: domain::formatter::StageFont::Large,
+                progress_width: 0,
+            },
+            badge: None,
+            pause_modal: None,
+        });
+
+        assert!(prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn paused_reader_does_not_suppress_sleep() {
+        let screen = PreparedScreen::Reader(app_runtime::components::ReaderShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            stage: app_runtime::components::RsvpStage {
+                title: "TEST",
+                wpm: 260,
+                left_word: domain::text::InlineText::new(),
+                right_word: domain::text::InlineText::new(),
+                preview: domain::text::InlineText::new(),
+                font: domain::formatter::StageFont::Large,
+                progress_width: 0,
+            },
+            badge: None,
+            pause_modal: Some(app_runtime::components::PauseModal {
+                title: "PAUSED",
+                rows: [
+                    app_runtime::components::PauseModalRow {
+                        label: "A",
+                        action: "A",
+                    },
+                    app_runtime::components::PauseModalRow {
+                        label: "B",
+                        action: "B",
+                    },
+                    app_runtime::components::PauseModalRow {
+                        label: "C",
+                        action: "C",
+                    },
+                ],
+            }),
+        });
+
+        assert!(!prepared_screen_suppresses_sleep(&screen));
     }
 }

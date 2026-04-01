@@ -1,14 +1,26 @@
-use crate::screens::Screen;
+use domain::{
+    input::{InputGesture, RotationDirection},
+    runtime::{Command, UiCommand},
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct NavigationState {
-    pub active_screen: Screen,
-}
+pub struct NavigationState;
 
 impl NavigationState {
     pub const fn new() -> Self {
-        Self {
-            active_screen: Screen::Boot,
+        Self
+    }
+
+    pub const fn command_for_gesture(gesture: InputGesture) -> Command {
+        match gesture {
+            InputGesture::Rotate {
+                direction: RotationDirection::Clockwise,
+            } => Command::Ui(UiCommand::FocusPrevious),
+            InputGesture::Rotate {
+                direction: RotationDirection::CounterClockwise,
+            } => Command::Ui(UiCommand::FocusNext),
+            InputGesture::Click => Command::Ui(UiCommand::Confirm),
+            InputGesture::LongPress => Command::Ui(UiCommand::Back),
         }
     }
 }
