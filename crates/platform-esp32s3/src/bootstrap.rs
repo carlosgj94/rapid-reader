@@ -1,11 +1,17 @@
+extern crate alloc;
+
 use ::domain::{
-    device::{BootState, DeviceState, PairingState},
+    content::PackageState,
+    device::{BootState, DeviceState},
     runtime::{BootstrapSnapshot, Effect, Event},
     sleep::{SleepModel, SleepState},
+    storage::StorageRecoveryStatus,
     store::Store,
 };
 use ::services::{input::InputService, sleep::SleepService};
+use alloc::boxed::Box;
 use app_runtime::{AppRuntime, PreparedScreen, ScreenUpdate, TransitionPlan};
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either5, select, select5};
 use embassy_sync::{
@@ -27,19 +33,25 @@ use log::info;
 use ls027b7dh01::FrameBuffer;
 
 use crate::{
+    backend,
     board::BoardConfig,
+    content_storage,
     display::PlatformDisplay,
     input::PlatformInputService,
+    internet,
     renderer::{self, AnimationPlayback},
     sleep::enter_deep_sleep_with_button,
     storage::PlatformStorageService,
 };
 
 const DISPLAY_SPI_HZ: u32 = 1_000_000;
+const SD_SPI_HZ: u32 = 400_000;
 const INPUT_POLL_MS: u64 = 2;
 const READER_TICK_MS: u64 = 20;
-const APP_EVENT_QUEUE_CAPACITY: usize = 16;
+// TimedEvent can carry whole manifest snapshots, so this queue must stay small.
+const APP_EVENT_QUEUE_CAPACITY: usize = 8;
 const PLATFORM_COMMAND_QUEUE_CAPACITY: usize = 4;
+const DROP_LOG_SAMPLE_EVERY: u32 = 64;
 
 static APP_EVENT_CH: Channel<CriticalSectionRawMutex, TimedEvent, APP_EVENT_QUEUE_CAPACITY> =
     Channel::new();
@@ -49,16 +61,19 @@ static PLATFORM_CMD_CH: Channel<
     PLATFORM_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
 static SCREEN_SIGNAL: Signal<CriticalSectionRawMutex, ScreenUpdate> = Signal::new();
+static DROPPED_UI_TICKS: AtomicU32 = AtomicU32::new(0);
+static DROPPED_READER_TICKS: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct TimedEvent {
     event: Event,
     at_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum PlatformCommand {
     RequestDeepSleep,
+    PersistBackendCredential(Box<crate::storage::BackendCredential>),
     PersistSettings(domain::settings::PersistedSettings),
 }
 
@@ -73,11 +88,15 @@ async fn app_task(snapshot: BootstrapSnapshot) {
 
     loop {
         let timed_event = APP_EVENT_CH.receive().await;
+        let input_gesture = match &timed_event.event {
+            Event::InputGestureReceived(gesture) => Some(*gesture),
+            _ => None,
+        };
         let mut effect = store
             .handle_event(timed_event.event, timed_event.at_ms)
             .unwrap_or(Effect::Noop);
 
-        if let Event::InputGestureReceived(gesture) = timed_event.event {
+        if let Some(gesture) = input_gesture {
             let command = app.handle_input_gesture(gesture);
             let command_effect = store.dispatch(command).unwrap_or(Effect::Noop);
             if !matches!(command_effect, Effect::Noop) {
@@ -85,26 +104,108 @@ async fn app_task(snapshot: BootstrapSnapshot) {
             }
         }
 
+        apply_effect(&mut store, effect, timed_event.at_ms).await;
+
         let next_update = app.tick(&store);
         if next_update.screen != last_update.screen || next_update.prepared != last_update.prepared
         {
             SCREEN_SIGNAL.signal(next_update);
             last_update = next_update;
         }
+    }
+}
 
-        match effect {
-            Effect::EnterDeepSleep => {
-                PLATFORM_CMD_CH
-                    .send(PlatformCommand::RequestDeepSleep)
-                    .await;
-            }
-            Effect::PersistSettings(settings) => {
-                PLATFORM_CMD_CH
-                    .send(PlatformCommand::PersistSettings(settings))
-                    .await;
-            }
-            Effect::Noop => {}
+async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
+    match effect {
+        Effect::EnterDeepSleep => {
+            PLATFORM_CMD_CH
+                .send(PlatformCommand::RequestDeepSleep)
+                .await;
         }
+        Effect::CollectionConfirmIgnored { collection, reason } => {
+            info!(
+                "collection confirm ignored collection={:?} reason={}",
+                collection,
+                reason.label()
+            );
+        }
+        Effect::OpenCachedContent(request) => {
+            info!(
+                "collection confirm open cached collection={:?} content_id={}",
+                request.collection,
+                request.content_id.as_str(),
+            );
+            match content_storage::open_cached_reader_content(request.content_id).await {
+                Ok(opened) => {
+                    store.open_cached_content(request.collection, opened.title, opened.document);
+                    info!(
+                        "content storage opened cached content collection={:?} content_id={} truncated={}",
+                        request.collection,
+                        request.content_id.as_str(),
+                        opened.truncated,
+                    );
+                }
+                Err(err) => {
+                    info!(
+                        "content storage open failed collection={:?} content_id={} err={:?}",
+                        request.collection,
+                        request.content_id.as_str(),
+                        err,
+                    );
+                    match content_storage::update_package_state(
+                        request.collection,
+                        request.remote_item_id,
+                        PackageState::Failed,
+                    )
+                    .await
+                    {
+                        Ok(snapshot) => {
+                            let _ = store.handle_event(
+                                Event::CollectionContentUpdated(
+                                    request.collection,
+                                    Box::new(snapshot),
+                                ),
+                                at_ms,
+                            );
+                        }
+                        Err(_) => {
+                            let _ = store.handle_event(
+                                Event::ContentPackageStateChanged {
+                                    collection: request.collection,
+                                    remote_item_id: request.remote_item_id,
+                                    package_state: PackageState::Failed,
+                                },
+                                at_ms,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Effect::PrepareContent(request) => {
+            info!(
+                "collection confirm prepare content collection={:?} content_id={} remote_item_id={}",
+                request.collection,
+                request.content_id.as_str(),
+                request.remote_item_id.as_str(),
+            );
+            backend::request_prepare_content(request).await;
+        }
+        Effect::OpenRemoteContent(request) => {
+            info!(
+                "collection confirm open remote collection={:?} content_id={} remote_item_id={}",
+                request.collection,
+                request.content_id.as_str(),
+                request.remote_item_id.as_str(),
+            );
+            backend::request_open_remote_content(request).await;
+        }
+        Effect::PersistSettings(settings) => {
+            PLATFORM_CMD_CH
+                .send(PlatformCommand::PersistSettings(settings))
+                .await;
+        }
+        Effect::Noop => {}
     }
 }
 
@@ -122,7 +223,8 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     );
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 80 * 1024);
+    log_heap("after heap init");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
@@ -136,8 +238,36 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
             None
         }
     };
-    let storage_health = storage.health_snapshot();
+    let backend_credential = match storage.read_backend_credential_sync() {
+        Ok(credential) => credential,
+        Err(err) => {
+            info!("backend credential hydrate failed: {:?}", err);
+            None
+        }
+    };
+    let sd_spi_config = esp_hal::spi::master::Config::default()
+        .with_frequency(Rate::from_hz(SD_SPI_HZ))
+        .with_mode(esp_hal::spi::Mode::_0);
+    let sd_spi = Spi::new(peripherals.SPI3, sd_spi_config)
+        .unwrap()
+        .with_sck(peripherals.GPIO4)
+        .with_mosi(peripherals.GPIO40)
+        .with_miso(peripherals.GPIO41);
+    let sd_cs = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
+    let content_mount = content_storage::mount(sd_spi, sd_cs);
+    let mut storage_health = storage.health_snapshot().with_sd_card(
+        content_mount.sd_card_ready,
+        content_mount.sd_total_bytes,
+        content_mount.sd_free_bytes,
+    );
+    if matches!(
+        content_mount.last_recovery,
+        StorageRecoveryStatus::Recovered
+    ) {
+        storage_health.last_recovery = StorageRecoveryStatus::Recovered;
+    }
     info!("storage health={:?}", storage_health);
+    log_heap("after content mount");
 
     let boot_ms = Instant::now().as_millis();
     let boot_state = if woke_from_deep_sleep {
@@ -147,15 +277,26 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     };
     let snapshot = BootstrapSnapshot::new(
         DeviceState {
-            pairing: PairingState::Unpaired,
+            pairing: backend::initial_pairing_state(backend_credential),
             boot: boot_state,
         },
         boot_ms,
+        None,
         persisted_settings,
         storage_health,
+        internet::initial_network_state(),
     );
 
     spawner.spawn(app_task(snapshot)).unwrap();
+    content_storage::install(spawner, content_mount.storage);
+    let network_stack = internet::install(spawner, peripherals.WIFI);
+    backend::install(
+        spawner,
+        network_stack,
+        backend_credential,
+        peripherals.RNG,
+        peripherals.ADC1,
+    );
 
     let mut input = PlatformInputService::new(
         peripherals.GPIO10.degrade(),
@@ -281,7 +422,11 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                         }
                     }
                     Either::Second(_) => {
-                        publish_event(Event::ReaderTick(now_ms), now_ms);
+                        if current_prepared_screen(animation, committed_update)
+                            .is_some_and(|screen| prepared_screen_drives_reader_ticks(&screen))
+                        {
+                            publish_event(Event::ReaderTick(now_ms), now_ms);
+                        }
                     }
                 }
             }
@@ -306,6 +451,11 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                         &mut rtc,
                     );
                 }
+                PlatformCommand::PersistBackendCredential(credential) => {
+                    if let Err(err) = storage.write_backend_credential_sync(&credential) {
+                        info!("persist backend credential failed: {:?}", err);
+                    }
+                }
                 PlatformCommand::PersistSettings(settings) => {
                     sleep.configure_inactivity_timeout(settings.inactivity_timeout_ms);
                     if let Err(err) = storage.write_persisted_settings_sync(&settings) {
@@ -314,11 +464,16 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                 }
             },
             Either5::Fifth(update) => {
+                let previous_screen = animation
+                    .map(|active| active.screen)
+                    .or(committed_update.map(|committed| committed.screen));
                 let previous_prepared = animation
                     .map(|active| active.target_screen())
                     .or(committed_update.map(|committed| committed.prepared));
 
-                info!("app screen={:?}", update.screen);
+                if previous_screen != Some(update.screen) {
+                    info!("app screen={:?}", update.screen);
+                }
 
                 if let Some(previous) = previous_prepared {
                     if update.transition == TransitionPlan::none() {
@@ -361,10 +516,35 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     }
 }
 
-fn publish_event(event: Event, at_ms: u64) {
-    if APP_EVENT_CH.try_send(TimedEvent { event, at_ms }).is_err() {
-        info!("app event dropped: {:?}", event);
+pub(crate) fn publish_event(event: Event, at_ms: u64) {
+    let is_ui_tick = matches!(event, Event::UiTick(_));
+    let is_reader_tick = matches!(event, Event::ReaderTick(_));
+
+    match APP_EVENT_CH.try_send(TimedEvent { event, at_ms }) {
+        Ok(()) => {
+            if !is_ui_tick && !is_reader_tick {
+                flush_tick_drop_logs();
+            }
+        }
+        Err(embassy_sync::channel::TrySendError::Full(timed_event)) => {
+            if is_ui_tick {
+                record_tick_drop(&DROPPED_UI_TICKS, "ui");
+            } else if is_reader_tick {
+                record_tick_drop(&DROPPED_READER_TICKS, "reader");
+            } else {
+                flush_tick_drop_logs();
+                info!("app event dropped: {:?}", timed_event.event);
+            }
+        }
     }
+}
+
+pub(crate) async fn persist_backend_credential(credential: crate::storage::BackendCredential) {
+    PLATFORM_CMD_CH
+        .send(PlatformCommand::PersistBackendCredential(Box::new(
+            credential,
+        )))
+        .await;
 }
 
 fn current_prepared_screen(
@@ -377,7 +557,27 @@ fn current_prepared_screen(
 }
 
 fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
+    prepared_screen_drives_reader_ticks(screen)
+}
+
+fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
     matches!(screen, PreparedScreen::Reader(shell) if shell.pause_modal.is_none())
+}
+
+fn record_tick_drop(counter: &AtomicU32, label: &str) {
+    let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped.is_multiple_of(DROP_LOG_SAMPLE_EVERY) {
+        info!("app {} ticks dropped={} (aggregated)", label, dropped);
+    }
+}
+
+fn flush_tick_drop_logs() {
+    let ui = DROPPED_UI_TICKS.swap(0, Ordering::Relaxed);
+    let reader = DROPPED_READER_TICKS.swap(0, Ordering::Relaxed);
+
+    if ui > 0 || reader > 0 {
+        info!("app tick drops ui={} reader={}", ui, reader);
+    }
 }
 
 fn next_sleep_deadline(model: &SleepModel, suppress_inactivity_sleep: bool) -> Instant {
@@ -484,6 +684,17 @@ fn log_gpio_contract(board: &BoardConfig) {
     info!(
         "sleep wake gpio={} inactivity_ms=30000",
         board.sleep_wake_gpio
+    );
+}
+
+fn log_heap(label: &str) {
+    let stats = esp_alloc::HEAP.stats();
+    info!(
+        "heap label={} size={} used={} free={}",
+        label,
+        stats.size,
+        stats.current_usage,
+        stats.size.saturating_sub(stats.current_usage),
     );
 }
 

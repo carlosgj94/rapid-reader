@@ -1,5 +1,6 @@
 use crate::screens::Screen;
 use domain::{
+    content::{CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES},
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     selectors::{
         ActiveScreenModel, ContentListScreenModel, DashboardScreenModel, ParagraphNavigationModel,
@@ -31,6 +32,12 @@ pub struct DashboardItem {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SyncIndicator {
+    pub label: &'static str,
+    pub spinner_phase: u8,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct SelectionBand {
     pub y: i32,
     pub height: u32,
@@ -40,6 +47,7 @@ pub struct SelectionBand {
 pub struct DashboardShell {
     pub appearance: AppearanceMode,
     pub status: StatusCluster,
+    pub sync_indicator: Option<SyncIndicator>,
     pub rail: VerticalRail,
     pub items: [DashboardItem; 3],
     pub band: SelectionBand,
@@ -47,8 +55,8 @@ pub struct DashboardShell {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ContentRow {
-    pub meta: &'static str,
-    pub title: &'static str,
+    pub meta: domain::text::InlineText<CONTENT_META_MAX_BYTES>,
+    pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub selected: bool,
 }
 
@@ -86,7 +94,7 @@ pub struct PauseModal {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RsvpStage {
-    pub title: &'static str,
+    pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub wpm: u16,
     pub left_word: domain::text::InlineText<MAX_STAGE_SEGMENT_BYTES>,
     pub right_word: domain::text::InlineText<MAX_STAGE_SEGMENT_BYTES>,
@@ -112,13 +120,13 @@ pub struct ParagraphMapRail {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ParagraphNavigationShell {
     pub appearance: AppearanceMode,
-    pub title: &'static str,
-    pub counter: &'static str,
-    pub previous_top: &'static str,
-    pub selected_label: &'static str,
-    pub selected_excerpt: &'static str,
-    pub previous_bottom: &'static str,
-    pub final_excerpt: &'static str,
+    pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub counter: domain::text::InlineText<16>,
+    pub previous_top: domain::text::InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
+    pub selected_label: domain::text::InlineText<16>,
+    pub selected_excerpt: domain::text::InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
+    pub previous_bottom: domain::text::InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
+    pub final_excerpt: domain::text::InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
     pub rail: ParagraphMapRail,
 }
 
@@ -207,6 +215,10 @@ fn compose_dashboard(model: DashboardScreenModel) -> DashboardShell {
             battery_percent: model.status.battery_percent,
             wifi_online: model.status.network == domain::network::NetworkStatus::Online,
         },
+        sync_indicator: model.sync_indicator.map(|indicator| SyncIndicator {
+            label: indicator.label,
+            spinner_phase: indicator.spinner_phase,
+        }),
         rail: VerticalRail {
             text: model.rail_label,
         },
@@ -436,60 +448,37 @@ impl PreparedScreen {
     }
 }
 
-const fn counter_label(current_index: u8, total: u8) -> &'static str {
-    match (current_index, total) {
-        (1, 23) => "01 / 23",
-        (2, 23) => "02 / 23",
-        (3, 23) => "03 / 23",
-        (4, 23) => "04 / 23",
-        (5, 23) => "05 / 23",
-        (6, 23) => "06 / 23",
-        (7, 23) => "07 / 23",
-        (8, 23) => "08 / 23",
-        (9, 23) => "09 / 23",
-        (10, 23) => "10 / 23",
-        (11, 23) => "11 / 23",
-        (12, 23) => "12 / 23",
-        (13, 23) => "13 / 23",
-        (14, 23) => "14 / 23",
-        (15, 23) => "15 / 23",
-        (16, 23) => "16 / 23",
-        (17, 23) => "17 / 23",
-        (18, 23) => "18 / 23",
-        (19, 23) => "19 / 23",
-        (20, 23) => "20 / 23",
-        (21, 23) => "21 / 23",
-        (22, 23) => "22 / 23",
-        (23, 23) => "23 / 23",
-        _ => "07 / 23",
+fn counter_label(current_index: u8, total: u8) -> domain::text::InlineText<16> {
+    let mut label = domain::text::InlineText::new();
+    let tens = (current_index / 10) % 10;
+    let ones = current_index % 10;
+    let _ = label.try_push_char((b'0' + tens) as char);
+    let _ = label.try_push_char((b'0' + ones) as char);
+    let _ = label.try_push_str(" / ");
+    if total >= 100 {
+        let _ = label.try_push_char((b'0' + ((total / 100) % 10)) as char);
     }
+    if total >= 10 {
+        let _ = label.try_push_char((b'0' + ((total / 10) % 10)) as char);
+    } else {
+        let _ = label.try_push_char('0');
+    }
+    let _ = label.try_push_char((b'0' + (total % 10)) as char);
+    label
 }
 
-const fn paragraph_label(current_index: u8) -> &'static str {
-    match current_index {
-        1 => "PARAGRAPH 01",
-        2 => "PARAGRAPH 02",
-        3 => "PARAGRAPH 03",
-        4 => "PARAGRAPH 04",
-        5 => "PARAGRAPH 05",
-        6 => "PARAGRAPH 06",
-        7 => "PARAGRAPH 07",
-        8 => "PARAGRAPH 08",
-        9 => "PARAGRAPH 09",
-        10 => "PARAGRAPH 10",
-        11 => "PARAGRAPH 11",
-        12 => "PARAGRAPH 12",
-        13 => "PARAGRAPH 13",
-        14 => "PARAGRAPH 14",
-        15 => "PARAGRAPH 15",
-        16 => "PARAGRAPH 16",
-        17 => "PARAGRAPH 17",
-        18 => "PARAGRAPH 18",
-        19 => "PARAGRAPH 19",
-        20 => "PARAGRAPH 20",
-        21 => "PARAGRAPH 21",
-        22 => "PARAGRAPH 22",
-        23 => "PARAGRAPH 23",
-        _ => "PARAGRAPH 07",
+fn paragraph_label(current_index: u8) -> domain::text::InlineText<16> {
+    let mut label = domain::text::InlineText::new();
+    let _ = label.try_push_str("PARAGRAPH ");
+    if current_index < 10 {
+        let _ = label.try_push_char('0');
     }
+    if current_index >= 100 {
+        let _ = label.try_push_char((b'0' + ((current_index / 100) % 10)) as char);
+    }
+    if current_index >= 10 {
+        let _ = label.try_push_char((b'0' + ((current_index / 10) % 10)) as char);
+    }
+    let _ = label.try_push_char((b'0' + (current_index % 10)) as char);
+    label
 }

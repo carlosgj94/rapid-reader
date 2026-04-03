@@ -1,5 +1,8 @@
 use crate::{
-    content::{CollectionKind, ContentState, script_paragraph},
+    content::{
+        CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestItem,
+        CollectionManifestState, ContentState,
+    },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     network::NetworkStatus,
     reader::ReaderMode,
@@ -32,15 +35,22 @@ pub struct DashboardItemModel {
 pub struct DashboardScreenModel {
     pub appearance: AppearanceMode,
     pub status: StatusClusterModel,
+    pub sync_indicator: Option<SyncIndicatorModel>,
     pub rail_label: &'static str,
     pub items: [DashboardItemModel; VISIBLE_LIST_ROWS],
     pub focused: DashboardFocus,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SyncIndicatorModel {
+    pub label: &'static str,
+    pub spinner_phase: u8,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ContentRowModel {
-    pub meta: &'static str,
-    pub title: &'static str,
+    pub meta: InlineText<CONTENT_META_MAX_BYTES>,
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub selected: bool,
 }
 
@@ -63,7 +73,7 @@ pub struct PauseActionModel {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ReaderScreenModel {
     pub appearance: AppearanceMode,
-    pub title: &'static str,
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub wpm: u16,
     pub left_word: InlineText<MAX_STAGE_SEGMENT_BYTES>,
     pub right_word: InlineText<MAX_STAGE_SEGMENT_BYTES>,
@@ -77,13 +87,13 @@ pub struct ReaderScreenModel {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ParagraphNavigationModel {
     pub appearance: AppearanceMode,
-    pub title: &'static str,
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub current_index: u8,
     pub total: u8,
-    pub previous_top: &'static str,
-    pub selected_excerpt: &'static str,
-    pub previous_bottom: &'static str,
-    pub final_excerpt: &'static str,
+    pub previous_top: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
+    pub selected_excerpt: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
+    pub previous_bottom: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
+    pub final_excerpt: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
     pub tick_index: u8,
 }
 
@@ -160,6 +170,12 @@ pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
     DashboardScreenModel {
         appearance: store.settings.appearance,
         status: select_status(store),
+        sync_indicator: store.backend_sync.shows_dashboard_indicator().then_some(
+            SyncIndicatorModel {
+                label: "syncing...",
+                spinner_phase: store.backend_sync.spinner_phase,
+            },
+        ),
         rail_label: "M\nO\nT\nI\nF",
         items: [
             DashboardItemModel {
@@ -184,7 +200,7 @@ pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
 
 pub fn select_collection(store: &Store, kind: CollectionKind) -> ContentListScreenModel {
     let selected_index = store.ui.collection_index(kind);
-    let rows = select_collection_rows(&store.content, kind, selected_index);
+    let rows = select_collection_rows(store.content(), kind, selected_index);
 
     ContentListScreenModel {
         appearance: store.settings.appearance,
@@ -197,19 +213,16 @@ pub fn select_collection(store: &Store, kind: CollectionKind) -> ContentListScre
 }
 
 pub fn select_reader(store: &Store) -> ReaderScreenModel {
-    let article = store
-        .content
-        .article_by_id(store.reader.active_collection, store.reader.active_article);
     let current_unit = store.reader.current_unit();
     let stage_token = current_unit.stage_token();
     let preview = store
         .reader
-        .document
+        .document()
         .preview_for_paragraph(store.reader.progress.paragraph_index);
 
     ReaderScreenModel {
         appearance: store.settings.appearance,
-        title: article.reader_title,
+        title: store.reader.title,
         wpm: store.settings.reading_speed_wpm,
         left_word: stage_token.left,
         right_word: stage_token.right,
@@ -235,28 +248,30 @@ pub fn select_reader(store: &Store) -> ReaderScreenModel {
 }
 
 pub fn select_paragraph_navigation(store: &Store) -> ParagraphNavigationModel {
-    let article = store.content.article_at(
-        store.reader.active_collection,
-        store.ui.collection_index(store.reader.active_collection),
-    );
     let current_index = store.reader.progress.paragraph_index as usize;
     let total = store.reader.progress.total_paragraphs;
     let current_zero_based = current_index.saturating_sub(1);
-    let previous_top = script_paragraph(article.script, current_zero_based.saturating_sub(1));
-    let selected_excerpt = script_paragraph(article.script, current_zero_based);
-    let previous_bottom = script_paragraph(
-        article.script,
-        (current_zero_based + 1).min((total - 1) as usize),
-    );
-    let final_excerpt = script_paragraph(
-        article.script,
-        (current_zero_based + 2).min((total - 1) as usize),
-    );
+    let previous_top = store
+        .reader
+        .document()
+        .preview_for_paragraph((current_zero_based.saturating_sub(1) + 1) as u8);
+    let selected_excerpt = store
+        .reader
+        .document()
+        .preview_for_paragraph((current_zero_based + 1) as u8);
+    let previous_bottom = store
+        .reader
+        .document()
+        .preview_for_paragraph(((current_zero_based + 1).min((total - 1) as usize) + 1) as u8);
+    let final_excerpt = store
+        .reader
+        .document()
+        .preview_for_paragraph(((current_zero_based + 2).min((total - 1) as usize) + 1) as u8);
     let tick_index = current_zero_based.min(6) as u8;
 
     ParagraphNavigationModel {
         appearance: store.settings.appearance,
-        title: article.reader_title,
+        title: store.reader.title,
         current_index: store.reader.progress.paragraph_index,
         total,
         previous_top,
@@ -298,12 +313,12 @@ pub fn select_settings(store: &Store) -> SettingsScreenModel {
         },
         SettingsRowModel {
             label: "Network Connection",
-            value: None,
+            value: Some(store.network.status.label()),
             selected: matches!(
                 store.ui.settings_row,
                 crate::ui::SettingsRow::NetworkConnection
             ),
-            show_arrow: true,
+            show_arrow: false,
         },
         SettingsRowModel {
             label: "Connect Account",
@@ -383,28 +398,72 @@ fn select_collection_rows(
     kind: CollectionKind,
     selected_index: usize,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
-    let len = content.collection(kind).len();
-    let previous = content.article_at(kind, (selected_index + len - 1) % len);
-    let selected = content.article_at(kind, selected_index % len);
-    let next = content.article_at(kind, (selected_index + 1) % len);
+    select_manifest_collection_rows(content.collection_state(kind), kind, selected_index)
+}
+
+fn select_manifest_collection_rows(
+    collection: &CollectionManifestState,
+    kind: CollectionKind,
+    selected_index: usize,
+) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
+    let Some(selected) = collection.item_at(selected_index) else {
+        return empty_collection_rows(kind);
+    };
+    if collection.len() == 1 {
+        return [
+            content_row("", "", false),
+            content_row_from_manifest(selected, true),
+            content_row("", "", false),
+        ];
+    }
+    let previous = collection
+        .item_at((selected_index + collection.len() - 1) % collection.len())
+        .unwrap_or(selected);
+    let next = collection
+        .item_at((selected_index + 1) % collection.len())
+        .unwrap_or(selected);
 
     [
-        ContentRowModel {
-            meta: previous.meta,
-            title: previous.title,
-            selected: false,
-        },
-        ContentRowModel {
-            meta: selected.meta,
-            title: selected.title,
-            selected: true,
-        },
-        ContentRowModel {
-            meta: next.meta,
-            title: next.title,
-            selected: false,
-        },
+        content_row_from_manifest(previous, false),
+        content_row_from_manifest(selected, true),
+        content_row_from_manifest(next, false),
     ]
+}
+
+fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
+    ContentRowModel {
+        meta: InlineText::from_slice(meta),
+        title: InlineText::from_slice(title),
+        selected,
+    }
+}
+
+fn content_row_from_manifest(item: CollectionManifestItem, selected: bool) -> ContentRowModel {
+    ContentRowModel {
+        meta: item.meta,
+        title: item.title,
+        selected,
+    }
+}
+
+fn empty_collection_rows(kind: CollectionKind) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
+    match kind {
+        CollectionKind::Saved => [
+            content_row("", "", false),
+            content_row("MOTIF / SAVED", "No saved items synced yet", true),
+            content_row("PHONE / APP", "Save links, then refresh data", false),
+        ],
+        CollectionKind::Inbox => [
+            content_row("", "", false),
+            content_row("MOTIF / INBOX", "No inbox items synced yet", true),
+            content_row("NETWORK / SYNC", "Refresh data once feeds arrive", false),
+        ],
+        CollectionKind::Recommendations => [
+            content_row("", "", false),
+            content_row("MOTIF / FOR YOU", "No recommendations synced yet", true),
+            content_row("NETWORK / SYNC", "Refresh data after pairing", false),
+        ],
+    }
 }
 
 fn select_status(store: &Store) -> StatusClusterModel {
@@ -417,7 +476,11 @@ fn select_status(store: &Store) -> StatusClusterModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::{CollectionManifestItem, ContentState};
+    use crate::formatter::{article_document_from_script, format_article_document};
+    use crate::network::NetworkStatus;
     use crate::store::Store;
+    use crate::sync::SyncStatus;
 
     #[test]
     fn dashboard_defaults_to_saved_focus() {
@@ -428,6 +491,24 @@ mod tests {
         assert!(model.items[1].selected);
         assert_eq!(model.items[0].label, "INBOX");
         assert_eq!(model.items[2].label, "FOR YOU");
+        assert_eq!(model.sync_indicator, None);
+    }
+
+    #[test]
+    fn dashboard_shows_sync_indicator_for_active_backend_sync() {
+        let mut store = Store::new();
+        store.backend_sync.status = SyncStatus::SyncingContent;
+        store.backend_sync.spinner_phase = 2;
+
+        let model = select_dashboard(&store);
+
+        assert_eq!(
+            model.sync_indicator,
+            Some(SyncIndicatorModel {
+                label: "syncing...",
+                spinner_phase: 2,
+            })
+        );
     }
 
     #[test]
@@ -440,7 +521,7 @@ mod tests {
         assert_eq!(model.current_index, 7);
         assert_eq!(model.total, 23);
         assert_eq!(
-            model.selected_excerpt,
+            model.selected_excerpt.as_str(),
             "Analog objects still teach us what speed tends to erase."
         );
     }
@@ -448,21 +529,85 @@ mod tests {
     #[test]
     fn reader_selector_uses_live_rsvp_stage() {
         let mut store = Store::new();
-        store
-            .dispatch(crate::runtime::Command::Ui(
-                crate::runtime::UiCommand::Confirm,
-            ))
-            .unwrap();
-        store
-            .dispatch(crate::runtime::Command::Ui(
-                crate::runtime::UiCommand::Confirm,
-            ))
-            .unwrap();
+        let article = store.content().article_at(CollectionKind::Inbox, 0);
+        let document = format_article_document(&article_document_from_script(
+            article.source,
+            article.script,
+        ));
+        store.reader.open_article(
+            CollectionKind::Inbox,
+            article.id,
+            InlineText::from_slice(article.reader_title),
+            alloc::boxed::Box::new(document),
+            article.has_chat,
+        );
+        store.ui.route = UiRoute::Reader;
 
         let model = select_reader(&store);
 
-        assert_eq!(model.title, "THE MACHINE SOUL");
+        assert_eq!(model.title.as_str(), "THE MACHINE SOUL");
         assert!(!model.right_word.is_empty());
         assert!(!model.preview.is_empty());
+    }
+
+    #[test]
+    fn settings_selector_surfaces_network_status_value() {
+        let mut store = Store::new();
+        store.network.status = NetworkStatus::ProbeFailed;
+
+        let model = select_settings(&store);
+
+        assert_eq!(model.rows[4].value, Some("Probe Failed"));
+        assert!(!model.rows[4].show_arrow);
+    }
+
+    #[test]
+    fn saved_collection_selector_uses_live_saved_manifest() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.title.set_truncated("Example saved title");
+        let _ = store.content_mut().saved.try_push(item);
+        store.ui.saved_index = 0;
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED");
+        assert_eq!(model.rows[1].title.as_str(), "Example saved title");
+    }
+
+    #[test]
+    fn single_saved_item_does_not_repeat_in_adjacent_rows() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.title.set_truncated("Example saved title");
+        let _ = store.content_mut().saved.try_push(item);
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert!(model.rows[0].meta.is_empty());
+        assert!(model.rows[0].title.is_empty());
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED");
+        assert_eq!(model.rows[1].title.as_str(), "Example saved title");
+        assert!(model.rows[2].meta.is_empty());
+        assert!(model.rows[2].title.is_empty());
+    }
+
+    #[test]
+    fn empty_saved_collection_selector_shows_empty_state() {
+        let store = Store::from_bootstrap(crate::runtime::BootstrapSnapshot::new(
+            crate::device::DeviceState::new(),
+            0,
+            None,
+            None,
+            crate::storage::StorageHealth::new(),
+            crate::network::NetworkState::disabled(),
+        ));
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert_eq!(model.rows[1].meta.as_str(), "MOTIF / SAVED");
+        assert_eq!(model.rows[1].title.as_str(), "No saved items synced yet");
     }
 }

@@ -1,4 +1,4 @@
-use crate::content::{ARTICLE_COUNT_PER_COLLECTION, CollectionKind};
+use crate::content::CollectionKind;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum UiRoute {
@@ -148,9 +148,9 @@ impl UiState {
         Self {
             route: UiRoute::Dashboard,
             dashboard_focus: DashboardFocus::Saved,
-            saved_index: 1,
-            inbox_index: 1,
-            recommendations_index: 1,
+            saved_index: 0,
+            inbox_index: 0,
+            recommendations_index: 0,
             settings_mode: SettingsMode::Master,
             settings_row: SettingsRow::ReadingSpeed,
             topic_focus: TopicFocus::new(),
@@ -173,24 +173,32 @@ impl UiState {
         self.dashboard_focus = self.dashboard_focus.next();
     }
 
-    pub fn move_collection_previous(&mut self, kind: CollectionKind) {
+    pub fn move_collection_previous(&mut self, kind: CollectionKind, len: usize) {
+        if len <= 1 {
+            return;
+        }
+
         let target = match kind {
             CollectionKind::Saved => &mut self.saved_index,
             CollectionKind::Inbox => &mut self.inbox_index,
             CollectionKind::Recommendations => &mut self.recommendations_index,
         };
 
-        *target = (*target + ARTICLE_COUNT_PER_COLLECTION - 1) % ARTICLE_COUNT_PER_COLLECTION;
+        *target = (*target + len - 1) % len;
     }
 
-    pub fn move_collection_next(&mut self, kind: CollectionKind) {
+    pub fn move_collection_next(&mut self, kind: CollectionKind, len: usize) {
+        if len <= 1 {
+            return;
+        }
+
         let target = match kind {
             CollectionKind::Saved => &mut self.saved_index,
             CollectionKind::Inbox => &mut self.inbox_index,
             CollectionKind::Recommendations => &mut self.recommendations_index,
         };
 
-        *target = (*target + 1) % ARTICLE_COUNT_PER_COLLECTION;
+        *target = (*target + 1) % len;
     }
 
     pub fn move_settings_previous(&mut self) {

@@ -1,7 +1,14 @@
+extern crate alloc;
+
+use alloc::boxed::Box;
+
 use crate::{
-    content::{ArticleId, CollectionKind},
+    content::{ArticleId, CONTENT_TITLE_MAX_BYTES, CollectionKind},
     formatter::{ReadingDocument, ReadingUnit},
+    text::InlineText,
 };
+
+const EMPTY_READING_DOCUMENT: ReadingDocument = ReadingDocument::empty();
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum ReaderMode {
@@ -24,7 +31,8 @@ pub struct ReaderProgress {
 pub struct ReaderSession {
     pub active_article: ArticleId,
     pub active_collection: CollectionKind,
-    pub document: ReadingDocument,
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    document: Option<Box<ReadingDocument>>,
     pub progress: ReaderProgress,
     pub mode: ReaderMode,
     pub resume_mode: ReaderMode,
@@ -33,15 +41,16 @@ pub struct ReaderSession {
 }
 
 impl ReaderSession {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             active_article: ArticleId(102),
             active_collection: CollectionKind::Saved,
-            document: ReadingDocument::empty(),
+            title: InlineText::new(),
+            document: None,
             progress: ReaderProgress {
                 unit_index: 0,
                 paragraph_index: 1,
-                total_paragraphs: 23,
+                total_paragraphs: 1,
                 completion_percent: 0,
             },
             mode: ReaderMode::Normal,
@@ -55,12 +64,14 @@ impl ReaderSession {
         &mut self,
         collection: CollectionKind,
         article: ArticleId,
-        document: ReadingDocument,
+        title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+        document: Box<ReadingDocument>,
         chat_available: bool,
     ) {
         self.active_collection = collection;
         self.active_article = article;
-        self.document = document;
+        self.title = title;
+        self.document = Some(document);
         self.progress.unit_index = 0;
         self.sync_progress();
         self.mode = ReaderMode::Normal;
@@ -114,7 +125,9 @@ impl ReaderSession {
     pub fn commit_paragraph_navigation(&mut self) {
         if matches!(self.mode, ReaderMode::ParagraphNavigation) {
             self.mode = self.resume_mode;
-            self.progress.unit_index = self.document.paragraph_start(self.progress.paragraph_index);
+            self.progress.unit_index = self
+                .document()
+                .paragraph_start(self.progress.paragraph_index);
             self.sync_progress();
             self.next_due_at_ms = None;
         }
@@ -139,7 +152,8 @@ impl ReaderSession {
     }
 
     pub fn advance_if_due(&mut self, now_ms: u64, wpm: u16) -> bool {
-        if !self.is_active_reading() || self.document.is_empty() {
+        let document = self.document();
+        if !self.is_active_reading() || document.is_empty() {
             return false;
         }
 
@@ -157,7 +171,7 @@ impl ReaderSession {
             return false;
         }
 
-        if (self.progress.unit_index as usize + 1) >= self.document.unit_count as usize {
+        if (self.progress.unit_index as usize + 1) >= document.unit_count as usize {
             self.next_due_at_ms = None;
             self.progress.completion_percent = 100;
             return false;
@@ -169,8 +183,12 @@ impl ReaderSession {
         true
     }
 
+    pub fn document(&self) -> &ReadingDocument {
+        self.document.as_deref().unwrap_or(&EMPTY_READING_DOCUMENT)
+    }
+
     pub fn current_unit(&self) -> &ReadingUnit {
-        self.document.unit(self.progress.unit_index)
+        self.document().unit(self.progress.unit_index)
     }
 
     pub const fn progress_width_px(&self) -> u16 {
@@ -178,15 +196,23 @@ impl ReaderSession {
     }
 
     fn sync_progress(&mut self) {
-        self.progress.total_paragraphs = self.document.paragraph_count.max(1);
-        self.progress.paragraph_index = self.current_unit().paragraph_index.max(1);
+        let (total_paragraphs, current_paragraph, unit_count) = {
+            let document = self.document();
+            (
+                document.paragraph_count.max(1),
+                document
+                    .unit(self.progress.unit_index)
+                    .paragraph_index
+                    .max(1),
+                document.unit_count,
+            )
+        };
 
-        let total_units = self.document.unit_count.max(1) as u32;
-        let current = self
-            .progress
-            .unit_index
-            .min(self.document.unit_count.saturating_sub(1)) as u32
-            + 1;
+        self.progress.total_paragraphs = total_paragraphs;
+        self.progress.paragraph_index = current_paragraph;
+
+        let total_units = unit_count.max(1) as u32;
+        let current = self.progress.unit_index.min(unit_count.saturating_sub(1)) as u32 + 1;
         self.progress.completion_percent = ((current * 100) / total_units) as u8;
     }
 }

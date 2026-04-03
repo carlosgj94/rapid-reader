@@ -1,20 +1,19 @@
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum WifiStatus {
-    #[default]
-    Disabled,
-    Idle,
-    Unavailable,
-}
+use domain::network::NetworkStatus;
 
 pub trait WifiService {
-    fn status(&self) -> WifiStatus;
+    fn status(&self) -> NetworkStatus;
+    fn start(&mut self) -> NetworkStatus;
 }
 
 #[derive(Debug, Default)]
 pub struct NoopWifiService;
 
 impl WifiService for NoopWifiService {
-    fn status(&self) -> WifiStatus {
-        WifiStatus::Disabled
+    fn status(&self) -> NetworkStatus {
+        NetworkStatus::Disabled
+    }
+
+    fn start(&mut self) -> NetworkStatus {
+        NetworkStatus::Disabled
     }
 }

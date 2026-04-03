@@ -19,6 +19,8 @@ use log::info;
 pub const STATE_PARTITION_LABEL: &str = "motif_state";
 pub const OUTBOX_PARTITION_LABEL: &str = "motif_outbox";
 pub const SETTINGS_RECORD_KEY: RecordKey = RecordKey::new(RecordNamespace::Settings, 1);
+pub const BACKEND_CREDENTIAL_RECORD_KEY: RecordKey = RecordKey::new(RecordNamespace::Backend, 1);
+pub const BACKEND_REFRESH_TOKEN_MAX_LEN: usize = 320;
 
 const SLOT_SIZE: usize = 512;
 const SLOT_PAYLOAD_MAX: usize = SLOT_SIZE - SLOT_HEADER_LEN - SLOT_COMMIT_LEN;
@@ -84,6 +86,19 @@ impl<'d> PlatformStorageService<'d> {
         settings: &PersistedSettings,
     ) -> Result<(), StorageError> {
         self.write_record_sync::<PersistedSettingsCodec>(settings)
+    }
+
+    pub fn read_backend_credential_sync(
+        &mut self,
+    ) -> Result<Option<BackendCredential>, StorageError> {
+        self.read_record_sync::<BackendCredentialCodec>()
+    }
+
+    pub fn write_backend_credential_sync(
+        &mut self,
+        credential: &BackendCredential,
+    ) -> Result<(), StorageError> {
+        self.write_record_sync::<BackendCredentialCodec>(credential)
     }
 
     pub fn read_record_sync<C: RecordCodec>(&mut self) -> Result<Option<C::Value>, StorageError> {
@@ -1403,6 +1418,51 @@ fn codec_error(_: StorageCodecError) -> StorageError {
     StorageError::CodecFailure
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct BackendCredential {
+    pub refresh_token: [u8; BACKEND_REFRESH_TOKEN_MAX_LEN],
+    pub refresh_token_len: u16,
+}
+
+impl BackendCredential {
+    pub const fn empty() -> Self {
+        Self {
+            refresh_token: [0; BACKEND_REFRESH_TOKEN_MAX_LEN],
+            refresh_token_len: 0,
+        }
+    }
+
+    pub fn from_refresh_token(token: &str) -> Result<Self, StorageCodecError> {
+        let token = token.trim();
+        if token.is_empty() || token.len() > BACKEND_REFRESH_TOKEN_MAX_LEN {
+            return Err(StorageCodecError::InvalidData);
+        }
+
+        let mut refresh_token = [0u8; BACKEND_REFRESH_TOKEN_MAX_LEN];
+        refresh_token[..token.len()].copy_from_slice(token.as_bytes());
+
+        Ok(Self {
+            refresh_token,
+            refresh_token_len: token.len() as u16,
+        })
+    }
+
+    pub fn refresh_token(&self) -> Result<&str, StorageCodecError> {
+        let len = self.refresh_token_len as usize;
+        if len == 0 || len > BACKEND_REFRESH_TOKEN_MAX_LEN {
+            return Err(StorageCodecError::InvalidData);
+        }
+
+        core::str::from_utf8(&self.refresh_token[..len]).map_err(|_| StorageCodecError::InvalidData)
+    }
+}
+
+impl Default for BackendCredential {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 pub struct PersistedSettingsCodec;
 
 impl RecordCodec for PersistedSettingsCodec {
@@ -1452,6 +1512,54 @@ impl RecordCodec for PersistedSettingsCodec {
             AppearanceMode::from_byte(bytes[10]),
             TopicPreferences::from_bits(u32::from_le_bytes(topic_bits_raw)),
         ))
+    }
+}
+
+pub struct BackendCredentialCodec;
+
+impl RecordCodec for BackendCredentialCodec {
+    type Value = BackendCredential;
+
+    const KEY: RecordKey = BACKEND_CREDENTIAL_RECORD_KEY;
+    const SCHEMA_VERSION: u16 = 1;
+    const MAX_ENCODED_LEN: usize = 2 + BACKEND_REFRESH_TOKEN_MAX_LEN;
+
+    fn encode(value: &Self::Value, out: &mut [u8]) -> Result<usize, StorageCodecError> {
+        let len = value.refresh_token_len as usize;
+        if len == 0 || len > BACKEND_REFRESH_TOKEN_MAX_LEN {
+            return Err(StorageCodecError::InvalidData);
+        }
+
+        if out.len() < 2 + len {
+            return Err(StorageCodecError::BufferTooSmall);
+        }
+
+        out[..2].copy_from_slice(&value.refresh_token_len.to_le_bytes());
+        out[2..2 + len].copy_from_slice(&value.refresh_token[..len]);
+        Ok(2 + len)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self::Value, StorageCodecError> {
+        if bytes.len() < 3 {
+            return Err(StorageCodecError::InvalidData);
+        }
+
+        let mut len_raw = [0u8; 2];
+        len_raw.copy_from_slice(&bytes[..2]);
+        let len = u16::from_le_bytes(len_raw) as usize;
+
+        if len == 0 || len > BACKEND_REFRESH_TOKEN_MAX_LEN || bytes.len() != 2 + len {
+            return Err(StorageCodecError::InvalidData);
+        }
+
+        let mut refresh_token = [0u8; BACKEND_REFRESH_TOKEN_MAX_LEN];
+        refresh_token[..len].copy_from_slice(&bytes[2..]);
+        core::str::from_utf8(&refresh_token[..len]).map_err(|_| StorageCodecError::InvalidData)?;
+
+        Ok(BackendCredential {
+            refresh_token,
+            refresh_token_len: len as u16,
+        })
     }
 }
 

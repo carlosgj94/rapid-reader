@@ -1,6 +1,46 @@
+use alloc::boxed::Box;
+
 use crate::{
-    device::DeviceState, input::InputGesture, settings::PersistedSettings, storage::StorageHealth,
+    content::{
+        CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestState, PackageState,
+        PrepareContentRequest, REMOTE_ITEM_ID_MAX_BYTES,
+    },
+    device::DeviceState,
+    formatter::ReadingDocument,
+    input::InputGesture,
+    network::NetworkState,
+    network::NetworkStatus,
+    settings::PersistedSettings,
+    storage::StorageHealth,
+    sync::SyncStatus,
+    text::InlineText,
 };
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum CollectionConfirmIgnoredReason {
+    #[default]
+    EmptyCollection,
+    StorageUnavailable,
+    BackendUnavailable,
+    AlreadyFetching,
+    PendingRemote,
+    Failed,
+    NotReady,
+}
+
+impl CollectionConfirmIgnoredReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EmptyCollection => "empty_collection",
+            Self::StorageUnavailable => "storage_unavailable",
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::AlreadyFetching => "already_fetching",
+            Self::PendingRemote => "pending_remote",
+            Self::Failed => "failed",
+            Self::NotReady => "not_ready",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum UiCommand {
@@ -21,12 +61,26 @@ pub enum Command {
     Ui(UiCommand),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub enum Event {
     #[default]
     Noop,
     BootCompleted,
     InputGestureReceived(InputGesture),
+    NetworkStatusChanged(NetworkStatus),
+    BackendSyncStatusChanged(SyncStatus),
+    CollectionContentUpdated(CollectionKind, Box<CollectionManifestState>),
+    ReaderContentOpened {
+        collection: CollectionKind,
+        title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+        document: Box<ReadingDocument>,
+    },
+    ContentPackageStateChanged {
+        collection: CollectionKind,
+        remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+        package_state: PackageState,
+    },
     UiTick(u64),
     ReaderTick(u64),
     WokeFromDeepSleep,
@@ -37,35 +91,55 @@ pub enum Effect {
     #[default]
     Noop,
     EnterDeepSleep,
+    CollectionConfirmIgnored {
+        collection: CollectionKind,
+        reason: CollectionConfirmIgnoredReason,
+    },
+    OpenCachedContent(PrepareContentRequest),
+    PrepareContent(PrepareContentRequest),
+    OpenRemoteContent(PrepareContentRequest),
     PersistSettings(PersistedSettings),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct BootstrapSnapshot {
     pub device: DeviceState,
     pub boot_at_ms: u64,
+    pub content: Option<Box<crate::content::ContentState>>,
     pub settings: Option<PersistedSettings>,
     pub storage: StorageHealth,
+    pub network: NetworkState,
 }
 
 impl BootstrapSnapshot {
-    pub const fn new(
+    pub fn new(
         device: DeviceState,
         boot_at_ms: u64,
+        content: Option<Box<crate::content::ContentState>>,
         settings: Option<PersistedSettings>,
         storage: StorageHealth,
+        network: NetworkState,
     ) -> Self {
         Self {
             device,
             boot_at_ms,
+            content,
             settings,
             storage,
+            network,
         }
     }
 }
 
 impl Default for BootstrapSnapshot {
     fn default() -> Self {
-        Self::new(DeviceState::new(), 0, None, StorageHealth::new())
+        Self::new(
+            DeviceState::new(),
+            0,
+            None,
+            None,
+            StorageHealth::new(),
+            NetworkState::disabled(),
+        )
     }
 }

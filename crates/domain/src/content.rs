@@ -1,7 +1,16 @@
-use crate::source::SourceKind;
+use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+use alloc::boxed::Box;
+
+use crate::{source::SourceKind, text::InlineText};
 
 pub const ARTICLE_COUNT_PER_COLLECTION: usize = 5;
+pub const MANIFEST_ITEM_CAPACITY: usize = 16;
 pub const PARAGRAPH_COUNT_PER_SCRIPT: usize = 23;
+pub const CONTENT_META_MAX_BYTES: usize = 48;
+pub const CONTENT_TITLE_MAX_BYTES: usize = 96;
+pub const CONTENT_ID_MAX_BYTES: usize = 36;
+pub const REMOTE_ITEM_ID_MAX_BYTES: usize = 36;
+pub const RECOMMENDATION_SERVE_ID_MAX_BYTES: usize = 36;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum CollectionKind {
@@ -110,25 +119,188 @@ impl Default for ArticleSummary {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct ContentState {
-    pub saved: [ArticleSummary; ARTICLE_COUNT_PER_COLLECTION],
-    pub inbox: [ArticleSummary; ARTICLE_COUNT_PER_COLLECTION],
-    pub recommendations: [ArticleSummary; ARTICLE_COUNT_PER_COLLECTION],
+pub enum DetailLocator {
+    Saved,
+    Inbox,
+    Content,
 }
 
-impl ContentState {
-    pub const fn mock() -> Self {
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum RemoteContentStatus {
+    Ready,
+    Pending,
+    Failed,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum PackageState {
+    #[default]
+    Missing,
+    Cached,
+    Stale,
+    Fetching,
+    PendingRemote,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CollectionManifestItem {
+    pub remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub detail_locator: DetailLocator,
+    pub source: SourceKind,
+    pub meta: InlineText<CONTENT_META_MAX_BYTES>,
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub remote_revision: u64,
+    pub remote_status: RemoteContentStatus,
+    pub package_state: PackageState,
+}
+
+impl CollectionManifestItem {
+    pub const fn empty() -> Self {
         Self {
-            saved: SAVED_ARTICLES,
-            inbox: INBOX_ARTICLES,
-            recommendations: RECOMMENDATION_ARTICLES,
+            remote_item_id: InlineText::new(),
+            content_id: InlineText::new(),
+            detail_locator: DetailLocator::Saved,
+            source: SourceKind::Unknown,
+            meta: InlineText::new(),
+            title: InlineText::new(),
+            remote_revision: 0,
+            remote_status: RemoteContentStatus::Unknown,
+            package_state: PackageState::Missing,
         }
     }
 
-    pub const fn collection(
-        &self,
-        kind: CollectionKind,
-    ) -> &[ArticleSummary; ARTICLE_COUNT_PER_COLLECTION] {
+    pub const fn is_cached(self) -> bool {
+        matches!(self.package_state, PackageState::Cached)
+    }
+
+    pub const fn can_prepare(self) -> bool {
+        matches!(self.remote_status, RemoteContentStatus::Ready)
+            && matches!(
+                self.package_state,
+                PackageState::Missing | PackageState::Stale
+            )
+    }
+}
+
+impl Default for CollectionManifestItem {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CollectionManifestState {
+    pub items: [CollectionManifestItem; MANIFEST_ITEM_CAPACITY],
+    pub serve_id: InlineText<RECOMMENDATION_SERVE_ID_MAX_BYTES>,
+    len: u8,
+}
+
+impl CollectionManifestState {
+    pub const fn empty() -> Self {
+        Self {
+            items: [CollectionManifestItem::empty(); MANIFEST_ITEM_CAPACITY],
+            serve_id: InlineText::new(),
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::empty();
+    }
+
+    pub fn try_push(&mut self, item: CollectionManifestItem) -> bool {
+        let len = self.len();
+        if len >= MANIFEST_ITEM_CAPACITY {
+            return false;
+        }
+
+        self.items[len] = item;
+        self.len = self.len.saturating_add(1);
+        true
+    }
+
+    pub fn item_at(&self, index: usize) -> Option<CollectionManifestItem> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.items[index % self.len()])
+        }
+    }
+
+    pub fn item_mut_at(&mut self, index: usize) -> Option<&mut CollectionManifestItem> {
+        if self.is_empty() {
+            None
+        } else {
+            let len = self.len();
+            Some(&mut self.items[index % len])
+        }
+    }
+
+    pub fn update_package_state(
+        &mut self,
+        remote_item_id: &InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+        package_state: PackageState,
+    ) -> bool {
+        let len = self.len();
+        let mut index = 0;
+        while index < len {
+            if self.items[index].remote_item_id == *remote_item_id {
+                self.items[index].package_state = package_state;
+                return true;
+            }
+            index += 1;
+        }
+
+        false
+    }
+}
+
+impl Default for CollectionManifestState {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ContentState {
+    pub saved: CollectionManifestState,
+    pub inbox: CollectionManifestState,
+    pub recommendations: CollectionManifestState,
+}
+
+impl ContentState {
+    pub const fn empty() -> Self {
+        Self {
+            saved: CollectionManifestState::empty(),
+            inbox: CollectionManifestState::empty(),
+            recommendations: CollectionManifestState::empty(),
+        }
+    }
+
+    pub fn boxed_empty() -> Box<Self> {
+        let layout = Layout::new::<Self>();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = core::ptr::NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
+        unsafe { Box::from_raw(ptr.as_ptr().cast::<Self>()) }
+    }
+
+    pub const fn collection_len(&self, kind: CollectionKind) -> usize {
+        self.collection_state(kind).len()
+    }
+
+    pub const fn collection_state(&self, kind: CollectionKind) -> &CollectionManifestState {
         match kind {
             CollectionKind::Saved => &self.saved,
             CollectionKind::Inbox => &self.inbox,
@@ -136,12 +308,52 @@ impl ContentState {
         }
     }
 
+    pub fn collection_state_mut(&mut self, kind: CollectionKind) -> &mut CollectionManifestState {
+        match kind {
+            CollectionKind::Saved => &mut self.saved,
+            CollectionKind::Inbox => &mut self.inbox,
+            CollectionKind::Recommendations => &mut self.recommendations,
+        }
+    }
+
+    pub fn manifest_item_at(
+        &self,
+        kind: CollectionKind,
+        index: usize,
+    ) -> Option<CollectionManifestItem> {
+        self.collection_state(kind).item_at(index)
+    }
+
+    pub fn update_collection(&mut self, kind: CollectionKind, collection: CollectionManifestState) {
+        *self.collection_state_mut(kind) = collection;
+    }
+
+    pub fn update_package_state(
+        &mut self,
+        kind: CollectionKind,
+        remote_item_id: &InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+        package_state: PackageState,
+    ) -> bool {
+        self.collection_state_mut(kind)
+            .update_package_state(remote_item_id, package_state)
+    }
+
     pub fn article_at(&self, kind: CollectionKind, index: usize) -> ArticleSummary {
-        self.collection(kind)[index % ARTICLE_COUNT_PER_COLLECTION]
+        match kind {
+            CollectionKind::Saved => SAVED_ARTICLES[index % ARTICLE_COUNT_PER_COLLECTION],
+            CollectionKind::Inbox => INBOX_ARTICLES[index % ARTICLE_COUNT_PER_COLLECTION],
+            CollectionKind::Recommendations => {
+                RECOMMENDATION_ARTICLES[index % ARTICLE_COUNT_PER_COLLECTION]
+            }
+        }
     }
 
     pub fn article_by_id(&self, kind: CollectionKind, article_id: ArticleId) -> ArticleSummary {
-        let collection = self.collection(kind);
+        let collection = match kind {
+            CollectionKind::Saved => &SAVED_ARTICLES,
+            CollectionKind::Inbox => &INBOX_ARTICLES,
+            CollectionKind::Recommendations => &RECOMMENDATION_ARTICLES,
+        };
         let mut index = 0;
 
         while index < collection.len() {
@@ -157,7 +369,28 @@ impl ContentState {
 
 impl Default for ContentState {
     fn default() -> Self {
-        Self::mock()
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PrepareContentRequest {
+    pub collection: CollectionKind,
+    pub remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub detail_locator: DetailLocator,
+    pub remote_revision: u64,
+}
+
+impl PrepareContentRequest {
+    pub const fn from_manifest(collection: CollectionKind, item: CollectionManifestItem) -> Self {
+        Self {
+            collection,
+            remote_item_id: item.remote_item_id,
+            content_id: item.content_id,
+            detail_locator: item.detail_locator,
+            remote_revision: item.remote_revision,
+        }
     }
 }
 

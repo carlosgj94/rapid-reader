@@ -23,6 +23,9 @@ pub struct StorageHealth {
     pub outbox_partition_ready: bool,
     pub state_free_bytes: u32,
     pub outbox_free_bytes: u32,
+    pub sd_card_ready: bool,
+    pub sd_total_bytes: u64,
+    pub sd_free_bytes: u64,
 }
 
 impl StorageHealth {
@@ -34,6 +37,9 @@ impl StorageHealth {
             outbox_partition_ready: false,
             state_free_bytes: 0,
             outbox_free_bytes: 0,
+            sd_card_ready: false,
+            sd_total_bytes: 0,
+            sd_free_bytes: 0,
         }
     }
 
@@ -45,6 +51,9 @@ impl StorageHealth {
             outbox_partition_ready: false,
             state_free_bytes: 0,
             outbox_free_bytes: 0,
+            sd_card_ready: false,
+            sd_total_bytes: 0,
+            sd_free_bytes: 0,
         }
     }
 
@@ -60,7 +69,25 @@ impl StorageHealth {
             outbox_partition_ready: true,
             state_free_bytes,
             outbox_free_bytes,
+            sd_card_ready: false,
+            sd_total_bytes: 0,
+            sd_free_bytes: 0,
         }
+    }
+
+    pub const fn with_sd_card(
+        mut self,
+        sd_card_ready: bool,
+        sd_total_bytes: u64,
+        sd_free_bytes: u64,
+    ) -> Self {
+        self.sd_card_ready = sd_card_ready;
+        self.sd_total_bytes = sd_total_bytes;
+        self.sd_free_bytes = sd_free_bytes;
+        if matches!(self.status, StorageStatus::Available) && !sd_card_ready {
+            self.status = StorageStatus::Degraded;
+        }
+        self
     }
 }
 

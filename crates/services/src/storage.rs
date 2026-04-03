@@ -95,6 +95,9 @@ impl StorageService for NoopStorageService {
             outbox_partition_ready: false,
             state_free_bytes: 0,
             outbox_free_bytes: 0,
+            sd_card_ready: false,
+            sd_total_bytes: 0,
+            sd_free_bytes: 0,
         }
     }
 

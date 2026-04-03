@@ -1,0 +1,2757 @@
+extern crate alloc;
+
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::{cmp::Ordering, ptr::addr_of_mut};
+
+use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use domain::{
+    content::{
+        CONTENT_ID_MAX_BYTES, CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
+        CollectionManifestItem, CollectionManifestState, DetailLocator, MANIFEST_ITEM_CAPACITY,
+        PackageState, RECOMMENDATION_SERVE_ID_MAX_BYTES, REMOTE_ITEM_ID_MAX_BYTES,
+        RemoteContentStatus,
+    },
+    formatter::{
+        MAX_READING_PARAGRAPHS, MAX_READING_TOKEN_BYTES, MAX_READING_UNITS, ReadingDocument,
+    },
+    runtime::Event,
+    storage::StorageRecoveryStatus,
+    text::InlineText,
+};
+use embassy_executor::Spawner;
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
+};
+use embassy_time::Instant;
+use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
+use embedded_sdmmc::{
+    Directory, Error as SdError, File, Mode, SdCard, ShortFileName, TimeSource, Timestamp,
+    VolumeIdx, VolumeManager,
+};
+use esp_hal::{Blocking, delay::Delay, gpio::Output, spi::master::Spi};
+use log::info;
+use services::storage::StorageError;
+
+use crate::bootstrap::publish_event;
+
+const MAX_DIRS: usize = 8;
+const MAX_FILES: usize = 4;
+const MAX_VOLUMES: usize = 1;
+const STORAGE_CMD_QUEUE_CAPACITY: usize = 4;
+const MANIFEST_MAGIC: u32 = 0x4D43_4F4C;
+const CACHE_INDEX_MAGIC: u32 = 0x4D43_4944;
+const PACKAGE_META_MAGIC: u32 = 0x4D43_504D;
+const FORMAT_VERSION: u16 = 1;
+const MAX_MANIFEST_SNAPSHOT_LEN: usize = 4096;
+const MAX_CACHE_INDEX_LEN: usize = 4096;
+const MAX_PACKAGE_META_LEN: usize = 128;
+const PACKAGE_COPY_BUFFER_LEN: usize = 512;
+const STAGE_WRITE_CHUNK_LEN: usize = 512;
+const CACHE_ENTRY_CAPACITY: usize = 48;
+const CACHE_SIZE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+const PACKAGE_READ_BUFFER_LEN: usize = 512;
+const MAX_JSON_KEY_BYTES: usize = 16;
+const MAX_PARSED_TITLE_BYTES: usize = CONTENT_TITLE_MAX_BYTES * 4;
+const MAX_PARSED_BLOCK_TEXT_BYTES: usize = MAX_READING_UNITS * (MAX_READING_TOKEN_BYTES + 1);
+const MAX_PARSED_LIST_ITEMS: usize = MAX_READING_PARAGRAPHS;
+const MAX_PARSED_LIST_TOTAL_BYTES: usize = MAX_PARSED_BLOCK_TEXT_BYTES;
+
+// Dev-time content storage reset. Use a fresh top-level root while storage evolves.
+const ROOT_DIR_NAME: &str = "MTDV0002";
+const VERSION_DIR_NAME: &str = "V1";
+const MANIFEST_DIR_NAME: &str = "MANIF";
+const PACKAGE_DIR_NAME: &str = "PKG";
+const STAGING_DIR_NAME: &str = "STAGE";
+const CACHE_DIR_NAME: &str = "CACHE";
+const ACTIVE_STAGE_FILE_NAME: &str = "ACTIVE.PRT";
+const SAVED_MANIFEST_FILE_NAME: &str = "SAVED.BIN";
+const INBOX_MANIFEST_FILE_NAME: &str = "INBOX.BIN";
+const RECOMMENDATION_MANIFEST_FILE_NAME: &str = "RECS.BIN";
+const CACHE_INDEX_FILE_NAME: &str = "PKGIDX.BIN";
+
+type SdBus<'d> = Spi<'d, Blocking>;
+type SdSpiDevice<'d> = ExclusiveDevice<SdBus<'d>, Output<'d>, NoDelay>;
+type SdBlockDevice<'d> = SdCard<SdSpiDevice<'d>, Delay>;
+type SdVolumeManager<'d> =
+    VolumeManager<SdBlockDevice<'d>, FixedTimeSource, MAX_DIRS, MAX_FILES, MAX_VOLUMES>;
+type SdDirectory<'a, 'd> =
+    Directory<'a, SdBlockDevice<'d>, FixedTimeSource, MAX_DIRS, MAX_FILES, MAX_VOLUMES>;
+type SdFile<'a, 'd> =
+    File<'a, SdBlockDevice<'d>, FixedTimeSource, MAX_DIRS, MAX_FILES, MAX_VOLUMES>;
+
+static STORAGE_CMD_CH: Channel<
+    CriticalSectionRawMutex,
+    StorageCommand,
+    STORAGE_CMD_QUEUE_CAPACITY,
+> = Channel::new();
+static STORAGE_RESP_SIG: Signal<CriticalSectionRawMutex, StorageResponse> = Signal::new();
+static STORAGE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+pub struct ContentStorageMount<'d> {
+    pub storage: Option<Box<SdContentStorage<'d>>>,
+    pub sd_card_ready: bool,
+    pub sd_total_bytes: u64,
+    pub sd_free_bytes: u64,
+    pub last_recovery: StorageRecoveryStatus,
+}
+
+pub struct SdContentStorage<'d> {
+    volume_mgr: SdVolumeManager<'d>,
+    total_bytes: u64,
+    snapshots: [CollectionManifestState; 3],
+    cache_index: CacheIndex,
+    pending_stage: Option<PendingStage>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OpenedReaderContent {
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub document: Box<ReadingDocument>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PendingStage {
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    remote_revision: u64,
+    slot_id: u8,
+    bytes_written: u32,
+    crc32: u32,
+    overwritten_entry: Option<CacheEntry>,
+    superseded_entry: Option<CacheEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PackageMeta {
+    slot_id: u8,
+    remote_revision: u64,
+    size_bytes: u32,
+    crc32: u32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CacheEntry {
+    slot_id: u8,
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    remote_revision: u64,
+    size_bytes: u32,
+    crc32: u32,
+    last_touch_seq: u32,
+    collection_flags: u8,
+}
+
+impl CacheEntry {
+    const fn empty() -> Self {
+        Self {
+            slot_id: 0,
+            content_id: InlineText::new(),
+            remote_revision: 0,
+            size_bytes: 0,
+            crc32: 0,
+            last_touch_seq: 0,
+            collection_flags: 0,
+        }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.slot_id == 0 || self.content_id.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CacheIndex {
+    entries: [CacheEntry; CACHE_ENTRY_CAPACITY],
+    len: u8,
+    next_touch_seq: u32,
+}
+
+impl CacheIndex {
+    const fn empty() -> Self {
+        Self {
+            entries: [CacheEntry::empty(); CACHE_ENTRY_CAPACITY],
+            len: 0,
+            next_touch_seq: 1,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    fn total_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        let mut index = 0;
+        while index < self.len() {
+            total = total.saturating_add(self.entries[index].size_bytes as u64);
+            index += 1;
+        }
+        total
+    }
+
+    fn find_by_content_id(
+        &self,
+        content_id: &InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> Option<CacheEntry> {
+        let mut index = 0;
+        while index < self.len() {
+            let entry = self.entries[index];
+            if entry.content_id == *content_id {
+                return Some(entry);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn find_index_by_content_id(
+        &self,
+        content_id: &InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> Option<usize> {
+        let mut index = 0;
+        while index < self.len() {
+            if self.entries[index].content_id == *content_id {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn find_index_by_slot(&self, slot_id: u8) -> Option<usize> {
+        let mut index = 0;
+        while index < self.len() {
+            if self.entries[index].slot_id == slot_id {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn upsert(&mut self, mut entry: CacheEntry) {
+        if let Some(index) = self.find_index_by_content_id(&entry.content_id) {
+            entry.last_touch_seq = self.bump_touch_seq();
+            self.entries[index] = entry;
+            return;
+        }
+
+        if self.len() < CACHE_ENTRY_CAPACITY {
+            entry.last_touch_seq = self.bump_touch_seq();
+            self.entries[self.len()] = entry;
+            self.len = self.len.saturating_add(1);
+        }
+    }
+
+    fn remove_slot(&mut self, slot_id: u8) -> Option<CacheEntry> {
+        let index = self.find_index_by_slot(slot_id)?;
+
+        let removed = self.entries[index];
+        let last_index = self.len().saturating_sub(1);
+        self.entries[index] = self.entries[last_index];
+        self.entries[last_index] = CacheEntry::empty();
+        self.len = self.len.saturating_sub(1);
+        Some(removed)
+    }
+
+    fn next_available_slot_id(&self) -> Option<u8> {
+        let mut slot = 1u8;
+        while (slot as usize) <= CACHE_ENTRY_CAPACITY {
+            if self.find_index_by_slot(slot).is_none() {
+                return Some(slot);
+            }
+            slot = slot.saturating_add(1);
+        }
+        None
+    }
+
+    fn bump_touch_seq(&mut self) -> u32 {
+        let next = self.next_touch_seq;
+        self.next_touch_seq = self.next_touch_seq.saturating_add(1).max(1);
+        next
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct FixedTimeSource;
+
+impl TimeSource for FixedTimeSource {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp {
+            year_since_1970: 56,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+
+// Keep chunk bytes inline so streaming package writes do not allocate per chunk.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum StorageCommand {
+    PersistSnapshot {
+        kind: CollectionKind,
+        snapshot: Box<CollectionManifestState>,
+    },
+    BeginPackageStage {
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        remote_revision: u64,
+    },
+    WritePackageChunk {
+        len: usize,
+        bytes: [u8; STAGE_WRITE_CHUNK_LEN],
+    },
+    CommitPackageStage {
+        collection: CollectionKind,
+        remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    },
+    AbortPackageStage,
+    UpdatePackageState {
+        collection: CollectionKind,
+        remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+        package_state: PackageState,
+    },
+    OpenCachedReaderContent {
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    },
+}
+
+#[derive(Debug)]
+enum StorageResponse {
+    Snapshot(Result<Box<CollectionManifestState>, StorageError>),
+    Opened(Result<Box<OpenedReaderContent>, StorageError>),
+    Unit(Result<(), StorageError>),
+}
+
+pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
+    let device = match ExclusiveDevice::new_no_delay(spi, cs) {
+        Ok(device) => device,
+        Err(_) => {
+            info!("content storage mount failed: sd chip-select init");
+            return ContentStorageMount {
+                storage: None,
+                sd_card_ready: false,
+                sd_total_bytes: 0,
+                sd_free_bytes: 0,
+                last_recovery: StorageRecoveryStatus::Failed,
+            };
+        }
+    };
+
+    let delay = Delay::new();
+    let card = SdCard::new(device, delay);
+    let total_bytes = match card.num_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            info!("content storage mount failed: {:?}", err);
+            return ContentStorageMount {
+                storage: None,
+                sd_card_ready: false,
+                sd_total_bytes: 0,
+                sd_free_bytes: 0,
+                last_recovery: StorageRecoveryStatus::Failed,
+            };
+        }
+    };
+
+    let volume_mgr = VolumeManager::<_, _, MAX_DIRS, MAX_FILES, MAX_VOLUMES>::new_with_limits(
+        card,
+        FixedTimeSource,
+        0,
+    );
+    let mut storage = Box::<SdContentStorage<'d>>::new_uninit();
+    let storage_ptr = storage.as_mut_ptr();
+    unsafe {
+        addr_of_mut!((*storage_ptr).volume_mgr).write(volume_mgr);
+        addr_of_mut!((*storage_ptr).total_bytes).write(total_bytes);
+        addr_of_mut!((*storage_ptr).snapshots).write([CollectionManifestState::empty(); 3]);
+        addr_of_mut!((*storage_ptr).cache_index).write(CacheIndex::empty());
+        addr_of_mut!((*storage_ptr).pending_stage).write(None);
+    }
+    let mut storage = unsafe { storage.assume_init() };
+    let mut last_recovery = StorageRecoveryStatus::Clean;
+
+    if let Err(err) = storage.initialize_layout() {
+        info!("content storage layout init failed: {:?}", err);
+        if matches!(err, StorageError::CorruptData) {
+            info!(
+                "content storage layout corrupt: wiping motif sd data root={} version={}",
+                ROOT_DIR_NAME, VERSION_DIR_NAME
+            );
+            match storage.reset_dev_data() {
+                Ok(()) => {
+                    last_recovery = StorageRecoveryStatus::Recovered;
+                    info!("content storage layout recovered by wiping motif sd data");
+                }
+                Err(recovery_err) => {
+                    info!("content storage layout recovery failed: {:?}", recovery_err);
+                    return ContentStorageMount {
+                        storage: None,
+                        sd_card_ready: false,
+                        sd_total_bytes: total_bytes,
+                        sd_free_bytes: 0,
+                        last_recovery: StorageRecoveryStatus::Failed,
+                    };
+                }
+            }
+        } else {
+            return ContentStorageMount {
+                storage: None,
+                sd_card_ready: false,
+                sd_total_bytes: total_bytes,
+                sd_free_bytes: 0,
+                last_recovery: StorageRecoveryStatus::Failed,
+            };
+        }
+    } else if let Err(err) = storage.load_state() {
+        info!("content storage state load failed: {:?}", err);
+        if matches!(err, StorageError::CorruptData) {
+            info!(
+                "content storage state corrupt: wiping motif sd data root={} version={}",
+                ROOT_DIR_NAME, VERSION_DIR_NAME
+            );
+            match storage.reset_dev_data() {
+                Ok(()) => {
+                    last_recovery = StorageRecoveryStatus::Recovered;
+                    info!("content storage state recovered by wiping motif sd data");
+                }
+                Err(recovery_err) => {
+                    info!("content storage state recovery failed: {:?}", recovery_err);
+                    return ContentStorageMount {
+                        storage: None,
+                        sd_card_ready: false,
+                        sd_total_bytes: total_bytes,
+                        sd_free_bytes: 0,
+                        last_recovery: StorageRecoveryStatus::Failed,
+                    };
+                }
+            }
+        } else {
+            storage.snapshots = [CollectionManifestState::empty(); 3];
+            storage.cache_index = CacheIndex::empty();
+            let _ = storage.cleanup_active_stage_file();
+        };
+    }
+
+    ContentStorageMount {
+        storage: Some(storage),
+        sd_card_ready: true,
+        sd_total_bytes: total_bytes,
+        sd_free_bytes: 0,
+        last_recovery,
+    }
+}
+
+pub fn install(spawner: Spawner, storage: Option<Box<SdContentStorage<'static>>>) {
+    STORAGE_AVAILABLE.store(storage.is_some(), AtomicOrdering::Relaxed);
+    let Some(storage) = storage else {
+        info!("content storage disabled: sd unavailable");
+        return;
+    };
+
+    if spawner.spawn(content_storage_task(storage)).is_err() {
+        info!("content storage failed to spawn task");
+    }
+}
+
+pub async fn persist_snapshot(
+    kind: CollectionKind,
+    snapshot: CollectionManifestState,
+) -> Result<CollectionManifestState, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH
+        .send(StorageCommand::PersistSnapshot {
+            kind,
+            snapshot: Box::new(snapshot),
+        })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
+        StorageResponse::Opened(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub async fn begin_package_stage(
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    remote_revision: u64,
+) -> Result<(), StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH
+        .send(StorageCommand::BeginPackageStage {
+            content_id,
+            remote_revision,
+        })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Unit(result) => result,
+        StorageResponse::Opened(_) | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub async fn write_package_chunk(chunk: &[u8]) -> Result<(), StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    if chunk.len() > STAGE_WRITE_CHUNK_LEN {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    let mut bytes = [0u8; STAGE_WRITE_CHUNK_LEN];
+    bytes[..chunk.len()].copy_from_slice(chunk);
+    STORAGE_CMD_CH
+        .send(StorageCommand::WritePackageChunk {
+            len: chunk.len(),
+            bytes,
+        })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Unit(result) => result,
+        StorageResponse::Opened(_) | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub async fn commit_package_stage(
+    collection: CollectionKind,
+    remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+) -> Result<CollectionManifestState, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH
+        .send(StorageCommand::CommitPackageStage {
+            collection,
+            remote_item_id,
+        })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
+        StorageResponse::Opened(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub async fn abort_package_stage() -> Result<(), StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH.send(StorageCommand::AbortPackageStage).await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Unit(result) => result,
+        StorageResponse::Opened(_) | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub async fn update_package_state(
+    collection: CollectionKind,
+    remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    package_state: PackageState,
+) -> Result<CollectionManifestState, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH
+        .send(StorageCommand::UpdatePackageState {
+            collection,
+            remote_item_id,
+            package_state,
+        })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
+        StorageResponse::Opened(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub async fn open_cached_reader_content(
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+) -> Result<Box<OpenedReaderContent>, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH
+        .send(StorageCommand::OpenCachedReaderContent { content_id })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::Opened(result) => result,
+        StorageResponse::Snapshot(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    }
+}
+
+pub(crate) fn parse_reader_content_bytes(
+    bytes: &[u8],
+) -> Result<OpenedReaderContent, StorageError> {
+    let source = SliceJsonSource::new(bytes);
+    parse_opened_reader_content(source)
+}
+
+#[embassy_executor::task]
+async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
+    publish_initial_snapshots(&storage);
+
+    loop {
+        let response = match STORAGE_CMD_CH.receive().await {
+            StorageCommand::PersistSnapshot { kind, snapshot } => {
+                StorageResponse::Snapshot(storage.persist_snapshot(kind, *snapshot).map(Box::new))
+            }
+            StorageCommand::BeginPackageStage {
+                content_id,
+                remote_revision,
+            } => StorageResponse::Unit(storage.begin_stage(content_id, remote_revision)),
+            StorageCommand::WritePackageChunk { len, bytes } => {
+                StorageResponse::Unit(storage.write_stage_chunk(&bytes[..len]))
+            }
+            StorageCommand::CommitPackageStage {
+                collection,
+                remote_item_id,
+            } => StorageResponse::Snapshot(
+                storage
+                    .commit_stage(collection, remote_item_id)
+                    .map(Box::new),
+            ),
+            StorageCommand::AbortPackageStage => StorageResponse::Unit(storage.abort_stage()),
+            StorageCommand::UpdatePackageState {
+                collection,
+                remote_item_id,
+                package_state,
+            } => StorageResponse::Snapshot(
+                storage
+                    .update_manifest_item_state(collection, remote_item_id, package_state)
+                    .map(Box::new),
+            ),
+            StorageCommand::OpenCachedReaderContent { content_id } => StorageResponse::Opened(
+                storage.open_cached_reader_content(content_id).map(Box::new),
+            ),
+        };
+
+        STORAGE_RESP_SIG.signal(response);
+    }
+}
+
+impl<'d> SdContentStorage<'d> {
+    fn snapshot(&self, kind: CollectionKind) -> CollectionManifestState {
+        self.snapshots[collection_index(kind)]
+    }
+
+    fn initialize_layout(&mut self) -> Result<(), StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = open_or_create_dir(&root, ROOT_DIR_NAME)?;
+        let v1 = open_or_create_dir(&motif, VERSION_DIR_NAME)?;
+        let _ = open_or_create_dir(&v1, MANIFEST_DIR_NAME)?;
+        let _ = open_or_create_dir(&v1, PACKAGE_DIR_NAME)?;
+        let _ = open_or_create_dir(&v1, STAGING_DIR_NAME)?;
+        let _ = open_or_create_dir(&v1, CACHE_DIR_NAME)?;
+        Ok(())
+    }
+
+    fn load_state(&mut self) -> Result<(), StorageError> {
+        self.cleanup_active_stage_file()?;
+        self.cache_index = self.read_cache_index()?.unwrap_or(CacheIndex::empty());
+
+        let saved = self
+            .read_manifest_snapshot(CollectionKind::Saved)?
+            .unwrap_or(CollectionManifestState::empty());
+        let inbox = self
+            .read_manifest_snapshot(CollectionKind::Inbox)?
+            .unwrap_or(CollectionManifestState::empty());
+        let recommendations = self
+            .read_manifest_snapshot(CollectionKind::Recommendations)?
+            .unwrap_or(CollectionManifestState::empty());
+
+        self.snapshots[collection_index(CollectionKind::Saved)] = saved;
+        self.snapshots[collection_index(CollectionKind::Inbox)] = inbox;
+        self.snapshots[collection_index(CollectionKind::Recommendations)] = recommendations;
+
+        self.reconcile_all_snapshots();
+        self.refresh_collection_flags();
+        self.evict_if_needed()?;
+        Ok(())
+    }
+
+    fn reset_dev_data(&mut self) -> Result<(), StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = open_or_replace_dir(&root, ROOT_DIR_NAME)?;
+        let v1 = open_or_replace_dir(&motif, VERSION_DIR_NAME)?;
+
+        clear_or_recreate_dir(&v1, MANIFEST_DIR_NAME)?;
+        clear_or_recreate_dir(&v1, CACHE_DIR_NAME)?;
+        clear_or_recreate_dir(&v1, STAGING_DIR_NAME)?;
+        clear_or_recreate_dir(&v1, PACKAGE_DIR_NAME)?;
+
+        self.snapshots = [CollectionManifestState::empty(); 3];
+        self.cache_index = CacheIndex::empty();
+        self.pending_stage = None;
+        Ok(())
+    }
+
+    fn persist_snapshot(
+        &mut self,
+        kind: CollectionKind,
+        snapshot: CollectionManifestState,
+    ) -> Result<CollectionManifestState, StorageError> {
+        self.snapshots[collection_index(kind)] = snapshot;
+        self.reconcile_snapshot(kind);
+        self.refresh_collection_flags();
+        self.write_manifest_snapshot(kind)?;
+        self.evict_if_needed()?;
+        Ok(self.snapshots[collection_index(kind)])
+    }
+
+    fn begin_stage(
+        &mut self,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        remote_revision: u64,
+    ) -> Result<(), StorageError> {
+        let superseded_entry = self.cache_index.find_by_content_id(&content_id);
+        let overwritten_entry = match self.cache_index.next_available_slot_id() {
+            Some(_) => None,
+            None => self
+                .select_eviction_candidate_excluding(superseded_entry.map(|entry| entry.slot_id)),
+        };
+        let slot_id = if let Some(slot_id) = self.cache_index.next_available_slot_id() {
+            slot_id
+        } else if let Some(entry) = overwritten_entry {
+            entry.slot_id
+        } else {
+            return Err(StorageError::PartitionFull);
+        };
+
+        self.delete_stage_file()?;
+        self.write_stage_file(&[])?;
+        self.pending_stage = Some(PendingStage {
+            content_id,
+            remote_revision,
+            slot_id,
+            bytes_written: 0,
+            crc32: 0xFFFF_FFFF,
+            overwritten_entry,
+            superseded_entry,
+        });
+        Ok(())
+    }
+
+    fn write_stage_chunk(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
+        let Some(mut stage) = self.pending_stage else {
+            return Err(StorageError::Unavailable);
+        };
+
+        self.append_stage_file(chunk)?;
+        stage.bytes_written = stage.bytes_written.saturating_add(chunk.len() as u32);
+        stage.crc32 = crc32_continue(stage.crc32, chunk);
+        self.pending_stage = Some(stage);
+        Ok(())
+    }
+
+    fn commit_stage(
+        &mut self,
+        collection: CollectionKind,
+        remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    ) -> Result<CollectionManifestState, StorageError> {
+        let Some(stage) = self.pending_stage.take() else {
+            return Err(StorageError::Unavailable);
+        };
+
+        if !self.stage_file_has_compact_body()? {
+            self.delete_stage_file()?;
+            return self.update_manifest_item_state(
+                collection,
+                remote_item_id,
+                PackageState::PendingRemote,
+            );
+        }
+
+        self.copy_stage_to_package_slot(stage.slot_id)?;
+        self.write_package_meta(
+            stage.slot_id,
+            stage.remote_revision,
+            stage.bytes_written,
+            !stage.crc32,
+        )?;
+        self.delete_stage_file()?;
+
+        if let Some(entry) = stage.overwritten_entry {
+            let _ = self.cache_index.remove_slot(entry.slot_id);
+        }
+        if let Some(entry) = stage.superseded_entry
+            && entry.slot_id != stage.slot_id
+        {
+            if let Err(err) = self.delete_package_slot(entry.slot_id) {
+                info!(
+                    "content storage stale package cleanup failed slot={} err={:?}",
+                    entry.slot_id, err
+                );
+            }
+            let _ = self.cache_index.remove_slot(entry.slot_id);
+        }
+
+        self.cache_index.upsert(CacheEntry {
+            slot_id: stage.slot_id,
+            content_id: stage.content_id,
+            remote_revision: stage.remote_revision,
+            size_bytes: stage.bytes_written,
+            crc32: !stage.crc32,
+            last_touch_seq: 0,
+            collection_flags: 0,
+        });
+        self.refresh_collection_flags();
+        self.write_cache_index()?;
+        let snapshot =
+            self.update_manifest_item_state(collection, remote_item_id, PackageState::Cached)?;
+        self.evict_if_needed()?;
+        Ok(snapshot)
+    }
+
+    fn abort_stage(&mut self) -> Result<(), StorageError> {
+        self.pending_stage = None;
+        self.delete_stage_file()
+    }
+
+    fn update_manifest_item_state(
+        &mut self,
+        collection: CollectionKind,
+        remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+        package_state: PackageState,
+    ) -> Result<CollectionManifestState, StorageError> {
+        {
+            let snapshot = &mut self.snapshots[collection_index(collection)];
+            let _ = snapshot.update_package_state(&remote_item_id, package_state);
+        }
+        self.write_manifest_snapshot(collection)?;
+        Ok(self.snapshots[collection_index(collection)])
+    }
+
+    fn open_cached_reader_content(
+        &mut self,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> Result<OpenedReaderContent, StorageError> {
+        let entry = self
+            .cache_index
+            .find_by_content_id(&content_id)
+            .ok_or(StorageError::Unavailable)?;
+        let meta = self.read_package_meta(entry.slot_id)?;
+        if meta.remote_revision != entry.remote_revision {
+            return Err(StorageError::CorruptData);
+        }
+
+        let opened = {
+            let volume = self
+                .volume_mgr
+                .open_volume(VolumeIdx(0))
+                .map_err(map_sd_error)?;
+            let root = volume.open_root_dir().map_err(map_sd_error)?;
+            let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+            let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+            let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+            let file = pkg_dir
+                .open_file_in_dir(
+                    package_payload_file_name(entry.slot_id).as_str(),
+                    Mode::ReadOnly,
+                )
+                .map_err(map_sd_error)?;
+
+            let mut source = SdPackageSource::new(file);
+            let opened = parse_opened_reader_content(&mut source)?;
+            source.finish()?;
+            if source.bytes_read() != meta.size_bytes as usize || source.crc32() != meta.crc32 {
+                return Err(StorageError::CorruptData);
+            }
+            opened
+        };
+
+        if let Some(index) = self.cache_index.find_index_by_content_id(&content_id) {
+            self.cache_index.entries[index].last_touch_seq = self.cache_index.bump_touch_seq();
+            self.write_cache_index()?;
+        }
+
+        Ok(opened)
+    }
+
+    fn reconcile_all_snapshots(&mut self) {
+        let mut index = 0;
+        while index < CollectionKind::ALL.len() {
+            self.reconcile_snapshot(CollectionKind::ALL[index]);
+            index += 1;
+        }
+    }
+
+    fn reconcile_snapshot(&mut self, kind: CollectionKind) {
+        let snapshot = &mut self.snapshots[collection_index(kind)];
+        let len = snapshot.len();
+        let mut index = 0;
+        while index < len {
+            let item = &mut snapshot.items[index];
+            let local = self.cache_index.find_by_content_id(&item.content_id);
+            item.package_state = match local {
+                Some(entry) if entry.remote_revision == item.remote_revision => {
+                    PackageState::Cached
+                }
+                Some(_) => PackageState::Stale,
+                None => match item.remote_status {
+                    RemoteContentStatus::Ready => PackageState::Missing,
+                    RemoteContentStatus::Pending | RemoteContentStatus::Unknown => {
+                        PackageState::PendingRemote
+                    }
+                    RemoteContentStatus::Failed => PackageState::Failed,
+                },
+            };
+            index += 1;
+        }
+    }
+
+    fn refresh_collection_flags(&mut self) {
+        let mut entry_index = 0;
+        while entry_index < self.cache_index.len() {
+            let content_id = self.cache_index.entries[entry_index].content_id;
+            let mut flags = 0u8;
+
+            let mut collection_index_value = 0;
+            while collection_index_value < CollectionKind::ALL.len() {
+                let kind = CollectionKind::ALL[collection_index_value];
+                let snapshot = &self.snapshots[collection_index(kind)];
+                let mut item_index = 0;
+                while item_index < snapshot.len() {
+                    if snapshot.items[item_index].content_id == content_id {
+                        flags |= collection_flag(kind);
+                    }
+                    item_index += 1;
+                }
+                collection_index_value += 1;
+            }
+
+            self.cache_index.entries[entry_index].collection_flags = flags;
+            entry_index += 1;
+        }
+    }
+
+    fn evict_if_needed(&mut self) -> Result<(), StorageError> {
+        while self.cache_index.len() > CACHE_ENTRY_CAPACITY
+            || self.cache_index.total_bytes() > CACHE_SIZE_BUDGET_BYTES
+        {
+            let Some(candidate) = self.select_eviction_candidate() else {
+                break;
+            };
+            self.delete_package_slot(candidate.slot_id)?;
+            let _ = self.cache_index.remove_slot(candidate.slot_id);
+            self.reconcile_all_snapshots();
+        }
+
+        self.write_cache_index()?;
+        self.write_manifest_snapshot(CollectionKind::Saved)?;
+        self.write_manifest_snapshot(CollectionKind::Inbox)?;
+        self.write_manifest_snapshot(CollectionKind::Recommendations)?;
+        Ok(())
+    }
+
+    fn select_eviction_candidate(&self) -> Option<CacheEntry> {
+        self.select_eviction_candidate_excluding(None)
+    }
+
+    fn select_eviction_candidate_excluding(&self, excluded_slot: Option<u8>) -> Option<CacheEntry> {
+        let mut best: Option<CacheEntry> = None;
+        let mut index = 0;
+        while index < self.cache_index.len() {
+            let entry = self.cache_index.entries[index];
+            if Some(entry.slot_id) == excluded_slot {
+                index += 1;
+                continue;
+            }
+            match best {
+                None => best = Some(entry),
+                Some(current) => {
+                    if compare_eviction_priority(entry, current) == Ordering::Less {
+                        best = Some(entry);
+                    }
+                }
+            }
+            index += 1;
+        }
+        best
+    }
+
+    fn write_manifest_snapshot(&mut self, kind: CollectionKind) -> Result<(), StorageError> {
+        let snapshot = self.snapshots[collection_index(kind)];
+        let mut bytes = Box::new([0u8; MAX_MANIFEST_SNAPSHOT_LEN]);
+        let encoded_len = encode_manifest_snapshot(kind, &snapshot, &mut bytes[..])?;
+        self.write_named_file_in_manif_dir(manifest_file_name(kind), &bytes[..encoded_len])
+    }
+
+    fn read_manifest_snapshot(
+        &mut self,
+        kind: CollectionKind,
+    ) -> Result<Option<CollectionManifestState>, StorageError> {
+        let mut bytes = Box::new([0u8; MAX_MANIFEST_SNAPSHOT_LEN]);
+        let Some(read_len) =
+            self.read_named_file_in_manif_dir(manifest_file_name(kind), &mut bytes[..])?
+        else {
+            return Ok(None);
+        };
+
+        decode_manifest_snapshot(kind, &bytes[..read_len]).map(Some)
+    }
+
+    fn write_cache_index(&mut self) -> Result<(), StorageError> {
+        let mut bytes = Box::new([0u8; MAX_CACHE_INDEX_LEN]);
+        let encoded_len = encode_cache_index(&self.cache_index, &mut bytes[..])?;
+        self.write_named_file_in_cache_dir(CACHE_INDEX_FILE_NAME, &bytes[..encoded_len])
+    }
+
+    fn read_cache_index(&mut self) -> Result<Option<CacheIndex>, StorageError> {
+        let mut bytes = Box::new([0u8; MAX_CACHE_INDEX_LEN]);
+        let Some(read_len) =
+            self.read_named_file_in_cache_dir(CACHE_INDEX_FILE_NAME, &mut bytes[..])?
+        else {
+            return Ok(None);
+        };
+
+        decode_cache_index(&bytes[..read_len]).map(Some)
+    }
+
+    fn write_package_meta(
+        &mut self,
+        slot_id: u8,
+        remote_revision: u64,
+        size_bytes: u32,
+        crc32: u32,
+    ) -> Result<(), StorageError> {
+        let mut bytes = [0u8; MAX_PACKAGE_META_LEN];
+        let encoded_len =
+            encode_package_meta(slot_id, remote_revision, size_bytes, crc32, &mut bytes)?;
+        self.write_named_file_in_pkg_dir(&package_meta_file_name(slot_id), &bytes[..encoded_len])
+    }
+
+    fn read_package_meta(&mut self, slot_id: u8) -> Result<PackageMeta, StorageError> {
+        let mut bytes = [0u8; MAX_PACKAGE_META_LEN];
+        let read_len = self
+            .read_named_file_in_pkg_dir(package_meta_file_name(slot_id).as_str(), &mut bytes)?
+            .ok_or(StorageError::Unavailable)?;
+        decode_package_meta(&bytes[..read_len])
+    }
+
+    fn cleanup_active_stage_file(&mut self) -> Result<(), StorageError> {
+        self.pending_stage = None;
+        self.delete_stage_file()
+    }
+
+    fn stage_file_has_compact_body(&mut self) -> Result<bool, StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
+        let file = stage_dir
+            .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadOnly)
+            .map_err(map_sd_error)?;
+
+        let mut buffer = [0u8; PACKAGE_COPY_BUFFER_LEN];
+        let mut saw_body_key = false;
+        let mut saw_body_object = false;
+        let mut carry = [0u8; 16];
+        let mut carry_len = 0usize;
+
+        loop {
+            let read = file.read(&mut buffer).map_err(map_sd_error)?;
+            if read == 0 {
+                break;
+            }
+
+            let mut combined = [0u8; PACKAGE_COPY_BUFFER_LEN + 16];
+            combined[..carry_len].copy_from_slice(&carry[..carry_len]);
+            combined[carry_len..carry_len + read].copy_from_slice(&buffer[..read]);
+            let combined_len = carry_len + read;
+            let haystack = &combined[..combined_len];
+
+            if find_bytes(haystack, br#""body":{"#).is_some() {
+                saw_body_key = true;
+                saw_body_object = true;
+                break;
+            }
+            if find_bytes(haystack, br#""body":null"#).is_some() {
+                saw_body_key = true;
+                break;
+            }
+            if find_bytes(haystack, br#""body""#).is_some() {
+                saw_body_key = true;
+            }
+
+            carry_len = haystack.len().min(carry.len());
+            carry[..carry_len].copy_from_slice(&haystack[haystack.len() - carry_len..]);
+        }
+
+        Ok(saw_body_key && saw_body_object)
+    }
+
+    fn delete_stage_file(&mut self) -> Result<(), StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
+        match stage_dir.delete_file_in_dir(ACTIVE_STAGE_FILE_NAME) {
+            Ok(()) => Ok(()),
+            Err(SdError::NotFound) => Ok(()),
+            Err(err) => Err(map_sd_error(err)),
+        }
+    }
+
+    fn write_stage_file(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+        self.write_named_file_in_stage_dir(ACTIVE_STAGE_FILE_NAME, bytes)
+    }
+
+    fn append_stage_file(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
+        let file = stage_dir
+            .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadWriteCreateOrAppend)
+            .map_err(map_sd_error)?;
+        file.write(bytes).map_err(map_sd_error)?;
+        file.flush().map_err(map_sd_error)?;
+        Ok(())
+    }
+
+    fn copy_stage_to_package_slot(&mut self, slot_id: u8) -> Result<(), StorageError> {
+        self.write_named_file_in_pkg_dir(&package_payload_file_name(slot_id), &[])?;
+
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
+        let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+        let stage_file = stage_dir
+            .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadOnly)
+            .map_err(map_sd_error)?;
+        let payload_file = pkg_dir
+            .open_file_in_dir(
+                package_payload_file_name(slot_id).as_str(),
+                Mode::ReadWriteCreateOrTruncate,
+            )
+            .map_err(map_sd_error)?;
+
+        let mut buffer = [0u8; PACKAGE_COPY_BUFFER_LEN];
+        loop {
+            let read = stage_file.read(&mut buffer).map_err(map_sd_error)?;
+            if read == 0 {
+                break;
+            }
+            payload_file.write(&buffer[..read]).map_err(map_sd_error)?;
+        }
+        payload_file.flush().map_err(map_sd_error)?;
+        Ok(())
+    }
+
+    fn delete_package_slot(&mut self, slot_id: u8) -> Result<(), StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+
+        for name in [
+            package_payload_file_name(slot_id),
+            package_meta_file_name(slot_id),
+        ] {
+            match pkg_dir.delete_file_in_dir(name.as_str()) {
+                Ok(()) | Err(SdError::NotFound) => {}
+                Err(err) => return Err(map_sd_error(err)),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_named_file_in_manif_dir(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        self.write_named_file_in_subdir(MANIFEST_DIR_NAME, name, bytes)
+    }
+
+    fn read_named_file_in_manif_dir(
+        &mut self,
+        name: &str,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, StorageError> {
+        self.read_named_file_in_subdir(MANIFEST_DIR_NAME, name, out)
+    }
+
+    fn write_named_file_in_cache_dir(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        self.write_named_file_in_subdir(CACHE_DIR_NAME, name, bytes)
+    }
+
+    fn read_named_file_in_cache_dir(
+        &mut self,
+        name: &str,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, StorageError> {
+        self.read_named_file_in_subdir(CACHE_DIR_NAME, name, out)
+    }
+
+    fn write_named_file_in_stage_dir(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        self.write_named_file_in_subdir(STAGING_DIR_NAME, name, bytes)
+    }
+
+    fn write_named_file_in_pkg_dir(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        self.write_named_file_in_subdir(PACKAGE_DIR_NAME, name, bytes)
+    }
+
+    fn read_named_file_in_pkg_dir(
+        &mut self,
+        name: &str,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, StorageError> {
+        self.read_named_file_in_subdir(PACKAGE_DIR_NAME, name, out)
+    }
+
+    fn write_named_file_in_subdir(
+        &mut self,
+        subdir_name: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let dir = v1.open_dir(subdir_name).map_err(map_sd_error)?;
+        match dir.delete_file_in_dir(file_name) {
+            Ok(()) | Err(SdError::NotFound) => {}
+            Err(err) => return Err(map_sd_error(err)),
+        }
+        let file = dir
+            .open_file_in_dir(file_name, Mode::ReadWriteCreateOrTruncate)
+            .map_err(map_sd_error)?;
+        if !bytes.is_empty() {
+            file.write(bytes).map_err(map_sd_error)?;
+        }
+        file.flush().map_err(map_sd_error)?;
+        Ok(())
+    }
+
+    fn read_named_file_in_subdir(
+        &mut self,
+        subdir_name: &str,
+        file_name: &str,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let dir = v1.open_dir(subdir_name).map_err(map_sd_error)?;
+        let file = match dir.open_file_in_dir(file_name, Mode::ReadOnly) {
+            Ok(file) => file,
+            Err(SdError::NotFound) => return Ok(None),
+            Err(err) => return Err(map_sd_error(err)),
+        };
+
+        let mut total = 0usize;
+        loop {
+            if total == out.len() {
+                return Err(StorageError::PayloadTooLarge);
+            }
+
+            let read = file.read(&mut out[total..]).map_err(map_sd_error)?;
+            if read == 0 {
+                break;
+            }
+            total += read;
+        }
+
+        Ok(Some(total))
+    }
+}
+
+fn publish_initial_snapshots(storage: &SdContentStorage<'_>) {
+    let now_ms = Instant::now().as_millis();
+
+    for kind in CollectionKind::ALL {
+        let snapshot = storage.snapshot(kind);
+        if snapshot.is_empty() {
+            continue;
+        }
+        publish_event(
+            Event::CollectionContentUpdated(kind, Box::new(snapshot)),
+            now_ms,
+        );
+    }
+}
+
+fn open_or_create_dir<'a, 'd>(
+    parent: &'a SdDirectory<'a, 'd>,
+    name: &str,
+) -> Result<SdDirectory<'a, 'd>, StorageError> {
+    match parent.open_dir(name) {
+        Ok(dir) => Ok(dir),
+        Err(SdError::NotFound) => {
+            parent.make_dir_in_dir(name).map_err(map_sd_error)?;
+            parent.open_dir(name).map_err(map_sd_error)
+        }
+        Err(err) => Err(map_sd_error(err)),
+    }
+}
+
+fn open_or_replace_dir<'a, 'd>(
+    parent: &'a SdDirectory<'a, 'd>,
+    name: &str,
+) -> Result<SdDirectory<'a, 'd>, StorageError> {
+    match parent.open_dir(name) {
+        Ok(dir) => Ok(dir),
+        Err(SdError::NotFound) => {
+            parent.make_dir_in_dir(name).map_err(map_sd_error)?;
+            parent.open_dir(name).map_err(map_sd_error)
+        }
+        Err(SdError::OpenedFileAsDir) => {
+            parent.delete_file_in_dir(name).map_err(map_sd_error)?;
+            parent.make_dir_in_dir(name).map_err(map_sd_error)?;
+            parent.open_dir(name).map_err(map_sd_error)
+        }
+        Err(err) => Err(map_sd_error(err)),
+    }
+}
+
+fn clear_or_recreate_dir(parent: &SdDirectory<'_, '_>, name: &str) -> Result<(), StorageError> {
+    let dir = open_or_replace_dir(parent, name)?;
+    clear_directory_files(dir)
+}
+
+fn clear_directory_files(dir: SdDirectory<'_, '_>) -> Result<(), StorageError> {
+    let mut file_names = Vec::<ShortFileName>::new();
+    dir.iterate_dir(|entry| {
+        if entry.attributes.is_directory() {
+            return;
+        }
+        file_names.push(entry.name.clone());
+    })
+    .map_err(map_sd_error)?;
+
+    for file_name in file_names {
+        match dir.delete_file_in_dir(&file_name) {
+            Ok(()) | Err(SdError::NotFound) => {}
+            Err(err) => return Err(map_sd_error(err)),
+        }
+    }
+
+    Ok(())
+}
+fn compare_eviction_priority(candidate: CacheEntry, current: CacheEntry) -> Ordering {
+    eviction_sort_key(candidate)
+        .cmp(&eviction_sort_key(current))
+        .then(candidate.last_touch_seq.cmp(&current.last_touch_seq))
+}
+
+fn eviction_sort_key(entry: CacheEntry) -> (u8, u8) {
+    let referenced = if entry.collection_flags == 0 {
+        0u8
+    } else {
+        1u8
+    };
+    let priority = if entry.collection_flags & collection_flag(CollectionKind::Saved) != 0 {
+        2
+    } else if entry.collection_flags & collection_flag(CollectionKind::Inbox) != 0 {
+        1
+    } else {
+        0
+    };
+
+    (referenced, priority)
+}
+
+fn collection_index(kind: CollectionKind) -> usize {
+    match kind {
+        CollectionKind::Saved => 0,
+        CollectionKind::Inbox => 1,
+        CollectionKind::Recommendations => 2,
+    }
+}
+
+const fn collection_flag(kind: CollectionKind) -> u8 {
+    match kind {
+        CollectionKind::Saved => 0b001,
+        CollectionKind::Inbox => 0b010,
+        CollectionKind::Recommendations => 0b100,
+    }
+}
+
+fn manifest_file_name(kind: CollectionKind) -> &'static str {
+    match kind {
+        CollectionKind::Saved => SAVED_MANIFEST_FILE_NAME,
+        CollectionKind::Inbox => INBOX_MANIFEST_FILE_NAME,
+        CollectionKind::Recommendations => RECOMMENDATION_MANIFEST_FILE_NAME,
+    }
+}
+
+fn package_payload_file_name(slot_id: u8) -> heapless::String<12> {
+    let mut name = heapless::String::<12>::new();
+    let _ = core::fmt::write(&mut name, format_args!("P{:07}.JSN", slot_id));
+    name
+}
+
+fn package_meta_file_name(slot_id: u8) -> heapless::String<12> {
+    let mut name = heapless::String::<12>::new();
+    let _ = core::fmt::write(&mut name, format_args!("P{:07}.MTA", slot_id));
+    name
+}
+
+fn map_sd_error<E: core::fmt::Debug>(error: SdError<E>) -> StorageError {
+    match error {
+        SdError::NotFound => StorageError::Unavailable,
+        SdError::OpenedDirAsFile | SdError::OpenedFileAsDir | SdError::DeleteDirAsFile => {
+            StorageError::CorruptData
+        }
+        SdError::FormatError(_) | SdError::BadCluster | SdError::InvalidOffset => {
+            StorageError::CorruptData
+        }
+        SdError::DiskFull | SdError::NotEnoughSpace => StorageError::PartitionFull,
+        SdError::FilenameError(_) | SdError::Unsupported | SdError::BadBlockSize(_) => {
+            StorageError::UnsupportedLayout
+        }
+        SdError::ReadOnly => StorageError::Unavailable,
+        SdError::DeviceError(_) => StorageError::FlashFailure,
+        _ => StorageError::Unavailable,
+    }
+}
+
+fn encode_manifest_snapshot(
+    kind: CollectionKind,
+    snapshot: &CollectionManifestState,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    let needed =
+        16 + RECOMMENDATION_SERVE_ID_MAX_BYTES + snapshot.len() * manifest_item_encoded_len();
+    if out.len() < needed {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    write_u32(out, 0, MANIFEST_MAGIC);
+    write_u16(out, 4, FORMAT_VERSION);
+    out[6] = collection_index(kind) as u8;
+    out[7] = snapshot.len() as u8;
+    out[8] = snapshot.serve_id.len() as u8;
+    write_inline_text(
+        &mut out[16..16 + RECOMMENDATION_SERVE_ID_MAX_BYTES],
+        &snapshot.serve_id,
+    );
+
+    let mut offset = 16 + RECOMMENDATION_SERVE_ID_MAX_BYTES;
+    let mut index = 0;
+    while index < snapshot.len() {
+        offset += encode_manifest_item(&snapshot.items[index], &mut out[offset..])?;
+        index += 1;
+    }
+
+    Ok(offset)
+}
+
+fn decode_manifest_snapshot(
+    kind: CollectionKind,
+    bytes: &[u8],
+) -> Result<CollectionManifestState, StorageError> {
+    if bytes.len() < 16 + RECOMMENDATION_SERVE_ID_MAX_BYTES {
+        return Err(StorageError::CorruptData);
+    }
+    if read_u32(bytes, 0) != MANIFEST_MAGIC || read_u16(bytes, 4) != FORMAT_VERSION {
+        return Err(StorageError::CorruptData);
+    }
+    if bytes[6] != collection_index(kind) as u8 {
+        return Err(StorageError::CorruptData);
+    }
+
+    let len = bytes[7] as usize;
+    if len > MANIFEST_ITEM_CAPACITY {
+        return Err(StorageError::CorruptData);
+    }
+
+    let mut snapshot = CollectionManifestState::empty();
+    let serve_id_len = bytes[8] as usize;
+    read_inline_text(
+        &mut snapshot.serve_id,
+        serve_id_len,
+        &bytes[16..16 + RECOMMENDATION_SERVE_ID_MAX_BYTES],
+    );
+
+    let mut offset = 16 + RECOMMENDATION_SERVE_ID_MAX_BYTES;
+    let mut index = 0;
+    while index < len {
+        let (item, consumed) = decode_manifest_item(&bytes[offset..])?;
+        let _ = snapshot.try_push(item);
+        offset += consumed;
+        index += 1;
+    }
+
+    Ok(snapshot)
+}
+
+const fn manifest_item_encoded_len() -> usize {
+    1 + REMOTE_ITEM_ID_MAX_BYTES
+        + 1
+        + CONTENT_ID_MAX_BYTES
+        + 1
+        + 1
+        + 1
+        + CONTENT_META_MAX_BYTES
+        + 1
+        + CONTENT_TITLE_MAX_BYTES
+        + 8
+        + 1
+        + 1
+}
+
+fn encode_manifest_item(
+    item: &CollectionManifestItem,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    let needed = manifest_item_encoded_len();
+    if out.len() < needed {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    out[0] = item.remote_item_id.len() as u8;
+    write_inline_text(
+        &mut out[1..1 + REMOTE_ITEM_ID_MAX_BYTES],
+        &item.remote_item_id,
+    );
+    let content_id_offset = 1 + REMOTE_ITEM_ID_MAX_BYTES;
+    out[content_id_offset] = item.content_id.len() as u8;
+    write_inline_text(
+        &mut out[content_id_offset + 1..content_id_offset + 1 + CONTENT_ID_MAX_BYTES],
+        &item.content_id,
+    );
+    let detail_offset = content_id_offset + 1 + CONTENT_ID_MAX_BYTES;
+    out[detail_offset] = detail_locator_to_byte(item.detail_locator);
+    out[detail_offset + 1] = source_kind_to_byte(item.source);
+    out[detail_offset + 2] = item.meta.len() as u8;
+    let meta_offset = detail_offset + 3;
+    write_inline_text(
+        &mut out[meta_offset..meta_offset + CONTENT_META_MAX_BYTES],
+        &item.meta,
+    );
+    let title_offset = meta_offset + CONTENT_META_MAX_BYTES;
+    out[title_offset] = item.title.len() as u8;
+    write_inline_text(
+        &mut out[title_offset + 1..title_offset + 1 + CONTENT_TITLE_MAX_BYTES],
+        &item.title,
+    );
+    let revision_offset = title_offset + 1 + CONTENT_TITLE_MAX_BYTES;
+    write_u64(out, revision_offset, item.remote_revision);
+    out[revision_offset + 8] = remote_status_to_byte(item.remote_status);
+    out[revision_offset + 9] = package_state_to_byte(item.package_state);
+    Ok(needed)
+}
+
+fn decode_manifest_item(bytes: &[u8]) -> Result<(CollectionManifestItem, usize), StorageError> {
+    let needed = manifest_item_encoded_len();
+    if bytes.len() < needed {
+        return Err(StorageError::CorruptData);
+    }
+
+    let remote_id_offset = 1 + REMOTE_ITEM_ID_MAX_BYTES;
+    let detail_offset = remote_id_offset + 1 + CONTENT_ID_MAX_BYTES;
+    let meta_offset = detail_offset + 3;
+    let title_offset = meta_offset + CONTENT_META_MAX_BYTES;
+    let revision_offset = title_offset + 1 + CONTENT_TITLE_MAX_BYTES;
+
+    let mut item = CollectionManifestItem::empty();
+    read_inline_text(
+        &mut item.remote_item_id,
+        bytes[0] as usize,
+        &bytes[1..1 + REMOTE_ITEM_ID_MAX_BYTES],
+    );
+    read_inline_text(
+        &mut item.content_id,
+        bytes[remote_id_offset] as usize,
+        &bytes[remote_id_offset + 1..remote_id_offset + 1 + CONTENT_ID_MAX_BYTES],
+    );
+    item.detail_locator = detail_locator_from_byte(bytes[detail_offset])?;
+    item.source = source_kind_from_byte(bytes[detail_offset + 1])?;
+    read_inline_text(
+        &mut item.meta,
+        bytes[detail_offset + 2] as usize,
+        &bytes[meta_offset..meta_offset + CONTENT_META_MAX_BYTES],
+    );
+    read_inline_text(
+        &mut item.title,
+        bytes[title_offset] as usize,
+        &bytes[title_offset + 1..title_offset + 1 + CONTENT_TITLE_MAX_BYTES],
+    );
+    item.remote_revision = read_u64(bytes, revision_offset);
+    item.remote_status = remote_status_from_byte(bytes[revision_offset + 8])?;
+    item.package_state = package_state_from_byte(bytes[revision_offset + 9])?;
+    Ok((item, needed))
+}
+
+fn encode_cache_index(index: &CacheIndex, out: &mut [u8]) -> Result<usize, StorageError> {
+    let needed = 16 + index.len() * cache_entry_encoded_len();
+    if out.len() < needed {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    write_u32(out, 0, CACHE_INDEX_MAGIC);
+    write_u16(out, 4, FORMAT_VERSION);
+    out[6] = index.len;
+    write_u32(out, 8, index.next_touch_seq);
+
+    let mut offset = 16;
+    let mut entry_index = 0;
+    while entry_index < index.len() {
+        offset += encode_cache_entry(&index.entries[entry_index], &mut out[offset..])?;
+        entry_index += 1;
+    }
+
+    Ok(offset)
+}
+
+fn decode_cache_index(bytes: &[u8]) -> Result<CacheIndex, StorageError> {
+    if bytes.len() < 16 {
+        return Err(StorageError::CorruptData);
+    }
+    if read_u32(bytes, 0) != CACHE_INDEX_MAGIC || read_u16(bytes, 4) != FORMAT_VERSION {
+        return Err(StorageError::CorruptData);
+    }
+
+    let len = bytes[6] as usize;
+    if len > CACHE_ENTRY_CAPACITY {
+        return Err(StorageError::CorruptData);
+    }
+
+    let mut index = CacheIndex::empty();
+    index.next_touch_seq = read_u32(bytes, 8).max(1);
+    let mut offset = 16;
+    let mut entry_index = 0;
+    while entry_index < len {
+        let (entry, consumed) = decode_cache_entry(&bytes[offset..])?;
+        index.entries[entry_index] = entry;
+        index.len = index.len.saturating_add(1);
+        offset += consumed;
+        entry_index += 1;
+    }
+    Ok(index)
+}
+
+const fn cache_entry_encoded_len() -> usize {
+    1 + 1 + CONTENT_ID_MAX_BYTES + 8 + 4 + 4 + 4 + 1
+}
+
+fn encode_cache_entry(entry: &CacheEntry, out: &mut [u8]) -> Result<usize, StorageError> {
+    let needed = cache_entry_encoded_len();
+    if out.len() < needed {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    out[0] = entry.slot_id;
+    out[1] = entry.content_id.len() as u8;
+    write_inline_text(&mut out[2..2 + CONTENT_ID_MAX_BYTES], &entry.content_id);
+    let offset = 2 + CONTENT_ID_MAX_BYTES;
+    write_u64(out, offset, entry.remote_revision);
+    write_u32(out, offset + 8, entry.size_bytes);
+    write_u32(out, offset + 12, entry.crc32);
+    write_u32(out, offset + 16, entry.last_touch_seq);
+    out[offset + 20] = entry.collection_flags;
+    Ok(needed)
+}
+
+fn decode_cache_entry(bytes: &[u8]) -> Result<(CacheEntry, usize), StorageError> {
+    let needed = cache_entry_encoded_len();
+    if bytes.len() < needed {
+        return Err(StorageError::CorruptData);
+    }
+    let offset = 2 + CONTENT_ID_MAX_BYTES;
+    let mut entry = CacheEntry::empty();
+    entry.slot_id = bytes[0];
+    read_inline_text(
+        &mut entry.content_id,
+        bytes[1] as usize,
+        &bytes[2..2 + CONTENT_ID_MAX_BYTES],
+    );
+    entry.remote_revision = read_u64(bytes, offset);
+    entry.size_bytes = read_u32(bytes, offset + 8);
+    entry.crc32 = read_u32(bytes, offset + 12);
+    entry.last_touch_seq = read_u32(bytes, offset + 16);
+    entry.collection_flags = bytes[offset + 20];
+    Ok((entry, needed))
+}
+
+fn encode_package_meta(
+    slot_id: u8,
+    remote_revision: u64,
+    size_bytes: u32,
+    crc32: u32,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    if out.len() < 24 {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    write_u32(out, 0, PACKAGE_META_MAGIC);
+    write_u16(out, 4, FORMAT_VERSION);
+    out[6] = slot_id;
+    write_u64(out, 8, remote_revision);
+    write_u32(out, 16, size_bytes);
+    write_u32(out, 20, crc32);
+    Ok(24)
+}
+
+fn decode_package_meta(bytes: &[u8]) -> Result<PackageMeta, StorageError> {
+    if bytes.len() < 24 {
+        return Err(StorageError::CorruptData);
+    }
+    if read_u32(bytes, 0) != PACKAGE_META_MAGIC || read_u16(bytes, 4) != FORMAT_VERSION {
+        return Err(StorageError::CorruptData);
+    }
+
+    Ok(PackageMeta {
+        slot_id: bytes[6],
+        remote_revision: read_u64(bytes, 8),
+        size_bytes: read_u32(bytes, 16),
+        crc32: read_u32(bytes, 20),
+    })
+}
+
+fn write_inline_text<const N: usize>(out: &mut [u8], value: &InlineText<N>) {
+    let bytes = value.as_str().as_bytes();
+    out[..bytes.len()].copy_from_slice(bytes);
+}
+
+fn read_inline_text<const N: usize>(target: &mut InlineText<N>, len: usize, bytes: &[u8]) {
+    target.clear();
+    let copy_len = len.min(bytes.len());
+    let slice = core::str::from_utf8(&bytes[..copy_len]).unwrap_or("");
+    target.set_truncated(slice);
+}
+
+fn write_u16(buffer: &mut [u8], offset: usize, value: u16) {
+    buffer[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(buffer: &mut [u8], offset: usize, value: u32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(buffer: &mut [u8], offset: usize, value: u64) {
+    buffer[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u16(buffer: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([buffer[offset], buffer[offset + 1]])
+}
+
+fn read_u32(buffer: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        buffer[offset],
+        buffer[offset + 1],
+        buffer[offset + 2],
+        buffer[offset + 3],
+    ])
+}
+
+fn read_u64(buffer: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        buffer[offset],
+        buffer[offset + 1],
+        buffer[offset + 2],
+        buffer[offset + 3],
+        buffer[offset + 4],
+        buffer[offset + 5],
+        buffer[offset + 6],
+        buffer[offset + 7],
+    ])
+}
+
+fn detail_locator_to_byte(locator: DetailLocator) -> u8 {
+    match locator {
+        DetailLocator::Saved => 0,
+        DetailLocator::Inbox => 1,
+        DetailLocator::Content => 2,
+    }
+}
+
+fn detail_locator_from_byte(byte: u8) -> Result<DetailLocator, StorageError> {
+    match byte {
+        0 => Ok(DetailLocator::Saved),
+        1 => Ok(DetailLocator::Inbox),
+        2 => Ok(DetailLocator::Content),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn source_kind_to_byte(kind: domain::source::SourceKind) -> u8 {
+    match kind {
+        domain::source::SourceKind::PersonalQueue => 0,
+        domain::source::SourceKind::EditorialFeed => 1,
+        domain::source::SourceKind::Import => 2,
+        domain::source::SourceKind::Unknown => 3,
+    }
+}
+
+fn source_kind_from_byte(byte: u8) -> Result<domain::source::SourceKind, StorageError> {
+    match byte {
+        0 => Ok(domain::source::SourceKind::PersonalQueue),
+        1 => Ok(domain::source::SourceKind::EditorialFeed),
+        2 => Ok(domain::source::SourceKind::Import),
+        3 => Ok(domain::source::SourceKind::Unknown),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn remote_status_to_byte(status: RemoteContentStatus) -> u8 {
+    match status {
+        RemoteContentStatus::Ready => 0,
+        RemoteContentStatus::Pending => 1,
+        RemoteContentStatus::Failed => 2,
+        RemoteContentStatus::Unknown => 3,
+    }
+}
+
+fn remote_status_from_byte(byte: u8) -> Result<RemoteContentStatus, StorageError> {
+    match byte {
+        0 => Ok(RemoteContentStatus::Ready),
+        1 => Ok(RemoteContentStatus::Pending),
+        2 => Ok(RemoteContentStatus::Failed),
+        3 => Ok(RemoteContentStatus::Unknown),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn package_state_to_byte(state: PackageState) -> u8 {
+    match state {
+        PackageState::Missing => 0,
+        PackageState::Cached => 1,
+        PackageState::Stale => 2,
+        PackageState::Fetching => 3,
+        PackageState::PendingRemote => 4,
+        PackageState::Failed => 5,
+    }
+}
+
+fn package_state_from_byte(byte: u8) -> Result<PackageState, StorageError> {
+    match byte {
+        0 => Ok(PackageState::Missing),
+        1 => Ok(PackageState::Cached),
+        2 => Ok(PackageState::Stale),
+        3 => Ok(PackageState::Fetching),
+        4 => Ok(PackageState::PendingRemote),
+        5 => Ok(PackageState::Failed),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn crc32_continue(current: u32, bytes: &[u8]) -> u32 {
+    let mut crc = current;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg() & 0xEDB8_8320;
+            crc = (crc >> 1) ^ mask;
+            bit += 1;
+        }
+    }
+    crc
+}
+
+trait JsonSource {
+    fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize, StorageError>;
+}
+
+impl<T> JsonSource for &mut T
+where
+    T: JsonSource + ?Sized,
+{
+    fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize, StorageError> {
+        (**self).read_chunk(out)
+    }
+}
+
+struct SliceJsonSource<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SliceJsonSource<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+}
+
+impl JsonSource for SliceJsonSource<'_> {
+    fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize, StorageError> {
+        let remaining = &self.bytes[self.offset..];
+        if remaining.is_empty() {
+            return Ok(0);
+        }
+
+        let read = remaining.len().min(out.len());
+        out[..read].copy_from_slice(&remaining[..read]);
+        self.offset += read;
+        Ok(read)
+    }
+}
+
+struct SdPackageSource<'a, 'd> {
+    file: SdFile<'a, 'd>,
+    bytes_read: usize,
+    crc32: u32,
+}
+
+impl<'a, 'd> SdPackageSource<'a, 'd> {
+    fn new(file: SdFile<'a, 'd>) -> Self {
+        Self {
+            file,
+            bytes_read: 0,
+            crc32: 0xFFFF_FFFF,
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), StorageError> {
+        let mut buffer = [0u8; PACKAGE_READ_BUFFER_LEN];
+        loop {
+            let read = self.read_chunk(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn bytes_read(&self) -> usize {
+        self.bytes_read
+    }
+
+    fn crc32(&self) -> u32 {
+        !self.crc32
+    }
+}
+
+impl JsonSource for SdPackageSource<'_, '_> {
+    fn read_chunk(&mut self, out: &mut [u8]) -> Result<usize, StorageError> {
+        let read = self.file.read(out).map_err(map_sd_error)?;
+        self.bytes_read = self.bytes_read.saturating_add(read);
+        self.crc32 = crc32_continue(self.crc32, &out[..read]);
+        Ok(read)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedString {
+    value: String,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+enum BlockKind {
+    Text,
+    List,
+    #[default]
+    Other,
+}
+
+#[derive(Debug, Default)]
+struct BlockDraft {
+    kind: BlockKind,
+    text: Option<String>,
+    ordered: bool,
+    items: Vec<String>,
+    truncated: bool,
+    list_bytes: usize,
+}
+
+impl BlockDraft {
+    fn parse<S: JsonSource>(stream: &mut JsonStream<S>) -> Result<Self, StorageError> {
+        let mut draft = Self::default();
+        stream.parse_object_fields(|stream, key| match key.as_str() {
+            "t" => {
+                let parsed = stream.parse_string_limited(8)?;
+                if parsed.truncated {
+                    draft.truncated = true;
+                }
+                draft.kind = match parsed.value.as_str() {
+                    "h" | "p" | "q" | "c" => BlockKind::Text,
+                    "l" => BlockKind::List,
+                    _ => BlockKind::Other,
+                };
+                Ok(())
+            }
+            "x" => {
+                let parsed = stream.parse_string_limited(MAX_PARSED_BLOCK_TEXT_BYTES)?;
+                if parsed.truncated {
+                    draft.truncated = true;
+                }
+                draft.text = Some(parsed.value);
+                Ok(())
+            }
+            "o" => {
+                draft.ordered = stream.parse_bool()?;
+                Ok(())
+            }
+            "i" => draft.parse_list_items(stream),
+            _ => stream.skip_value(),
+        })?;
+        Ok(draft)
+    }
+
+    fn parse_list_items<S: JsonSource>(
+        &mut self,
+        stream: &mut JsonStream<S>,
+    ) -> Result<(), StorageError> {
+        stream.parse_array_values(|stream, first| {
+            if first != b'"' {
+                return Err(StorageError::CorruptData);
+            }
+
+            let parsed = stream.parse_string_body_limited(MAX_PARSED_BLOCK_TEXT_BYTES)?;
+            if parsed.truncated {
+                self.truncated = true;
+            }
+
+            let trimmed = parsed.value.trim();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+
+            if self.items.len() >= MAX_PARSED_LIST_ITEMS
+                || self.list_bytes.saturating_add(trimmed.len()) > MAX_PARSED_LIST_TOTAL_BYTES
+            {
+                self.truncated = true;
+                return Ok(());
+            }
+
+            self.list_bytes = self.list_bytes.saturating_add(trimmed.len());
+            self.items.push(String::from(trimmed));
+            Ok(())
+        })
+    }
+
+    fn apply(self, document: &mut ReadingDocument) -> bool {
+        let mut truncated = self.truncated;
+
+        match self.kind {
+            BlockKind::Text => {
+                if let Some(text) = self.text {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() && !document.push_paragraph_text(trimmed) {
+                        truncated = true;
+                    }
+                }
+            }
+            BlockKind::List => {
+                let mut item_index = 0usize;
+                while item_index < self.items.len() {
+                    let line = format_list_line(&self.items[item_index], self.ordered, item_index);
+                    if !document.push_paragraph_text(line.as_str()) {
+                        truncated = true;
+                        break;
+                    }
+                    item_index += 1;
+                }
+            }
+            BlockKind::Other => {}
+        }
+
+        truncated
+    }
+}
+
+struct JsonStream<S> {
+    source: S,
+    buffer: [u8; PACKAGE_READ_BUFFER_LEN],
+    cursor: usize,
+    buffered: usize,
+    unread: Option<u8>,
+}
+
+impl<S: JsonSource> JsonStream<S> {
+    fn new(source: S) -> Self {
+        Self {
+            source,
+            buffer: [0u8; PACKAGE_READ_BUFFER_LEN],
+            cursor: 0,
+            buffered: 0,
+            unread: None,
+        }
+    }
+
+    fn next_byte(&mut self) -> Result<Option<u8>, StorageError> {
+        if let Some(byte) = self.unread.take() {
+            return Ok(Some(byte));
+        }
+
+        if self.cursor == self.buffered {
+            self.buffered = self.source.read_chunk(&mut self.buffer)?;
+            self.cursor = 0;
+            if self.buffered == 0 {
+                return Ok(None);
+            }
+        }
+
+        let byte = self.buffer[self.cursor];
+        self.cursor += 1;
+        Ok(Some(byte))
+    }
+
+    fn unread_byte(&mut self, byte: u8) {
+        debug_assert!(self.unread.is_none());
+        self.unread = Some(byte);
+    }
+
+    fn next_significant_byte(&mut self) -> Result<Option<u8>, StorageError> {
+        loop {
+            let Some(byte) = self.next_byte()? else {
+                return Ok(None);
+            };
+            if !byte.is_ascii_whitespace() {
+                return Ok(Some(byte));
+            }
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), StorageError> {
+        let byte = self
+            .next_significant_byte()?
+            .ok_or(StorageError::CorruptData)?;
+        if byte != expected {
+            return Err(StorageError::CorruptData);
+        }
+        Ok(())
+    }
+
+    fn parse_bool(&mut self) -> Result<bool, StorageError> {
+        let first = self
+            .next_significant_byte()?
+            .ok_or(StorageError::CorruptData)?;
+        self.parse_bool_from(first)
+    }
+
+    fn parse_bool_from(&mut self, first: u8) -> Result<bool, StorageError> {
+        match first {
+            b't' => {
+                self.expect_literal(b"rue")?;
+                Ok(true)
+            }
+            b'f' => {
+                self.expect_literal(b"alse")?;
+                Ok(false)
+            }
+            _ => Err(StorageError::CorruptData),
+        }
+    }
+
+    fn parse_string_limited(&mut self, max_bytes: usize) -> Result<ParsedString, StorageError> {
+        let opening = self
+            .next_significant_byte()?
+            .ok_or(StorageError::CorruptData)?;
+        if opening != b'"' {
+            return Err(StorageError::CorruptData);
+        }
+        self.parse_string_body_limited(max_bytes)
+    }
+
+    fn parse_string_body_limited(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<ParsedString, StorageError> {
+        let mut parsed = ParsedString {
+            value: String::new(),
+            truncated: false,
+        };
+
+        loop {
+            let byte = self.next_byte()?.ok_or(StorageError::CorruptData)?;
+            match byte {
+                b'"' => return Ok(parsed),
+                b'\\' => {
+                    let escaped = self.next_byte()?.ok_or(StorageError::CorruptData)?;
+                    match escaped {
+                        b'"' | b'\\' | b'/' => {
+                            push_limited_char(
+                                &mut parsed.value,
+                                escaped as char,
+                                max_bytes,
+                                &mut parsed.truncated,
+                            );
+                        }
+                        b'b' | b'f' | b'n' | b'r' | b't' => {
+                            push_limited_char(
+                                &mut parsed.value,
+                                ' ',
+                                max_bytes,
+                                &mut parsed.truncated,
+                            );
+                        }
+                        b'u' => {
+                            let codepoint = self.parse_unicode_escape()?;
+                            push_limited_char(
+                                &mut parsed.value,
+                                char::from_u32(codepoint).unwrap_or('?'),
+                                max_bytes,
+                                &mut parsed.truncated,
+                            );
+                        }
+                        _ => return Err(StorageError::CorruptData),
+                    }
+                }
+                byte if byte.is_ascii() => {
+                    push_limited_char(
+                        &mut parsed.value,
+                        byte as char,
+                        max_bytes,
+                        &mut parsed.truncated,
+                    );
+                }
+                byte => {
+                    let continuation = utf8_continuation_len(byte)?;
+                    let mut utf8 = [0u8; 4];
+                    utf8[0] = byte;
+                    let mut index = 0usize;
+                    while index < continuation {
+                        let next = self.next_byte()?.ok_or(StorageError::CorruptData)?;
+                        if next & 0b1100_0000 != 0b1000_0000 {
+                            return Err(StorageError::CorruptData);
+                        }
+                        utf8[index + 1] = next;
+                        index += 1;
+                    }
+                    let text = core::str::from_utf8(&utf8[..continuation + 1])
+                        .map_err(|_| StorageError::CorruptData)?;
+                    push_limited_str(&mut parsed.value, text, max_bytes, &mut parsed.truncated);
+                }
+            }
+        }
+    }
+
+    fn parse_object_fields<F>(&mut self, mut handler: F) -> Result<(), StorageError>
+    where
+        F: FnMut(&mut Self, String) -> Result<(), StorageError>,
+    {
+        self.expect_byte(b'{')?;
+        let mut first = true;
+
+        loop {
+            let next = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            match next {
+                b'}' => return Ok(()),
+                b',' if !first => {}
+                _ if first => self.unread_byte(next),
+                _ => return Err(StorageError::CorruptData),
+            }
+
+            let opening = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            if opening != b'"' {
+                return Err(StorageError::CorruptData);
+            }
+
+            let key = self.parse_string_body_limited(MAX_JSON_KEY_BYTES)?.value;
+            self.expect_byte(b':')?;
+            handler(self, key)?;
+            first = false;
+        }
+    }
+
+    fn parse_array_values<F>(&mut self, mut handler: F) -> Result<(), StorageError>
+    where
+        F: FnMut(&mut Self, u8) -> Result<(), StorageError>,
+    {
+        self.expect_byte(b'[')?;
+        let mut first = true;
+
+        loop {
+            let next = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            match next {
+                b']' => return Ok(()),
+                b',' if !first => {}
+                _ if first => self.unread_byte(next),
+                _ => return Err(StorageError::CorruptData),
+            }
+
+            let first_byte = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            handler(self, first_byte)?;
+            first = false;
+        }
+    }
+
+    fn skip_value(&mut self) -> Result<(), StorageError> {
+        let first = self
+            .next_significant_byte()?
+            .ok_or(StorageError::CorruptData)?;
+        self.skip_value_from(first)
+    }
+
+    fn skip_value_from(&mut self, first: u8) -> Result<(), StorageError> {
+        match first {
+            b'{' => self.skip_object_body(),
+            b'[' => self.skip_array_body(),
+            b'"' => {
+                let _ = self.parse_string_body_limited(0)?;
+                Ok(())
+            }
+            b't' => self.expect_literal(b"rue"),
+            b'f' => self.expect_literal(b"alse"),
+            b'n' => self.expect_literal(b"ull"),
+            b'-' | b'0'..=b'9' => self.skip_number_from(first),
+            _ => Err(StorageError::CorruptData),
+        }
+    }
+
+    fn skip_object_body(&mut self) -> Result<(), StorageError> {
+        let mut first = true;
+        loop {
+            let next = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            match next {
+                b'}' => return Ok(()),
+                b',' if !first => {}
+                _ if first => self.unread_byte(next),
+                _ => return Err(StorageError::CorruptData),
+            }
+
+            let opening = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            if opening != b'"' {
+                return Err(StorageError::CorruptData);
+            }
+            let _ = self.parse_string_body_limited(0)?;
+            self.expect_byte(b':')?;
+            self.skip_value()?;
+            first = false;
+        }
+    }
+
+    fn skip_array_body(&mut self) -> Result<(), StorageError> {
+        let mut first = true;
+        loop {
+            let next = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            match next {
+                b']' => return Ok(()),
+                b',' if !first => {}
+                _ if first => self.unread_byte(next),
+                _ => return Err(StorageError::CorruptData),
+            }
+
+            let first_byte = self
+                .next_significant_byte()?
+                .ok_or(StorageError::CorruptData)?;
+            self.skip_value_from(first_byte)?;
+            first = false;
+        }
+    }
+
+    fn skip_number_from(&mut self, first: u8) -> Result<(), StorageError> {
+        if !matches!(first, b'-' | b'0'..=b'9') {
+            return Err(StorageError::CorruptData);
+        }
+
+        loop {
+            let Some(byte) = self.next_byte()? else {
+                return Ok(());
+            };
+            if byte.is_ascii_whitespace() || matches!(byte, b',' | b']' | b'}') {
+                self.unread_byte(byte);
+                return Ok(());
+            }
+            if !matches!(byte, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                return Err(StorageError::CorruptData);
+            }
+        }
+    }
+
+    fn expect_literal(&mut self, literal: &[u8]) -> Result<(), StorageError> {
+        let mut index = 0usize;
+        while index < literal.len() {
+            let byte = self.next_byte()?.ok_or(StorageError::CorruptData)?;
+            if byte != literal[index] {
+                return Err(StorageError::CorruptData);
+            }
+            index += 1;
+        }
+        Ok(())
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<u32, StorageError> {
+        let mut value = 0u32;
+        let mut index = 0usize;
+        while index < 4 {
+            let byte = self.next_byte()?.ok_or(StorageError::CorruptData)?;
+            value = (value << 4) | hex_value(byte)? as u32;
+            index += 1;
+        }
+        Ok(value)
+    }
+}
+
+fn parse_opened_reader_content<S: JsonSource>(
+    source: S,
+) -> Result<OpenedReaderContent, StorageError> {
+    let mut stream = JsonStream::new(source);
+    let mut title = InlineText::new();
+    let mut document = ReadingDocument::boxed_empty();
+    let mut truncated = false;
+    let mut content_found = false;
+    let mut body_found = false;
+    let mut blocks_found = false;
+    let mut kind_is_compact = false;
+
+    stream.parse_object_fields(|stream, key| match key.as_str() {
+        "content" => {
+            content_found = true;
+            stream.parse_object_fields(|stream, key| match key.as_str() {
+                "title" => {
+                    let parsed = stream.parse_string_limited(MAX_PARSED_TITLE_BYTES)?;
+                    if parsed.truncated {
+                        truncated = true;
+                    }
+                    title.set_truncated(parsed.value.as_str());
+                    Ok(())
+                }
+                "body" => {
+                    body_found = true;
+                    stream.parse_object_fields(|stream, key| match key.as_str() {
+                        "kind" => {
+                            let parsed = stream.parse_string_limited(16)?;
+                            if parsed.truncated {
+                                truncated = true;
+                            }
+                            kind_is_compact = parsed.value == "compact";
+                            Ok(())
+                        }
+                        "blocks" => {
+                            blocks_found = true;
+                            stream.parse_array_values(|stream, first| {
+                                if first != b'{' {
+                                    return Err(StorageError::CorruptData);
+                                }
+                                stream.unread_byte(first);
+                                let block = BlockDraft::parse(stream)?;
+                                if block.apply(&mut document) {
+                                    truncated = true;
+                                }
+                                Ok(())
+                            })
+                        }
+                        _ => stream.skip_value(),
+                    })
+                }
+                _ => stream.skip_value(),
+            })
+        }
+        _ => stream.skip_value(),
+    })?;
+
+    if !content_found || !body_found || !blocks_found || !kind_is_compact || document.is_empty() {
+        return Err(StorageError::CorruptData);
+    }
+
+    if title.is_empty() {
+        title.set_truncated("UNTITLED ARTICLE");
+    }
+
+    Ok(OpenedReaderContent {
+        title,
+        document,
+        truncated,
+    })
+}
+
+fn push_limited_char(target: &mut String, ch: char, max_bytes: usize, truncated: &mut bool) {
+    let mut utf8 = [0u8; 4];
+    let encoded = ch.encode_utf8(&mut utf8);
+    push_limited_str(target, encoded, max_bytes, truncated);
+}
+
+fn push_limited_str(target: &mut String, value: &str, max_bytes: usize, truncated: &mut bool) {
+    if *truncated || value.is_empty() {
+        return;
+    }
+
+    if target.len().saturating_add(value.len()) > max_bytes {
+        *truncated = true;
+        return;
+    }
+
+    target.push_str(value);
+}
+
+fn utf8_continuation_len(first: u8) -> Result<usize, StorageError> {
+    match first {
+        0xC2..=0xDF => Ok(1),
+        0xE0..=0xEF => Ok(2),
+        0xF0..=0xF4 => Ok(3),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn hex_value(byte: u8) -> Result<u8, StorageError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn format_list_line(item: &str, ordered: bool, index: usize) -> String {
+    let mut line = String::new();
+    if ordered {
+        let number = index + 1;
+        if number >= 10 {
+            let hundreds = (number / 100) % 10;
+            if hundreds > 0 {
+                line.push((b'0' + hundreds as u8) as char);
+            }
+            let tens = (number / 10) % 10;
+            line.push((b'0' + tens as u8) as char);
+        }
+        line.push((b'0' + (number % 10) as u8) as char);
+        line.push_str(". ");
+    } else {
+        line.push_str("- ");
+    }
+    line.push_str(item);
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+    use core::mem::size_of;
+
+    #[test]
+    fn manifest_snapshot_round_trips() {
+        let mut snapshot = CollectionManifestState::empty();
+        snapshot.serve_id.set_truncated("serve-1");
+        let mut item = CollectionManifestItem::empty();
+        item.remote_item_id.set_truncated("saved-1");
+        item.content_id.set_truncated("content-1");
+        item.title.set_truncated("Example Title");
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.remote_revision = 42;
+        item.remote_status = RemoteContentStatus::Ready;
+        item.package_state = PackageState::Cached;
+        let _ = snapshot.try_push(item);
+
+        let mut encoded = [0u8; MAX_MANIFEST_SNAPSHOT_LEN];
+        let encoded_len =
+            encode_manifest_snapshot(CollectionKind::Saved, &snapshot, &mut encoded).unwrap();
+        let decoded =
+            decode_manifest_snapshot(CollectionKind::Saved, &encoded[..encoded_len]).unwrap();
+
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn cache_index_round_trips() {
+        let mut index = CacheIndex::empty();
+        let mut content_id = InlineText::new();
+        content_id.set_truncated("content-1");
+        index.upsert(CacheEntry {
+            slot_id: 1,
+            content_id,
+            remote_revision: 88,
+            size_bytes: 1234,
+            crc32: 0xDEADBEEF,
+            last_touch_seq: 0,
+            collection_flags: collection_flag(CollectionKind::Saved),
+        });
+
+        let mut encoded = [0u8; MAX_CACHE_INDEX_LEN];
+        let encoded_len = encode_cache_index(&index, &mut encoded).unwrap();
+        let decoded = decode_cache_index(&encoded[..encoded_len]).unwrap();
+
+        assert_eq!(decoded, index);
+    }
+
+    #[test]
+    fn eviction_prefers_recommendations_before_saved() {
+        let mut saved_id = InlineText::new();
+        saved_id.set_truncated("saved");
+        let mut rec_id = InlineText::new();
+        rec_id.set_truncated("rec");
+
+        let saved = CacheEntry {
+            slot_id: 1,
+            content_id: saved_id,
+            remote_revision: 1,
+            size_bytes: 1,
+            crc32: 1,
+            last_touch_seq: 10,
+            collection_flags: collection_flag(CollectionKind::Saved),
+        };
+        let recommendation = CacheEntry {
+            slot_id: 2,
+            content_id: rec_id,
+            remote_revision: 1,
+            size_bytes: 1,
+            crc32: 1,
+            last_touch_seq: 10,
+            collection_flags: collection_flag(CollectionKind::Recommendations),
+        };
+
+        assert_eq!(
+            compare_eviction_priority(recommendation, saved),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn reader_content_parser_opens_compact_payload() {
+        let payload = br#"{
+            "content": {
+                "title": "Example article",
+                "body": {
+                    "kind": "compact",
+                    "blocks": [
+                        {"x": "First paragraph for Motif.", "t": "p"},
+                        {"i": ["Alpha", "Beta"], "o": true, "t": "l"}
+                    ]
+                }
+            }
+        }"#;
+
+        let opened = parse_reader_content_bytes(payload).unwrap();
+
+        assert_eq!(opened.title.as_str(), "Example article");
+        assert!(!opened.truncated);
+        assert_eq!(opened.document.paragraph_count, 3);
+        assert_eq!(
+            opened.document.preview_for_paragraph(1).as_str(),
+            "First paragraph for Motif."
+        );
+    }
+
+    #[test]
+    fn reader_content_parser_rejects_invalid_kind() {
+        let payload = br#"{
+            "content": {
+                "title": "Broken",
+                "body": {
+                    "kind": "full",
+                    "blocks": [{"t": "p", "x": "ignored"}]
+                }
+            }
+        }"#;
+
+        assert_eq!(
+            parse_reader_content_bytes(payload).unwrap_err(),
+            StorageError::CorruptData
+        );
+    }
+
+    #[test]
+    fn reader_content_parser_truncates_oversized_payloads_safely() {
+        let mut payload =
+            String::from(r#"{"content":{"title":"Oversized","body":{"kind":"compact","blocks":["#);
+
+        let mut index = 0usize;
+        while index < 40 {
+            if index > 0 {
+                payload.push(',');
+            }
+            payload.push_str(r#"{"t":"p","x":"alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega"}"#);
+            index += 1;
+        }
+
+        payload.push_str("]}}}");
+        let opened = parse_reader_content_bytes(payload.as_bytes()).unwrap();
+
+        assert!(opened.truncated);
+        assert!(opened.document.unit_count as usize <= MAX_READING_UNITS);
+        assert!(opened.document.paragraph_count as usize <= MAX_READING_PARAGRAPHS);
+        assert!(!opened.document.is_empty());
+    }
+
+    #[test]
+    fn reader_content_and_session_sizes_stay_bounded() {
+        assert!(size_of::<OpenedReaderContent>() < 256);
+        assert!(size_of::<domain::reader::ReaderSession>() < 256);
+        assert!(size_of::<domain::runtime::BootstrapSnapshot>() < 128);
+    }
+
+    #[test]
+    fn sd_layout_conflicts_map_to_corruption() {
+        assert_eq!(
+            map_sd_error::<()>(SdError::OpenedFileAsDir),
+            StorageError::CorruptData
+        );
+        assert_eq!(
+            map_sd_error::<()>(SdError::DeleteDirAsFile),
+            StorageError::CorruptData
+        );
+    }
+}

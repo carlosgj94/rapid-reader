@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(dead_code)]
 
+extern crate alloc;
+
 pub mod content;
 pub mod device;
 pub mod formatter;
@@ -16,5 +18,6 @@ pub mod sleep;
 pub mod source;
 pub mod storage;
 pub mod store;
+pub mod sync;
 pub mod text;
 pub mod ui;

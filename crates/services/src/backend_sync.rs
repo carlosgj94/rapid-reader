@@ -1,9 +1,4 @@
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub enum SyncStatus {
-    #[default]
-    Uninitialized,
-    Idle,
-}
+pub use domain::sync::SyncStatus;
 
 pub trait BackendSyncService {
     fn status(&self) -> SyncStatus;
@@ -15,10 +10,10 @@ pub struct NoopBackendSyncService;
 
 impl BackendSyncService for NoopBackendSyncService {
     fn status(&self) -> SyncStatus {
-        SyncStatus::Uninitialized
+        SyncStatus::Disabled
     }
 
     fn request_refresh(&mut self) -> SyncStatus {
-        SyncStatus::Idle
+        SyncStatus::Disabled
     }
 }

@@ -10,8 +10,8 @@ use domain::settings::AppearanceMode;
 use domain::ui::TopicRegion;
 use embedded_graphics::{
     mono_font::{
-        MonoTextStyleBuilder,
-        ascii::{FONT_5X7, FONT_6X10, FONT_8X13, FONT_10X20},
+        MonoFont, MonoTextStyleBuilder,
+        ascii::{FONT_6X10, FONT_8X13, FONT_10X20},
     },
     pixelcolor::BinaryColor,
     prelude::*,
@@ -25,6 +25,25 @@ pub const MAINTENANCE_REFRESH_TICKS: u8 = 6;
 const RSVP_STAGE_CENTER_X: i32 = 170;
 const RSVP_STAGE_LEFT_ANCHOR_X: i32 = 169;
 const RSVP_STAGE_RIGHT_ANCHOR_X: i32 = 173;
+
+fn ui_font_small() -> &'static MonoFont<'static> {
+    &FONT_6X10
+}
+
+fn ui_font_body() -> &'static MonoFont<'static> {
+    &FONT_8X13
+}
+
+fn ui_font_title() -> &'static MonoFont<'static> {
+    &FONT_10X20
+}
+
+fn stage_font_spec(font: StageFont) -> (&'static MonoFont<'static>, i32) {
+    match font {
+        StageFont::Large | StageFont::Medium => (ui_font_title(), 88),
+        StageFont::Small => (ui_font_body(), 96),
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct AnimationPlayback {
@@ -170,11 +189,11 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         frame,
         shell.items[0].label,
         Point::new(20, 54),
-        &FONT_8X13,
+        ui_font_title(),
         BinaryColor::On,
         Alignment::Left,
     );
-    draw_live_dot(frame, 86, 59, shell.items[0].live_dot);
+    draw_live_dot(frame, 100, 61, shell.items[0].live_dot);
     draw_selection_band(
         frame,
         16,
@@ -188,7 +207,7 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         frame,
         shell.items[1].label,
         Point::new(30, 92),
-        &FONT_10X20,
+        ui_font_title(),
         BinaryColor::Off,
         Alignment::Left,
     );
@@ -202,11 +221,42 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         frame,
         shell.items[2].label,
         Point::new(20, 161),
-        &FONT_8X13,
+        ui_font_title(),
         BinaryColor::On,
         Alignment::Left,
     );
-    draw_live_dot(frame, 102, 166, shell.items[2].live_dot);
+    draw_live_dot(frame, 100, 168, shell.items[2].live_dot);
+
+    if let Some(sync_indicator) = shell.sync_indicator {
+        draw_dashboard_sync_indicator(frame, sync_indicator.label, sync_indicator.spinner_phase);
+    }
+}
+
+fn draw_dashboard_sync_indicator(frame: &mut FrameBuffer, label: &str, spinner_phase: u8) {
+    draw_text(
+        frame,
+        sync_spinner_frame(spinner_phase),
+        Point::new(314, 220),
+        ui_font_small(),
+        BinaryColor::On,
+        Alignment::Left,
+    );
+    draw_text_right(
+        frame,
+        label,
+        Point::new(382, 220),
+        ui_font_small(),
+        BinaryColor::On,
+    );
+}
+
+fn sync_spinner_frame(spinner_phase: u8) -> &'static str {
+    match spinner_phase % 4 {
+        0 => "|",
+        1 => "/",
+        2 => "-",
+        _ => "\\",
+    }
 }
 
 fn draw_collection(
@@ -225,7 +275,7 @@ fn draw_collection(
         frame,
         shell.help.text,
         Point::new(38, 13),
-        &FONT_5X7,
+        ui_font_small(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -234,17 +284,17 @@ fn draw_collection(
 
     draw_text(
         frame,
-        shell.rows[0].meta,
+        shell.rows[0].meta.as_str(),
         Point::new(20, 40 + slide_offset),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
     draw_text(
         frame,
-        shell.rows[0].title,
+        shell.rows[0].title.as_str(),
         Point::new(20, 58 + slide_offset),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -260,17 +310,17 @@ fn draw_collection(
     );
     draw_text(
         frame,
-        shell.rows[1].meta,
+        shell.rows[1].meta.as_str(),
         Point::new(28, 110 + slide_offset),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::Off,
         Alignment::Left,
     );
     draw_text(
         frame,
-        shell.rows[1].title,
+        shell.rows[1].title.as_str(),
         Point::new(28, 127 + slide_offset),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::Off,
         Alignment::Left,
     );
@@ -282,17 +332,17 @@ fn draw_collection(
 
     draw_text(
         frame,
-        shell.rows[2].meta,
+        shell.rows[2].meta.as_str(),
         Point::new(20, 177 + slide_offset),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
     draw_text(
         frame,
-        shell.rows[2].title,
+        shell.rows[2].title.as_str(),
         Point::new(20, 195 + slide_offset),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -301,9 +351,9 @@ fn draw_collection(
 fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
     draw_text(
         frame,
-        shell.stage.title,
+        shell.stage.title.as_str(),
         Point::new(20, 18),
-        &FONT_8X13,
+        ui_font_title(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -311,7 +361,7 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
         frame,
         wpm_label(shell.stage.wpm),
         Point::new(380, 18),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
     );
 
@@ -338,7 +388,7 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
                 frame,
                 badge.label,
                 Point::new(140, 69),
-                &FONT_5X7,
+                ui_font_small(),
                 BinaryColor::Off,
                 Alignment::Left,
             );
@@ -349,7 +399,7 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
         frame,
         shell.stage.preview.as_str(),
         Point::new(20, 184),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -368,8 +418,8 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
 }
 
 fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total_steps: u8) {
-    let width = lerp_u32(96, 264, step, total_steps);
-    let height = lerp_u32(44, 148, step, total_steps);
+    let width = lerp_u32(112, 286, step, total_steps);
+    let height = lerp_u32(52, 166, step, total_steps);
     let x = 200 - (width as i32 / 2);
     let y = 118 - (height as i32 / 2);
 
@@ -379,60 +429,67 @@ fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total
         draw_text(
             frame,
             modal.title,
-            Point::new(x + 84, y + 18),
-            &FONT_8X13,
+            Point::new(200, y + 14),
+            ui_font_title(),
             BinaryColor::Off,
-            Alignment::Left,
+            Alignment::Center,
         );
-        fill_rect(frame, x + 16, y + 38, 232, 1, BinaryColor::Off);
+        fill_rect(
+            frame,
+            x + 16,
+            y + 46,
+            width as i32 - 32,
+            1,
+            BinaryColor::Off,
+        );
     }
 
     if step >= total_steps {
         draw_text(
             frame,
             modal.rows[0].label,
-            Point::new(x + 18, y + 58),
-            &FONT_5X7,
+            Point::new(x + 18, y + 60),
+            ui_font_small(),
             BinaryColor::Off,
             Alignment::Left,
         );
         draw_text(
             frame,
             modal.rows[0].action,
-            Point::new(x + 152, y + 58),
-            &FONT_5X7,
+            Point::new(x + 166, y + 60),
+            ui_font_small(),
             BinaryColor::Off,
             Alignment::Left,
         );
         draw_text(
             frame,
             modal.rows[1].label,
-            Point::new(x + 18, y + 84),
-            &FONT_5X7,
+            Point::new(x + 18, y + 88),
+            ui_font_small(),
             BinaryColor::Off,
             Alignment::Left,
         );
         draw_text(
             frame,
             modal.rows[1].action,
-            Point::new(x + 152, y + 84),
-            &FONT_5X7,
+            Point::new(x + 166, y + 88),
+            ui_font_small(),
             BinaryColor::Off,
             Alignment::Left,
         );
         draw_text(
             frame,
             modal.rows[2].label,
-            Point::new(x + 18, y + 110),
-            &FONT_5X7,
+            Point::new(x + 18, y + 116),
+            ui_font_small(),
             BinaryColor::Off,
             Alignment::Left,
         );
         draw_text(
             frame,
             modal.rows[2].action,
-            Point::new(x + 152, y + 110),
-            &FONT_5X7,
+            Point::new(x + 166, y + 116),
+            ui_font_small(),
             BinaryColor::Off,
             Alignment::Left,
         );
@@ -440,59 +497,22 @@ fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total
 }
 
 fn draw_stage_token(frame: &mut FrameBuffer, left: &str, right: &str, font: StageFont) {
-    match font {
-        StageFont::Large => {
-            draw_text_right(
-                frame,
-                left,
-                Point::new(RSVP_STAGE_LEFT_ANCHOR_X, 88),
-                &FONT_10X20,
-                BinaryColor::On,
-            );
-            draw_text(
-                frame,
-                right,
-                Point::new(RSVP_STAGE_RIGHT_ANCHOR_X, 88),
-                &FONT_10X20,
-                BinaryColor::On,
-                Alignment::Left,
-            );
-        }
-        StageFont::Medium => {
-            draw_text_right(
-                frame,
-                left,
-                Point::new(RSVP_STAGE_LEFT_ANCHOR_X, 96),
-                &FONT_8X13,
-                BinaryColor::On,
-            );
-            draw_text(
-                frame,
-                right,
-                Point::new(RSVP_STAGE_RIGHT_ANCHOR_X, 96),
-                &FONT_8X13,
-                BinaryColor::On,
-                Alignment::Left,
-            );
-        }
-        StageFont::Small => {
-            draw_text_right(
-                frame,
-                left,
-                Point::new(RSVP_STAGE_LEFT_ANCHOR_X, 100),
-                &FONT_6X10,
-                BinaryColor::On,
-            );
-            draw_text(
-                frame,
-                right,
-                Point::new(RSVP_STAGE_RIGHT_ANCHOR_X, 100),
-                &FONT_6X10,
-                BinaryColor::On,
-                Alignment::Left,
-            );
-        }
-    }
+    let (font, y) = stage_font_spec(font);
+    draw_text_right(
+        frame,
+        left,
+        Point::new(RSVP_STAGE_LEFT_ANCHOR_X, y),
+        font,
+        BinaryColor::On,
+    );
+    draw_text(
+        frame,
+        right,
+        Point::new(RSVP_STAGE_RIGHT_ANCHOR_X, y),
+        font,
+        BinaryColor::On,
+        Alignment::Left,
+    );
 }
 
 fn draw_paragraph_navigation(
@@ -503,24 +523,24 @@ fn draw_paragraph_navigation(
 ) {
     draw_text(
         frame,
-        shell.title,
+        shell.title.as_str(),
         Point::new(20, 18),
-        &FONT_8X13,
+        ui_font_title(),
         BinaryColor::On,
         Alignment::Left,
     );
     draw_text_right(
         frame,
-        shell.counter,
+        shell.counter.as_str(),
         Point::new(380, 18),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
     );
     draw_text(
         frame,
-        shell.previous_top,
+        shell.previous_top.as_str(),
         Point::new(20, 58),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -538,34 +558,34 @@ fn draw_paragraph_navigation(
     fill_rect(frame, 20, 88, 304, 82, card_color);
     draw_text(
         frame,
-        shell.selected_label,
+        shell.selected_label.as_str(),
         Point::new(34, 106),
-        &FONT_6X10,
+        ui_font_body(),
         card_text,
         Alignment::Left,
     );
     draw_text(
         frame,
-        shell.selected_excerpt,
+        shell.selected_excerpt.as_str(),
         Point::new(34, 126),
-        &FONT_6X10,
+        ui_font_body(),
         card_text,
         Alignment::Left,
     );
 
     draw_text(
         frame,
-        shell.previous_bottom,
+        shell.previous_bottom.as_str(),
         Point::new(20, 188),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
     draw_text(
         frame,
-        shell.final_excerpt,
+        shell.final_excerpt.as_str(),
         Point::new(20, 210),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -589,14 +609,14 @@ fn draw_settings(frame: &mut FrameBuffer, shell: &SettingsShell, step: u8, total
         frame,
         shell.title,
         Point::new(20, 18),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
 
     let selected_row = shell.rows.iter().position(|row| row.selected).unwrap_or(0);
     let band_y = settings_band_y(selected_row);
-    draw_selection_band(frame, 20, band_y, 320, 30, step, total_steps);
+    draw_selection_band(frame, 20, band_y, 320, 34, step, total_steps);
 
     let mut index = 0;
     while index < shell.rows.len() {
@@ -617,7 +637,7 @@ fn draw_settings(frame: &mut FrameBuffer, shell: &SettingsShell, step: u8, total
             frame,
             shell.rows[index].label,
             Point::new(if is_selected { 32 } else { 20 }, label_y),
-            &FONT_6X10,
+            ui_font_body(),
             text_color,
             Alignment::Left,
         );
@@ -627,7 +647,7 @@ fn draw_settings(frame: &mut FrameBuffer, shell: &SettingsShell, step: u8, total
                 frame,
                 value,
                 Point::new(320, label_y),
-                &FONT_5X7,
+                ui_font_small(),
                 text_color,
             );
         }
@@ -637,7 +657,7 @@ fn draw_settings(frame: &mut FrameBuffer, shell: &SettingsShell, step: u8, total
                 frame,
                 ">",
                 Point::new(326, label_y),
-                &FONT_6X10,
+                ui_font_body(),
                 if is_selected {
                     BinaryColor::Off
                 } else {
@@ -651,22 +671,22 @@ fn draw_settings(frame: &mut FrameBuffer, shell: &SettingsShell, step: u8, total
     }
 
     if let (Some(title), Some(body)) = (shell.refresh_title, shell.refresh_body) {
-        stroke_rect(frame, 74, 70, 252, 92, BinaryColor::On);
+        stroke_rect(frame, 58, 62, 268, 106, BinaryColor::On);
         draw_text(
             frame,
             title,
-            Point::new(108, 100),
-            &FONT_8X13,
+            Point::new(192, 82),
+            ui_font_title(),
             BinaryColor::On,
-            Alignment::Left,
+            Alignment::Center,
         );
         draw_text(
             frame,
             body,
-            Point::new(112, 126),
-            &FONT_6X10,
+            Point::new(192, 118),
+            ui_font_body(),
             BinaryColor::On,
-            Alignment::Left,
+            Alignment::Center,
         );
     }
 }
@@ -676,16 +696,16 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
         frame,
         grid.title,
         Point::new(20, 18),
-        &FONT_6X10,
+        ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
     );
 
     let category_positions = [
-        (20, 54, 108, 24, 32, 60),
-        (20, 89, 104, 22, 20, 95),
-        (20, 113, 104, 22, 20, 119),
-        (20, 137, 104, 22, 20, 143),
+        (20, 54, 112, 28, 28, 61),
+        (20, 90, 112, 28, 28, 97),
+        (20, 126, 112, 28, 28, 133),
+        (20, 162, 112, 28, 28, 169),
     ];
     let mut category_index = 0;
     while category_index < grid.categories.len() {
@@ -698,7 +718,7 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
                 frame,
                 category.label,
                 Point::new(text_x, text_y),
-                &FONT_6X10,
+                ui_font_body(),
                 BinaryColor::Off,
                 Alignment::Left,
             );
@@ -707,7 +727,7 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
                 frame,
                 category.label,
                 Point::new(text_x, text_y),
-                &FONT_6X10,
+                ui_font_body(),
                 BinaryColor::On,
                 Alignment::Left,
             );
@@ -716,16 +736,16 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
         category_index += 1;
     }
 
-    fill_rect(frame, 144, 54, 1, 148, BinaryColor::On);
+    fill_rect(frame, 148, 54, 1, 150, BinaryColor::On);
 
     let chip_layout = [
-        (164, 54, 92, 22),
-        (262, 54, 78, 22),
-        (164, 84, 96, 22),
-        (266, 84, 72, 22),
-        (164, 114, 50, 22),
-        (220, 114, 58, 22),
-        (284, 114, 56, 22),
+        (164, 54, 80, 24),
+        (250, 54, 90, 24),
+        (164, 86, 100, 24),
+        (270, 86, 70, 24),
+        (164, 118, 84, 24),
+        (254, 118, 86, 24),
+        (164, 150, 72, 24),
     ];
 
     let mut index = 0;
@@ -740,8 +760,8 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
             draw_text(
                 frame,
                 chip.label,
-                Point::new(x + 10, y + 5),
-                &FONT_5X7,
+                Point::new(x + 10, y + 7),
+                ui_font_small(),
                 BinaryColor::Off,
                 Alignment::Left,
             );
@@ -750,8 +770,8 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
             draw_text(
                 frame,
                 chip.label,
-                Point::new(x + 10, y + 5),
-                &FONT_5X7,
+                Point::new(x + 10, y + 7),
+                ui_font_small(),
                 BinaryColor::On,
                 Alignment::Left,
             );
@@ -760,8 +780,8 @@ fn draw_topic_preferences(frame: &mut FrameBuffer, grid: &TopicPreferenceGrid) {
             draw_text(
                 frame,
                 chip.label,
-                Point::new(x + 10, y + 5),
-                &FONT_5X7,
+                Point::new(x + 10, y + 7),
+                ui_font_small(),
                 BinaryColor::On,
                 Alignment::Left,
             );
@@ -787,7 +807,7 @@ fn draw_status_cluster(frame: &mut FrameBuffer, battery_percent: u8, wifi_online
         frame,
         battery_label(battery_percent),
         Point::new(353, 13),
-        &FONT_5X7,
+        ui_font_small(),
         BinaryColor::On,
         Alignment::Left,
     );
@@ -798,7 +818,7 @@ fn draw_vertical_rail(frame: &mut FrameBuffer, text: &str, right_edge: i32, y: i
         frame,
         text,
         Point::new(right_edge, y),
-        &FONT_10X20,
+        ui_font_title(),
         BinaryColor::On,
     );
 }
@@ -1085,36 +1105,36 @@ const fn lerp_u32(start: u32, end: u32, step: u8, total_steps: u8) -> u32 {
 
 const fn settings_band_y(selected_row: usize) -> i32 {
     match selected_row {
-        0 => 46,
-        1 => 88,
-        2 => 121,
-        3 => 154,
-        4 => 187,
-        5 => 218,
-        _ => 46,
+        0 => 42,
+        1 => 78,
+        2 => 114,
+        3 => 150,
+        4 => 186,
+        5 => 204,
+        _ => 42,
     }
 }
 
 const fn settings_label_y(selected_row: usize) -> i32 {
     match selected_row {
-        0 => 54,
-        1 => 95,
-        2 => 128,
-        3 => 161,
-        4 => 194,
-        5 => 224,
-        _ => 54,
+        0 => 51,
+        1 => 87,
+        2 => 123,
+        3 => 159,
+        4 => 195,
+        5 => 213,
+        _ => 51,
     }
 }
 
 const fn settings_separator_y(index: usize) -> i32 {
     match index {
-        0 => 86,
-        1 => 119,
+        0 => 80,
+        1 => 116,
         2 => 152,
-        3 => 185,
-        4 => 218,
-        _ => 218,
+        3 => 188,
+        4 => 224,
+        _ => 224,
     }
 }
 

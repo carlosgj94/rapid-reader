@@ -1,3 +1,6 @@
+use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+use alloc::boxed::Box;
+
 use crate::{
     content::{ArticleDocument, ReaderScript, script_paragraph, script_paragraph_count},
     text::InlineText,
@@ -66,6 +69,13 @@ impl ReadingDocument {
         }
     }
 
+    pub fn boxed_empty() -> Box<Self> {
+        let layout = Layout::new::<Self>();
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = core::ptr::NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
+        unsafe { Box::from_raw(ptr.as_ptr().cast::<Self>()) }
+    }
+
     pub const fn is_empty(&self) -> bool {
         self.unit_count == 0
     }
@@ -92,11 +102,19 @@ impl ReadingDocument {
         self.paragraphs[safe_index].start_unit_index
     }
 
-    fn push_paragraph(&mut self, paragraph_index: u8, paragraph: &str) {
+    pub fn push_paragraph_text(&mut self, paragraph: &str) -> bool {
+        if paragraph.is_empty() || self.paragraph_count as usize >= MAX_READING_PARAGRAPHS {
+            return false;
+        }
+
+        self.push_paragraph(self.paragraph_count.saturating_add(1), paragraph)
+    }
+
+    fn push_paragraph(&mut self, paragraph_index: u8, paragraph: &str) -> bool {
         if paragraph_index as usize > MAX_READING_PARAGRAPHS
             || self.unit_count as usize >= MAX_READING_UNITS
         {
-            return;
+            return false;
         }
 
         let paragraph_slot = paragraph_index.saturating_sub(1) as usize;
@@ -108,6 +126,7 @@ impl ReadingDocument {
 
         let mut index = 0usize;
         let mut first_unit = true;
+        let mut complete = true;
 
         while let Some((start, end)) = next_chunk_bounds(paragraph, index) {
             index = end;
@@ -122,6 +141,7 @@ impl ReadingDocument {
             first_unit = false;
 
             if self.unit_count as usize >= MAX_READING_UNITS {
+                complete = false;
                 break;
             }
         }
@@ -130,6 +150,8 @@ impl ReadingDocument {
             let last_index = self.unit_count as usize - 1;
             self.units[last_index].flags.paragraph_end = true;
         }
+
+        complete && index >= paragraph.len()
     }
 
     fn attach_standalone_punctuation(&mut self, chunk: &str) {
