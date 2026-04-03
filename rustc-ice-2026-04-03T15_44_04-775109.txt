@@ -1,0 +1,43 @@
+thread 'rustc' panicked at /home/rust/rust/compiler/rustc_query_system/src/query/plumbing.rs:739:9:
+Found unstable fingerprints for asyncness(platform_esp32s3[9f10]::content_storage::{impl#22}::fmt): No
+stack backtrace:
+   0:     0x7f0dbde29235 - std::backtrace::Backtrace::create::h33f58e410438e057
+   1:     0x7f0dbde29185 - std::backtrace::Backtrace::force_capture::h50fee9d4477113a7
+   2:     0x7f0db5e172e8 - std[62719d22eabff8a3]::panicking::update_hook::<alloc[8f606001954742e1]::boxed::Box<rustc_driver_impl[1e6664fa524f5856]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x7f0dbde1c37b - std::panicking::panic_with_hook::h0705227f9b1d898f
+   4:     0x7f0dbddf9a4a - std::panicking::panic_handler::{{closure}}::h52508074a503b693
+   5:     0x7f0dbddf9609 - std::sys::backtrace::__rust_end_short_backtrace::hed52233b999d74f5
+   6:     0x7f0dbde185cd - __rustc[38e1a0d78d9c0d1b]::rust_begin_unwind
+   7:     0x7f0dbde92830 - core::panicking::panic_fmt::h18a5c0f6641d7367
+   8:     0x7f0dbd646b8e - rustc_query_system[db99815d866ed76a]::query::plumbing::incremental_verify_ich_failed::<rustc_middle[39937188df802d05]::ty::context::TyCtxt>
+   9:     0x7f0dbc50cf06 - rustc_query_system[db99815d866ed76a]::query::plumbing::incremental_verify_ich::<rustc_middle[39937188df802d05]::ty::context::TyCtxt, rustc_middle[39937188df802d05]::query::erase::Erased<[u8; 1usize]>>
+  10:     0x7f0dbc4e0ba0 - <std[62719d22eabff8a3]::thread::local::LocalKey<core[dd1976961eee0119]::cell::Cell<*const ()>>>::with::<rustc_middle[39937188df802d05]::ty::context::tls::enter_context<rustc_query_system[db99815d866ed76a]::query::plumbing::execute_job_incr<rustc_query_impl[7d629c340fb8c9d6]::DynamicConfig<rustc_query_system[db99815d866ed76a]::query::caches::DefIdCache<rustc_middle[39937188df802d05]::query::erase::Erased<[u8; 1usize]>>, false, false, false>, rustc_query_impl[7d629c340fb8c9d6]::plumbing::QueryCtxt>::{closure#1}, core[dd1976961eee0119]::option::Option<(rustc_middle[39937188df802d05]::query::erase::Erased<[u8; 1usize]>, rustc_query_system[db99815d866ed76a]::dep_graph::graph::DepNodeIndex)>>::{closure#0}, core[dd1976961eee0119]::option::Option<(rustc_middle[39937188df802d05]::query::erase::Erased<[u8; 1usize]>, rustc_query_system[db99815d866ed76a]::dep_graph::graph::DepNodeIndex)>>
+  11:     0x7f0dbc3f3603 - rustc_query_system[db99815d866ed76a]::query::plumbing::try_execute_query::<rustc_query_impl[7d629c340fb8c9d6]::DynamicConfig<rustc_query_system[db99815d866ed76a]::query::caches::DefIdCache<rustc_middle[39937188df802d05]::query::erase::Erased<[u8; 1usize]>>, false, false, false>, rustc_query_impl[7d629c340fb8c9d6]::plumbing::QueryCtxt, true>
+  12:     0x7f0dbc69504d - rustc_query_impl[7d629c340fb8c9d6]::query_impl::asyncness::get_query_incr::__rust_end_short_backtrace
+  13:     0x7f0dbcec3887 - <rustc_metadata[7b866520e288ce6f]::rmeta::encoder::EncodeContext>::encode_def_ids
+  14:     0x7f0dbceba199 - <rustc_metadata[7b866520e288ce6f]::rmeta::encoder::EncodeContext>::encode_crate_root
+  15:     0x7f0dbceb5adc - rustc_metadata[7b866520e288ce6f]::rmeta::encoder::encode_metadata::{closure#3}::{closure#0}
+  16:     0x7f0dbced0420 - <rustc_metadata[7b866520e288ce6f]::rmeta::encoder::encode_metadata::{closure#3} as core[dd1976961eee0119]::ops::function::FnOnce<(rustc_middle[39937188df802d05]::ty::context::TyCtxt, &std[62719d22eabff8a3]::path::Path)>>::call_once
+  17:     0x7f0dbcecc090 - rustc_metadata[7b866520e288ce6f]::rmeta::encoder::encode_metadata
+  18:     0x7f0dbcfcf8f6 - rustc_metadata[7b866520e288ce6f]::fs::encode_and_write_metadata
+  19:     0x7f0db6145301 - rustc_interface[a2500c6c7097cc69]::passes::start_codegen
+  20:     0x7f0db61b382a - <rustc_interface[a2500c6c7097cc69]::queries::Linker>::codegen_and_build_linker
+  21:     0x7f0db5e44b93 - <std[62719d22eabff8a3]::thread::local::LocalKey<core[dd1976961eee0119]::cell::Cell<*const ()>>>::with::<rustc_middle[39937188df802d05]::ty::context::tls::enter_context<<rustc_middle[39937188df802d05]::ty::context::GlobalCtxt>::enter<rustc_interface[a2500c6c7097cc69]::passes::create_and_enter_global_ctxt<core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>, rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}::{closure#2}>::{closure#2}::{closure#0}, core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>>::{closure#1}, core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>>::{closure#0}, core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>>
+  22:     0x7f0db5e6a57b - <rustc_middle[39937188df802d05]::ty::context::TyCtxt>::create_global_ctxt::<core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>, rustc_interface[a2500c6c7097cc69]::passes::create_and_enter_global_ctxt<core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>, rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}::{closure#2}>::{closure#2}::{closure#0}>
+  23:     0x7f0db5e0e6d0 - <rustc_interface[a2500c6c7097cc69]::passes::create_and_enter_global_ctxt<core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>, rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}::{closure#2}>::{closure#2} as core[dd1976961eee0119]::ops::function::FnOnce<(&rustc_session[3b235475893653ac]::session::Session, rustc_middle[39937188df802d05]::ty::context::CurrentGcx, alloc[8f606001954742e1]::sync::Arc<rustc_data_structures[62dba797fd6e7380]::jobserver::Proxy>, &std[62719d22eabff8a3]::sync::once_lock::OnceLock<rustc_middle[39937188df802d05]::ty::context::GlobalCtxt>, &rustc_data_structures[62dba797fd6e7380]::sync::worker_local::WorkerLocal<rustc_middle[39937188df802d05]::arena::Arena>, &rustc_data_structures[62dba797fd6e7380]::sync::worker_local::WorkerLocal<rustc_hir[19ee8e02d18e4bea]::Arena>, rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}::{closure#2})>>::call_once::{shim:vtable#0}
+  24:     0x7f0db5df9735 - rustc_interface[a2500c6c7097cc69]::passes::create_and_enter_global_ctxt::<core[dd1976961eee0119]::option::Option<rustc_interface[a2500c6c7097cc69]::queries::Linker>, rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}::{closure#2}>
+  25:     0x7f0db5e505bf - rustc_span[187d41343d7e53a1]::create_session_globals_then::<(), rustc_interface[a2500c6c7097cc69]::util::run_in_thread_with_globals<rustc_interface[a2500c6c7097cc69]::util::run_in_thread_pool_with_globals<rustc_interface[a2500c6c7097cc69]::interface::run_compiler<(), rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}::{closure#0}>
+  26:     0x7f0db5e896c9 - std[62719d22eabff8a3]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[a2500c6c7097cc69]::util::run_in_thread_with_globals<rustc_interface[a2500c6c7097cc69]::util::run_in_thread_pool_with_globals<rustc_interface[a2500c6c7097cc69]::interface::run_compiler<(), rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  27:     0x7f0db5e8c4ee - <<std[62719d22eabff8a3]::thread::Builder>::spawn_unchecked_<rustc_interface[a2500c6c7097cc69]::util::run_in_thread_with_globals<rustc_interface[a2500c6c7097cc69]::util::run_in_thread_pool_with_globals<rustc_interface[a2500c6c7097cc69]::interface::run_compiler<(), rustc_driver_impl[1e6664fa524f5856]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[dd1976961eee0119]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  28:     0x7f0dbde32987 - std::sys::thread::unix::Thread::new::thread_start::h0a6a8ae11a158e1b
+  29:     0x7f0db0ea9ad3 - <unknown>
+  30:     0x7f0db0f4067c - <unknown>
+  31:                0x0 - <unknown>
+
+
+rustc version: 1.92.0-nightly (1e93cde56 2025-12-10) (1.92.0.0)
+platform: x86_64-unknown-linux-gnu
+
+query stack during panic:
+#0 [asyncness] checking if the function is async: `content_storage::<impl at crates/platform-esp32s3/src/content_storage.rs:124:10: 124:15>::fmt`
+end of query stack
