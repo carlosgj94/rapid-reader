@@ -65,11 +65,13 @@ const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
 const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
 const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 512;
+const STARTUP_SAVED_PREFETCH_LIMIT: usize = 4;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const BACKEND_CA_CHAIN_PEM: &str =
     concat!(include_str!("../certs/letsencrypt_isrg_root_x1.pem"), "\0");
 const BACKEND_CMD_QUEUE_CAPACITY: usize = 4;
 type BackendTcpClientState = TcpClientState<1, 1024, 1024>;
+type BackendTcpClient<'a> = TcpClient<'a, 1, 1024, 1024>;
 
 static BACKEND_CMD_CH: Channel<
     CriticalSectionRawMutex,
@@ -114,6 +116,27 @@ struct RefreshSession {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+struct ActiveAccessSession {
+    access_token: heapless::String<1536>,
+    valid_until_ms: u64,
+}
+
+impl ActiveAccessSession {
+    fn from_refresh_session(session: &RefreshSession, now_ms: u64) -> Self {
+        let ttl_ms = session.expires_in.saturating_mul(1000);
+        let refresh_margin_ms = 60_000u64.min(ttl_ms.saturating_div(4));
+        Self {
+            access_token: session.access_token.clone(),
+            valid_until_ms: now_ms.saturating_add(ttl_ms.saturating_sub(refresh_margin_ms)),
+        }
+    }
+
+    fn is_valid_at(&self, now_ms: u64) -> bool {
+        now_ms < self.valid_until_ms && !self.access_token.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct MeProfile {
     user_id: heapless::String<64>,
     role: heapless::String<32>,
@@ -133,7 +156,6 @@ struct CollectionFetchResult {
     collection: CollectionManifestState,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
 struct StartupSyncResult {
     refresh_session: RefreshSession,
     saved_result: Result<CollectionFetchResult, CollectionQueryError>,
@@ -307,13 +329,15 @@ async fn backend_task(
         let network = wait_for_network(stack).await;
         info!("backend network ready ip={:?}", network.address);
         log_heap("backend network ready");
+        let mut tcp_client = BackendTcpClient::new(stack, tcp_state.as_ref());
+        tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
 
         log_status(SyncStatus::RefreshingSession);
         let startup_sync = match perform_startup_refresh_and_saved_sync(
             stack,
             tls.reference(),
             &ca_chain,
-            tcp_state.as_ref(),
+            &tcp_client,
             &current.credential,
         )
         .await
@@ -356,6 +380,10 @@ async fn backend_task(
                 info!("backend credential persistence skipped: {:?}", err);
             }
         }
+        let mut access_session = Some(ActiveAccessSession::from_refresh_session(
+            &startup_sync.refresh_session,
+            now_ms(),
+        ));
 
         sync_one_collection(
             CollectionKind::Saved,
@@ -374,6 +402,7 @@ async fn backend_task(
                         &ca_chain,
                         tcp_state.as_ref(),
                         &mut current,
+                        &mut access_session,
                         request,
                     )
                     .await;
@@ -386,6 +415,7 @@ async fn backend_task(
                         &ca_chain,
                         tcp_state.as_ref(),
                         &mut current,
+                        &mut access_session,
                         request,
                     )
                     .await;
@@ -585,11 +615,11 @@ async fn sync_collection_manifests(
     .await;
 }
 
-async fn perform_startup_refresh_and_saved_sync(
+async fn perform_startup_refresh_and_saved_sync<'a>(
     stack: Stack<'static>,
-    tls: TlsReference<'_>,
+    tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
-    tcp_state: &BackendTcpClientState,
+    tcp_client: &'a BackendTcpClient<'a>,
     credential: &BackendCredential,
 ) -> Result<StartupSyncResult, RefreshError> {
     let refresh_token = credential
@@ -599,9 +629,6 @@ async fn perform_startup_refresh_and_saved_sync(
         "backend refresh building request token_len={}",
         refresh_token.len()
     );
-
-    let mut tcp_client = TcpClient::new(stack, tcp_state);
-    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
 
     let dns = DnsSocket::new(stack);
     let remote = dns
@@ -705,11 +732,17 @@ async fn perform_startup_refresh_and_saved_sync(
     log_status(SyncStatus::SyncingContent);
     info!("backend startup sync mode=saved-only");
 
-    let saved_result = perform_saved_content_fetch_over_session(
+    let mut saved_result = perform_saved_content_fetch_over_session(
         &mut session,
         refresh_session.access_token.as_str(),
+        false,
     )
     .await;
+
+    if let Ok(result) = &mut saved_result {
+        prefetch_startup_saved_content(&mut session, refresh_session.access_token.as_str(), result)
+            .await;
+    }
 
     if let Err(err) = session.close().await {
         info!("backend tls close failed: {:?}", err);
@@ -719,6 +752,102 @@ async fn perform_startup_refresh_and_saved_sync(
         refresh_session,
         saved_result,
     })
+}
+
+async fn prefetch_startup_saved_content<T>(
+    session: &mut Session<'_, T>,
+    access_token: &str,
+    result: &mut CollectionFetchResult,
+) where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    let mut prefetched = 0usize;
+    let mut index = 0usize;
+    while index < result.collection.len() && prefetched < STARTUP_SAVED_PREFETCH_LIMIT {
+        let item = result.collection.items[index];
+        index += 1;
+
+        if !item.can_prepare() {
+            continue;
+        }
+        let request = PrepareContentRequest::from_manifest(CollectionKind::Saved, item);
+        match fetch_and_stage_package_over_session(session, access_token, request).await {
+            Ok(snapshot) => {
+                result.collection = snapshot;
+                prefetched += 1;
+                info!(
+                    "backend startup saved prefetch ok content_id={} count={}",
+                    request.content_id.as_str(),
+                    prefetched,
+                );
+            }
+            Err(PackagePrepareError::PendingRemote) => {
+                info!(
+                    "backend startup saved prefetch pending remote content_id={}",
+                    request.content_id.as_str(),
+                );
+            }
+            Err(PackagePrepareError::Rejected(status)) => {
+                info!(
+                    "backend startup saved prefetch rejected status={} content_id={}",
+                    status,
+                    request.content_id.as_str(),
+                );
+                break;
+            }
+            Err(PackagePrepareError::Other(err)) => {
+                info!(
+                    "backend startup saved prefetch failed content_id={} err={:?}",
+                    request.content_id.as_str(),
+                    err,
+                );
+                break;
+            }
+        }
+    }
+}
+
+async fn ensure_access_session(
+    stack: Stack<'static>,
+    tls: TlsReference<'_>,
+    ca_chain: &Certificate<'static>,
+    tcp_state: &BackendTcpClientState,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+) -> Result<(), RefreshError> {
+    let now_ms = now_ms();
+    if access_session
+        .as_ref()
+        .is_some_and(|session| session.is_valid_at(now_ms))
+    {
+        info!("backend access session reuse");
+        return Ok(());
+    }
+
+    log_status(SyncStatus::RefreshingSession);
+    let refresh_session =
+        perform_refresh(stack, tls, ca_chain, tcp_state, &current.credential).await?;
+    info!(
+        "backend access session refreshed expires_in={}s",
+        refresh_session.expires_in
+    );
+
+    if let Ok(credential) =
+        BackendCredential::from_refresh_token(refresh_session.refresh_token.as_str())
+    {
+        *current = StartupCredential {
+            credential,
+            source: CredentialSource::Stored,
+        };
+        persist_backend_credential(credential).await;
+        info!("backend credential persisted");
+    }
+
+    *access_session = Some(ActiveAccessSession::from_refresh_session(
+        &refresh_session,
+        now_ms,
+    ));
+    Ok(())
 }
 
 async fn sync_one_collection(
@@ -776,6 +905,7 @@ async fn handle_prepare_content_request(
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
     current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
     request: PrepareContentRequest,
 ) {
     if request.remote_item_id.is_empty() || request.content_id.is_empty() {
@@ -796,60 +926,39 @@ async fn handle_prepare_content_request(
         return;
     }
 
-    log_status(SyncStatus::RefreshingSession);
-    let refresh_session =
-        match perform_refresh(stack, tls, ca_chain, tcp_state, &current.credential).await {
-            Ok(session) => session,
-            Err(RefreshError::Rejected(status)) => {
+    if let Err(err) =
+        ensure_access_session(stack, tls, ca_chain, tcp_state, current, access_session).await
+    {
+        match err {
+            RefreshError::Rejected(status) => {
                 log_status(SyncStatus::AuthFailed);
                 info!(
                     "backend content prepare refresh rejected status={} source={}",
                     status,
                     current.source.label(),
                 );
-                let _ = publish_package_state(
-                    request.collection,
-                    request.remote_item_id,
-                    PackageState::Failed,
-                )
-                .await;
-                return;
             }
-            Err(RefreshError::Other(err)) => {
+            RefreshError::Other(err) => {
                 log_status(SyncStatus::TransportFailed);
                 info!("backend content prepare refresh failed: {:?}", err);
-                let _ = publish_package_state(
-                    request.collection,
-                    request.remote_item_id,
-                    PackageState::Failed,
-                )
-                .await;
-                return;
             }
-        };
-
-    if let Ok(credential) =
-        BackendCredential::from_refresh_token(refresh_session.refresh_token.as_str())
-    {
-        *current = StartupCredential {
-            credential,
-            source: CredentialSource::Stored,
-        };
-        persist_backend_credential(credential).await;
+        }
+        let _ = publish_package_state(
+            request.collection,
+            request.remote_item_id,
+            PackageState::Failed,
+        )
+        .await;
+        return;
     }
 
     log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.as_str())
+        .unwrap_or("");
 
-    match fetch_and_stage_package(
-        stack,
-        tls,
-        ca_chain,
-        tcp_state,
-        refresh_session.access_token.as_str(),
-        request,
-    )
-    .await
-    {
+    match fetch_and_stage_package(stack, tls, ca_chain, tcp_state, access_token, request).await {
         Ok(snapshot) => {
             publish_event(
                 Event::CollectionContentUpdated(request.collection, Box::new(snapshot)),
@@ -860,6 +969,38 @@ async fn handle_prepare_content_request(
                 request.collection,
                 request.content_id.as_str(),
             );
+            match content_storage::open_cached_reader_content(request.content_id).await {
+                Ok(opened) => {
+                    publish_event(
+                        Event::ReaderContentOpened {
+                            collection: request.collection,
+                            title: opened.title,
+                            document: opened.document,
+                        },
+                        now_ms(),
+                    );
+                    info!(
+                        "backend content opened after prepare collection={:?} content_id={} truncated={}",
+                        request.collection,
+                        request.content_id.as_str(),
+                        opened.truncated,
+                    );
+                }
+                Err(err) => {
+                    let _ = publish_package_state(
+                        request.collection,
+                        request.remote_item_id,
+                        PackageState::Failed,
+                    )
+                    .await;
+                    info!(
+                        "backend content open after prepare failed collection={:?} content_id={} err={:?}",
+                        request.collection,
+                        request.content_id.as_str(),
+                        err,
+                    );
+                }
+            }
         }
         Err(PackagePrepareError::PendingRemote) => {
             let _ = publish_package_state(
@@ -904,6 +1045,7 @@ async fn handle_open_remote_content_request(
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
     current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
     request: PrepareContentRequest,
 ) {
     if request.remote_item_id.is_empty() || request.content_id.is_empty() {
@@ -918,47 +1060,33 @@ async fn handle_open_remote_content_request(
         return;
     }
 
-    log_status(SyncStatus::RefreshingSession);
-    let refresh_session =
-        match perform_refresh(stack, tls, ca_chain, tcp_state, &current.credential).await {
-            Ok(session) => session,
-            Err(RefreshError::Rejected(status)) => {
+    if let Err(err) =
+        ensure_access_session(stack, tls, ca_chain, tcp_state, current, access_session).await
+    {
+        match err {
+            RefreshError::Rejected(status) => {
                 log_status(SyncStatus::AuthFailed);
                 info!(
                     "backend content open refresh rejected status={} source={}",
                     status,
                     current.source.label(),
                 );
-                return;
             }
-            Err(RefreshError::Other(err)) => {
+            RefreshError::Other(err) => {
                 log_status(SyncStatus::TransportFailed);
                 info!("backend content open refresh failed: {:?}", err);
-                return;
             }
-        };
-
-    if let Ok(credential) =
-        BackendCredential::from_refresh_token(refresh_session.refresh_token.as_str())
-    {
-        *current = StartupCredential {
-            credential,
-            source: CredentialSource::Stored,
-        };
-        persist_backend_credential(credential).await;
+        }
+        return;
     }
 
     log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.as_str())
+        .unwrap_or("");
 
-    match fetch_opened_reader_content(
-        stack,
-        tls,
-        ca_chain,
-        tcp_state,
-        refresh_session.access_token.as_str(),
-        request,
-    )
-    .await
+    match fetch_opened_reader_content(stack, tls, ca_chain, tcp_state, access_token, request).await
     {
         Ok(opened) => {
             publish_event(
@@ -1608,6 +1736,61 @@ async fn fetch_and_stage_package(
     Ok(snapshot)
 }
 
+async fn fetch_and_stage_package_over_session<T>(
+    session: &mut Session<'_, T>,
+    access_token: &str,
+    request: PrepareContentRequest,
+) -> Result<CollectionManifestState, PackagePrepareError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    let path = build_detail_path(request).map_err(PackagePrepareError::Other)?;
+    content_storage::begin_package_stage(request.content_id, request.remote_revision)
+        .await
+        .map_err(map_storage_prepare_error)?;
+
+    let status = match stream_https_response_body_to_storage_over_session(
+        session,
+        HttpRequest {
+            method: "GET",
+            path: path.as_str(),
+            content_type: Some("application/json"),
+            bearer_token: Some(access_token),
+            body: b"",
+            connection_close: false,
+        },
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            let _ = content_storage::abort_package_stage().await;
+            return Err(PackagePrepareError::Other(err));
+        }
+    };
+
+    if (400..500).contains(&status) {
+        let _ = content_storage::abort_package_stage().await;
+        return Err(PackagePrepareError::Rejected(status));
+    }
+    if status != 200 {
+        let _ = content_storage::abort_package_stage().await;
+        return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
+    }
+
+    let snapshot =
+        content_storage::commit_package_stage(request.collection, request.remote_item_id)
+            .await
+            .map_err(map_storage_prepare_error)?;
+
+    if manifest_item_state(&snapshot, &request.remote_item_id) == Some(PackageState::PendingRemote)
+    {
+        return Err(PackagePrepareError::PendingRemote);
+    }
+
+    Ok(snapshot)
+}
+
 async fn fetch_opened_reader_content(
     stack: Stack<'static>,
     tls: TlsReference<'_>,
@@ -1736,7 +1919,12 @@ async fn stream_https_response_body_to_storage(
     )
     .await?;
 
-    let response = read_streaming_http_response_to_storage(&mut session, request.path).await;
+    let response = read_streaming_http_response_to_storage(
+        &mut session,
+        request.path,
+        request.connection_close,
+    )
+    .await;
     if let Err(err) = session.close().await {
         info!("backend tls close failed: {:?}", err);
     }
@@ -1753,9 +1941,44 @@ async fn stream_https_response_body_to_storage(
     }
 }
 
+async fn stream_https_response_body_to_storage_over_session<T>(
+    session: &mut Session<'_, T>,
+    request: HttpRequest<'_>,
+) -> Result<u16, BackendError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    info!("backend request write start path={}", request.path);
+    write_http_request(
+        session,
+        request.path,
+        request.method,
+        request.content_type,
+        request.bearer_token,
+        request.body,
+        request.connection_close,
+    )
+    .await?;
+
+    let response =
+        read_streaming_http_response_to_storage(session, request.path, request.connection_close)
+            .await;
+    match response {
+        Ok(status) => {
+            log_request_heap(request.path, "stream ok");
+            Ok(status)
+        }
+        Err(err) => {
+            log_request_heap(request.path, "stream failed");
+            Err(err)
+        }
+    }
+}
+
 async fn read_streaming_http_response_to_storage<T>(
     session: &mut Session<'_, T>,
     path: &str,
+    connection_close: bool,
 ) -> Result<u16, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -1779,17 +2002,53 @@ where
         let Some(header_end) = find_subslice(&header[..header_len], b"\r\n\r\n") else {
             continue;
         };
-        let status = parse_http_status(&header[..header_len])?;
+        let metadata = parse_http_response_metadata(&header[..header_len])?;
         let body_start = header_end + 4;
-        if status == 200 && header_len > body_start {
-            content_storage::write_package_chunk(&header[body_start..header_len])
-                .await
-                .map_err(map_storage_backend_error)?;
+        if metadata.status != 200 {
+            return Ok(metadata.status);
         }
-        if status != 200 {
-            return Ok(status);
+
+        let initial_body_len = header_len.saturating_sub(body_start);
+        match metadata.content_length {
+            Some(content_length) => {
+                if initial_body_len > content_length {
+                    return Err(BackendError::InvalidResponse);
+                }
+                if initial_body_len > 0 {
+                    content_storage::write_package_chunk(&header[body_start..header_len])
+                        .await
+                        .map_err(map_storage_backend_error)?;
+                }
+
+                let mut remaining = content_length - initial_body_len;
+                let mut chunk = [0u8; PACKAGE_DOWNLOAD_CHUNK_LEN];
+                while remaining > 0 {
+                    let read_len = remaining.min(chunk.len());
+                    let read = AsyncRead07::read(session, &mut chunk[..read_len])
+                        .await
+                        .map_err(|err| {
+                            map_logged_session_error(path, "stream response body read", err)
+                        })?;
+                    if read == 0 {
+                        return Err(BackendError::InvalidResponse);
+                    }
+                    content_storage::write_package_chunk(&chunk[..read])
+                        .await
+                        .map_err(map_storage_backend_error)?;
+                    remaining -= read;
+                }
+                return Ok(200);
+            }
+            None if connection_close => {
+                if initial_body_len > 0 {
+                    content_storage::write_package_chunk(&header[body_start..header_len])
+                        .await
+                        .map_err(map_storage_backend_error)?;
+                }
+                break;
+            }
+            None => return Err(BackendError::InvalidResponse),
         }
-        break;
     }
 
     let mut chunk = [0u8; PACKAGE_DOWNLOAD_CHUNK_LEN];
@@ -1824,6 +2083,7 @@ fn parse_http_status(response: &[u8]) -> Result<u16, BackendError> {
 async fn perform_saved_content_fetch_over_session<T>(
     session: &mut Session<'_, T>,
     access_token: &str,
+    connection_close: bool,
 ) -> Result<CollectionFetchResult, CollectionQueryError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -1837,7 +2097,7 @@ where
             content_type: Some("application/json"),
             bearer_token: Some(access_token),
             body: b"",
-            connection_close: true,
+            connection_close,
         },
         response_buffer,
     )
@@ -2887,6 +3147,21 @@ mod tests {
     fn builds_refresh_body_with_json_escaping() {
         let body = build_refresh_body("hello\"\\world").unwrap();
         assert_eq!(body.as_str(), "{\"refresh_token\":\"hello\\\"\\\\world\"}");
+    }
+
+    #[test]
+    fn active_access_session_stays_valid_before_refresh_margin() {
+        let refresh_session = RefreshSession {
+            access_token: bounded_string("access-token").unwrap(),
+            refresh_token: bounded_string("refresh-token").unwrap(),
+            expires_in: 3600,
+        };
+
+        let active = ActiveAccessSession::from_refresh_session(&refresh_session, 1_000);
+
+        assert!(active.is_valid_at(1_001));
+        assert!(active.is_valid_at(active.valid_until_ms.saturating_sub(1)));
+        assert!(!active.is_valid_at(active.valid_until_ms));
     }
 
     #[test]

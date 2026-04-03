@@ -1,7 +1,7 @@
 use crate::{
     content::{
         CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestItem,
-        CollectionManifestState, ContentState,
+        CollectionManifestState, ContentState, PackageState,
     },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     network::NetworkStatus,
@@ -440,9 +440,29 @@ fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
 
 fn content_row_from_manifest(item: CollectionManifestItem, selected: bool) -> ContentRowModel {
     ContentRowModel {
-        meta: item.meta,
+        meta: content_row_meta(item),
         title: item.title,
         selected,
+    }
+}
+
+fn content_row_meta(item: CollectionManifestItem) -> InlineText<CONTENT_META_MAX_BYTES> {
+    let mut meta = item.meta;
+    let Some(label) = package_state_hint(item.package_state) else {
+        return meta;
+    };
+
+    let _ = meta.try_push_str(" / ");
+    let _ = meta.try_push_str(label);
+    meta
+}
+
+const fn package_state_hint(state: PackageState) -> Option<&'static str> {
+    match state {
+        PackageState::Fetching => Some("FETCHING"),
+        PackageState::PendingRemote => Some("REMOTE"),
+        PackageState::Failed => Some("FAILED"),
+        PackageState::Missing | PackageState::Cached | PackageState::Stale => None,
     }
 }
 
@@ -574,6 +594,21 @@ mod tests {
 
         assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED");
         assert_eq!(model.rows[1].title.as_str(), "Example saved title");
+    }
+
+    #[test]
+    fn fetching_saved_collection_selector_surfaces_fetching_state() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.title.set_truncated("Example saved title");
+        item.package_state = crate::content::PackageState::Fetching;
+        let _ = store.content_mut().saved.try_push(item);
+        store.ui.saved_index = 0;
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED / FETCHING");
     }
 
     #[test]

@@ -7,7 +7,9 @@ use ::domain::{
     sleep::{SleepModel, SleepState},
     storage::StorageRecoveryStatus,
     store::Store,
+    sync::SyncStatus,
 };
+use ::services::storage::StorageError;
 use ::services::{input::InputService, sleep::SleepService};
 use alloc::boxed::Box;
 use app_runtime::{AppRuntime, PreparedScreen, ScreenUpdate, TransitionPlan};
@@ -152,10 +154,15 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                         request.content_id.as_str(),
                         err,
                     );
+                    let next_state = if matches!(err, StorageError::CorruptData) {
+                        PackageState::Missing
+                    } else {
+                        PackageState::Failed
+                    };
                     match content_storage::update_package_state(
                         request.collection,
                         request.remote_item_id,
-                        PackageState::Failed,
+                        next_state,
                     )
                     .await
                     {
@@ -173,11 +180,27 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                                 Event::ContentPackageStateChanged {
                                     collection: request.collection,
                                     remote_item_id: request.remote_item_id,
-                                    package_state: PackageState::Failed,
+                                    package_state: next_state,
                                 },
                                 at_ms,
                             );
                         }
+                    }
+                    if matches!(err, StorageError::CorruptData)
+                        && store.storage.sd_card_ready
+                        && matches!(store.backend_sync.status, SyncStatus::Ready)
+                    {
+                        let _ = store.content_mut().update_package_state(
+                            request.collection,
+                            &request.remote_item_id,
+                            PackageState::Fetching,
+                        );
+                        info!(
+                            "content storage cached content corrupt, refetching collection={:?} content_id={}",
+                            request.collection,
+                            request.content_id.as_str(),
+                        );
+                        backend::request_prepare_content(request).await;
                     }
                 }
             }
@@ -223,7 +246,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     );
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 80 * 1024);
+    esp_alloc::heap_allocator!(size: 64 * 1024);
     log_heap("after heap init");
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);

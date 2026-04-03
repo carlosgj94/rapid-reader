@@ -14,7 +14,6 @@ use domain::{
     formatter::{
         MAX_READING_PARAGRAPHS, MAX_READING_TOKEN_BYTES, MAX_READING_UNITS, ReadingDocument,
     },
-    runtime::Event,
     storage::StorageRecoveryStatus,
     text::InlineText,
 };
@@ -22,7 +21,6 @@ use embassy_executor::Spawner;
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
 };
-use embassy_time::Instant;
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use embedded_sdmmc::{
     Directory, Error as SdError, File, Mode, SdCard, ShortFileName, TimeSource, Timestamp,
@@ -31,8 +29,6 @@ use embedded_sdmmc::{
 use esp_hal::{Blocking, delay::Delay, gpio::Output, spi::master::Spi};
 use log::info;
 use services::storage::StorageError;
-
-use crate::bootstrap::publish_event;
 
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 4;
@@ -598,8 +594,9 @@ pub(crate) fn parse_reader_content_bytes(
 
 #[embassy_executor::task]
 async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
-    publish_initial_snapshots(&storage);
-
+    // Defer snapshot publication until backend sync updates the app store. Preloading
+    // non-empty SD manifests at boot materially increases heap pressure before the first
+    // auth/TLS exchange.
     loop {
         let response = match STORAGE_CMD_CH.receive().await {
             StorageCommand::PersistSnapshot { kind, snapshot } => {
@@ -771,6 +768,12 @@ impl<'d> SdContentStorage<'d> {
         };
 
         if !self.stage_file_has_compact_body()? {
+            info!(
+                "content storage package missing compact body collection={:?} remote_item_id={} content_id={}",
+                collection,
+                remote_item_id.as_str(),
+                stage.content_id.as_str(),
+            );
             self.delete_stage_file()?;
             return self.update_manifest_item_state(
                 collection,
@@ -849,6 +852,13 @@ impl<'d> SdContentStorage<'d> {
             .ok_or(StorageError::Unavailable)?;
         let meta = self.read_package_meta(entry.slot_id)?;
         if meta.remote_revision != entry.remote_revision {
+            info!(
+                "content storage cached content revision mismatch content_id={} slot={} entry_revision={} meta_revision={}",
+                content_id.as_str(),
+                entry.slot_id,
+                entry.remote_revision,
+                meta.remote_revision,
+            );
             return Err(StorageError::CorruptData);
         }
 
@@ -869,9 +879,40 @@ impl<'d> SdContentStorage<'d> {
                 .map_err(map_sd_error)?;
 
             let mut source = SdPackageSource::new(file);
-            let opened = parse_opened_reader_content(&mut source)?;
+            let opened = match parse_opened_reader_content(&mut source) {
+                Ok(opened) => opened,
+                Err(err) => {
+                    let _ = source.finish();
+                    info!(
+                        "content storage cached content parse failed content_id={} slot={} bytes_read={} crc32=0x{:08x} err={:?}",
+                        content_id.as_str(),
+                        entry.slot_id,
+                        source.bytes_read(),
+                        source.crc32(),
+                        err,
+                    );
+                    return Err(err);
+                }
+            };
             source.finish()?;
-            if source.bytes_read() != meta.size_bytes as usize || source.crc32() != meta.crc32 {
+            if source.bytes_read() != meta.size_bytes as usize {
+                info!(
+                    "content storage cached content size mismatch content_id={} slot={} expected={} actual={}",
+                    content_id.as_str(),
+                    entry.slot_id,
+                    meta.size_bytes,
+                    source.bytes_read(),
+                );
+                return Err(StorageError::CorruptData);
+            }
+            if source.crc32() != meta.crc32 {
+                info!(
+                    "content storage cached content crc mismatch content_id={} slot={} expected=0x{:08x} actual=0x{:08x}",
+                    content_id.as_str(),
+                    entry.slot_id,
+                    meta.crc32,
+                    source.crc32(),
+                );
                 return Err(StorageError::CorruptData);
             }
             opened
@@ -1314,21 +1355,6 @@ impl<'d> SdContentStorage<'d> {
         }
 
         Ok(Some(total))
-    }
-}
-
-fn publish_initial_snapshots(storage: &SdContentStorage<'_>) {
-    let now_ms = Instant::now().as_millis();
-
-    for kind in CollectionKind::ALL {
-        let snapshot = storage.snapshot(kind);
-        if snapshot.is_empty() {
-            continue;
-        }
-        publish_event(
-            Event::CollectionContentUpdated(kind, Box::new(snapshot)),
-            now_ms,
-        );
     }
 }
 
@@ -2465,9 +2491,9 @@ fn parse_opened_reader_content<S: JsonSource>(
     let mut content_found = false;
     let mut body_found = false;
     let mut blocks_found = false;
-    let mut kind_is_compact = false;
+    let mut body_kind_supported = false;
 
-    stream.parse_object_fields(|stream, key| match key.as_str() {
+    let parse_result = stream.parse_object_fields(|stream, key| match key.as_str() {
         "content" => {
             content_found = true;
             stream.parse_object_fields(|stream, key| match key.as_str() {
@@ -2487,7 +2513,8 @@ fn parse_opened_reader_content<S: JsonSource>(
                             if parsed.truncated {
                                 truncated = true;
                             }
-                            kind_is_compact = parsed.value == "compact";
+                            body_kind_supported =
+                                is_supported_reader_body_kind(parsed.value.as_str());
                             Ok(())
                         }
                         "blocks" => {
@@ -2511,9 +2538,34 @@ fn parse_opened_reader_content<S: JsonSource>(
             })
         }
         _ => stream.skip_value(),
-    })?;
+    });
+    if let Err(err) = parse_result {
+        info!(
+            "content storage reader parse stream error content_found={} body_found={} blocks_found={} body_kind_supported={} title_empty={} document_empty={} truncated={} err={:?}",
+            content_found,
+            body_found,
+            blocks_found,
+            body_kind_supported,
+            title.is_empty(),
+            document.is_empty(),
+            truncated,
+            err,
+        );
+        return Err(err);
+    }
 
-    if !content_found || !body_found || !blocks_found || !kind_is_compact || document.is_empty() {
+    if !content_found || !body_found || !blocks_found || !body_kind_supported || document.is_empty()
+    {
+        info!(
+            "content storage reader parse rejected content_found={} body_found={} blocks_found={} body_kind_supported={} title_empty={} document_empty={} truncated={}",
+            content_found,
+            body_found,
+            blocks_found,
+            body_kind_supported,
+            title.is_empty(),
+            document.is_empty(),
+            truncated,
+        );
         return Err(StorageError::CorruptData);
     }
 
@@ -2526,6 +2578,13 @@ fn parse_opened_reader_content<S: JsonSource>(
         document,
         truncated,
     })
+}
+
+fn is_supported_reader_body_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "compact" | "article" | "thread" | "post" | "website" | "video" | "podcast" | "pdf"
+    )
 }
 
 fn push_limited_char(target: &mut String, ch: char, max_bytes: usize, truncated: &mut bool) {
@@ -2670,12 +2729,12 @@ mod tests {
     }
 
     #[test]
-    fn reader_content_parser_opens_compact_payload() {
+    fn reader_content_parser_opens_backend_article_payload() {
         let payload = br#"{
             "content": {
                 "title": "Example article",
                 "body": {
-                    "kind": "compact",
+                    "kind": "article",
                     "blocks": [
                         {"x": "First paragraph for Motif.", "t": "p"},
                         {"i": ["Alpha", "Beta"], "o": true, "t": "l"}
@@ -2692,6 +2751,28 @@ mod tests {
         assert_eq!(
             opened.document.preview_for_paragraph(1).as_str(),
             "First paragraph for Motif."
+        );
+    }
+
+    #[test]
+    fn reader_content_parser_keeps_legacy_compact_kind_compatibility() {
+        let payload = br#"{
+            "content": {
+                "title": "Legacy article",
+                "body": {
+                    "kind": "compact",
+                    "blocks": [{"x": "Legacy paragraph.", "t": "p"}]
+                }
+            }
+        }"#;
+
+        let opened = parse_reader_content_bytes(payload).unwrap();
+
+        assert_eq!(opened.title.as_str(), "Legacy article");
+        assert_eq!(opened.document.paragraph_count, 1);
+        assert_eq!(
+            opened.document.preview_for_paragraph(1).as_str(),
+            "Legacy paragraph."
         );
     }
 
