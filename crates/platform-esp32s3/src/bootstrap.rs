@@ -12,7 +12,7 @@ use ::domain::{
 use ::services::storage::StorageError;
 use ::services::{input::InputService, sleep::SleepService};
 use alloc::boxed::Box;
-use app_runtime::{AppRuntime, PreparedScreen, ScreenUpdate, TransitionPlan};
+use app_runtime::{AppRuntime, PreparedScreen, Screen, ScreenUpdate, TransitionPlan};
 use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either5, select, select5};
@@ -496,6 +496,21 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
 
                 if previous_screen != Some(update.screen) {
                     info!("app screen={:?}", update.screen);
+                }
+
+                if update.screen == Screen::Reader && previous_screen != Some(Screen::Reader) {
+                    let reset = input.reset_after_reader_open();
+                    if reset.cleared_gestures > 0
+                        || reset.cleared_dropped_gestures > 0
+                        || reset.button_was_pressed
+                    {
+                        info!(
+                            "input reset for reader cleared_gestures={} cleared_dropped={} button_pressed={}",
+                            reset.cleared_gestures,
+                            reset.cleared_dropped_gestures,
+                            reset.button_was_pressed,
+                        );
+                    }
                 }
 
                 if let Some(previous) = previous_prepared {

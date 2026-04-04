@@ -80,6 +80,17 @@ impl ReaderSession {
         self.next_due_at_ms = None;
     }
 
+    pub fn unload_document(&mut self) {
+        self.document = None;
+        self.progress = ReaderProgress {
+            unit_index: 0,
+            paragraph_index: 1,
+            total_paragraphs: 1,
+            completion_percent: 0,
+        };
+        self.next_due_at_ms = None;
+    }
+
     pub fn show_normal(&mut self) {
         if matches!(self.mode, ReaderMode::Normal | ReaderMode::Chat) {
             self.mode = ReaderMode::Normal;

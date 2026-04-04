@@ -321,6 +321,7 @@ impl Store {
                 UiCommand::Confirm => self.reader.pause(),
                 UiCommand::Back => {
                     self.ui.route = UiRoute::Collection(self.reader.active_collection);
+                    self.reader.unload_document();
                     self.reader.mode = crate::reader::ReaderMode::Normal;
                     self.reader.resume_mode = crate::reader::ReaderMode::Normal;
                     self.reader.next_due_at_ms = None;
@@ -765,6 +766,30 @@ mod tests {
             store.reader.mode,
             crate::reader::ReaderMode::ParagraphNavigation
         ));
+    }
+
+    #[test]
+    fn reader_back_unloads_document_before_returning_to_collection() {
+        let mut store = Store::new();
+        let article = store.content().article_at(CollectionKind::Saved, 0);
+        let document = format_article_document(&article_document_from_script(
+            article.source,
+            article.script,
+        ));
+        store.reader.open_article(
+            CollectionKind::Saved,
+            article.id,
+            crate::text::InlineText::from_slice(article.reader_title),
+            alloc::boxed::Box::new(document),
+            article.has_chat,
+        );
+        store.ui.route = UiRoute::Reader;
+
+        store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
+
+        assert_eq!(store.ui.route, UiRoute::Collection(CollectionKind::Saved));
+        assert!(store.reader.document().is_empty());
+        assert_eq!(store.reader.progress.total_paragraphs, 1);
     }
 
     #[test]

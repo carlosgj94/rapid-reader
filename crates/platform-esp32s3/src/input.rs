@@ -8,6 +8,13 @@ const LONG_PRESS_MS: u64 = 600;
 const DETENT_DELTA: i8 = 2;
 const ROTARY_TRANSITIONS: [i8; 16] = [0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0];
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct InputResetSummary {
+    pub cleared_gestures: usize,
+    pub cleared_dropped_gestures: u32,
+    pub button_was_pressed: bool,
+}
+
 #[derive(Debug)]
 pub struct PlatformInputService<'d> {
     encoder_clk: Input<'d>,
@@ -70,6 +77,26 @@ impl<'d> PlatformInputService<'d> {
         self.wake_button_pin
             .take()
             .expect("wake button pin can only be taken once")
+    }
+
+    pub fn reset_after_reader_open(&mut self) -> InputResetSummary {
+        let button_was_pressed = self.button.is_low();
+        self.button.clear_interrupt();
+        self.button.listen(GpioEvent::AnyEdge);
+
+        let summary = InputResetSummary {
+            cleared_gestures: self.queue.clear(),
+            cleared_dropped_gestures: self.dropped_gestures,
+            button_was_pressed,
+        };
+
+        self.dropped_gestures = 0;
+        self.encoder_state =
+            EncoderState::new(sample_encoder_inputs(&self.encoder_clk, &self.encoder_dt));
+        self.button_state
+            .reset_after_reader_open(button_was_pressed);
+
+        summary
     }
 
     fn sample_rotation(&mut self) {
@@ -152,6 +179,18 @@ impl GestureQueue {
         self.head = (self.head + 1) % INPUT_QUEUE_CAPACITY;
         self.len -= 1;
         gesture
+    }
+
+    fn clear(&mut self) -> usize {
+        let cleared = self.len;
+        let mut index = 0usize;
+        while index < self.entries.len() {
+            self.entries[index] = None;
+            index += 1;
+        }
+        self.head = 0;
+        self.len = 0;
+        cleared
     }
 }
 
@@ -298,6 +337,15 @@ impl ButtonState {
         self.press_started_ms = None;
         self.long_press_emitted = false;
         gesture
+    }
+
+    fn reset_after_reader_open(&mut self, current_pressed: bool) {
+        self.stable_pressed = current_pressed;
+        self.candidate_pressed = None;
+        self.candidate_since_ms = 0;
+        self.press_started_ms = None;
+        self.long_press_emitted = false;
+        self.suppress_until_release = current_pressed;
     }
 }
 

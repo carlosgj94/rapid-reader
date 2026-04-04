@@ -21,6 +21,7 @@ use embassy_executor::Spawner;
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, signal::Signal,
 };
+use embassy_time::Instant;
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use embedded_sdmmc::{
     Directory, Error as SdError, File, Mode, SdCard, ShortFileName, TimeSource, Timestamp,
@@ -578,14 +579,33 @@ pub async fn open_cached_reader_content(
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
+    let started_at = Instant::now();
     STORAGE_CMD_CH
         .send(StorageCommand::OpenCachedReaderContent { content_id })
         .await;
 
-    match STORAGE_RESP_SIG.wait().await {
+    let result = match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Opened(result) => result,
         StorageResponse::Snapshot(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    };
+
+    let total_ms = Instant::now().duration_since(started_at).as_millis();
+    match &result {
+        Ok(opened) => info!(
+            "content storage cached open timing content_id={} total_ms={} truncated={}",
+            content_id.as_str(),
+            total_ms,
+            opened.truncated,
+        ),
+        Err(err) => info!(
+            "content storage cached open timing failed content_id={} total_ms={} err={:?}",
+            content_id.as_str(),
+            total_ms,
+            err,
+        ),
     }
+
+    result
 }
 
 pub(crate) fn parse_reader_content_bytes(
@@ -849,6 +869,7 @@ impl<'d> SdContentStorage<'d> {
         &mut self,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     ) -> Result<OpenedReaderContent, StorageError> {
+        let started_at = Instant::now();
         let entry = self
             .cache_index
             .find_by_content_id(&content_id)
@@ -882,6 +903,7 @@ impl<'d> SdContentStorage<'d> {
                 .map_err(map_sd_error)?;
 
             let mut source = SdPackageSource::new(file);
+            let parse_started_at = Instant::now();
             let opened = match parse_opened_reader_content(&mut source) {
                 Ok(opened) => opened,
                 Err(err) => {
@@ -897,6 +919,7 @@ impl<'d> SdContentStorage<'d> {
                     return Err(err);
                 }
             };
+            let parse_ms = Instant::now().duration_since(parse_started_at).as_millis();
             source.finish()?;
             if source.bytes_read() != meta.size_bytes as usize {
                 info!(
@@ -918,6 +941,16 @@ impl<'d> SdContentStorage<'d> {
                 );
                 return Err(StorageError::CorruptData);
             }
+            let total_ms = Instant::now().duration_since(started_at).as_millis();
+            info!(
+                "content storage cached parse timing content_id={} slot={} bytes_read={} parse_ms={} total_ms={} truncated={}",
+                content_id.as_str(),
+                entry.slot_id,
+                source.bytes_read(),
+                parse_ms,
+                total_ms,
+                opened.truncated,
+            );
             opened
         };
 
