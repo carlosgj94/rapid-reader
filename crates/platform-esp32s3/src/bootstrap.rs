@@ -328,13 +328,15 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     } else {
         BootState::ColdBoot
     };
+    let bootstrap_content =
+        content_storage::bootstrap_content_state(content_mount.storage.as_deref());
     let snapshot = BootstrapSnapshot::new(
         DeviceState {
             pairing: backend::initial_pairing_state(backend_credential),
             boot: boot_state,
         },
         boot_ms,
-        None,
+        bootstrap_content,
         persisted_settings,
         storage_health,
         internet::initial_network_state(),

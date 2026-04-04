@@ -7,9 +7,9 @@ use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use domain::{
     content::{
         CONTENT_ID_MAX_BYTES, CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
-        CollectionManifestItem, CollectionManifestState, DetailLocator, MANIFEST_ITEM_CAPACITY,
-        PackageState, RECOMMENDATION_SERVE_ID_MAX_BYTES, REMOTE_ITEM_ID_MAX_BYTES,
-        RemoteContentStatus,
+        CollectionManifestItem, CollectionManifestState, ContentState, DetailLocator,
+        MANIFEST_ITEM_CAPACITY, PackageState, RECOMMENDATION_SERVE_ID_MAX_BYTES,
+        REMOTE_ITEM_ID_MAX_BYTES, RemoteContentStatus,
     },
     formatter::{
         MAX_PARAGRAPH_PREVIEW_BYTES, MAX_READING_PARAGRAPHS, MAX_READING_TOKEN_BYTES,
@@ -492,6 +492,26 @@ pub fn install(spawner: Spawner, storage: Option<Box<SdContentStorage<'static>>>
     if spawner.spawn(content_storage_task(storage)).is_err() {
         info!("content storage failed to spawn task");
     }
+}
+
+pub(crate) fn bootstrap_content_state(
+    storage: Option<&SdContentStorage<'_>>,
+) -> Option<Box<ContentState>> {
+    let saved = storage
+        .and_then(|storage| storage.snapshots[collection_index(CollectionKind::Saved)].as_deref())
+        .copied()
+        .filter(|snapshot| !snapshot.is_empty())?;
+
+    info!(
+        "content storage bootstrap saved snapshot item_count={}",
+        saved.len()
+    );
+
+    Some(Box::new(ContentState {
+        saved: Some(Box::new(saved)),
+        inbox: None,
+        recommendations: None,
+    }))
 }
 
 pub async fn persist_snapshot(
