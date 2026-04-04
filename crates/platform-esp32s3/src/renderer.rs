@@ -3,8 +3,8 @@ use core::convert::Infallible;
 use app_runtime::{
     AnimationDescriptor, MotionDirection, PreparedScreen, Screen, ScreenUpdate, TransitionPlan,
     components::{
-        ContentListShell, DashboardShell, ParagraphNavigationShell, PauseModal, ReaderShell,
-        SettingsShell, TopicPreferenceGrid,
+        ContentListShell, ContentRow, DashboardShell, ParagraphNavigationShell, PauseModal,
+        ReaderShell, SettingsShell, TopicPreferenceGrid,
     },
 };
 use domain::formatter::StageFont;
@@ -34,6 +34,10 @@ const LARGE_RAIL_SCALE: u32 = 2;
 const LARGE_RAIL_RIGHT_EDGE_X: i32 = 399;
 const LARGE_RAIL_Y: i32 = 18;
 const COLLECTION_TEXT_RIGHT_EDGE_X: i32 = 316;
+const COLLECTION_SELECTED_TEXT_X: i32 = 28;
+const COLLECTION_SELECTED_META_Y: i32 = 118;
+const COLLECTION_SELECTED_TITLE_Y: i32 = 135;
+const COLLECTION_LIST_STEP_TRAVEL_PX: i32 = 12;
 const READER_TITLE_MAX_WIDTH_PX: i32 = 250;
 const READER_PREVIEW_MAX_WIDTH_PX: i32 = 360;
 const READER_PREVIEW_Y: i32 = 214;
@@ -151,9 +155,17 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
             _ => draw_prepared_screen(frame, &playback.to),
         },
         AnimationDescriptor::ListStep(direction) => {
-            if let PreparedScreen::Collection(shell) = playback.to {
-                let slide = slide_offset(direction, playback.step, playback.plan.steps, 18);
-                draw_collection(frame, &shell, playback.step, playback.plan.steps, slide);
+            if let (PreparedScreen::Collection(from_shell), PreparedScreen::Collection(to_shell)) =
+                (playback.from, playback.to)
+            {
+                draw_collection_list_step(
+                    frame,
+                    &from_shell,
+                    &to_shell,
+                    direction,
+                    playback.step,
+                    playback.plan.steps,
+                );
             } else {
                 draw_prepared_screen(frame, &playback.to);
             }
@@ -384,8 +396,7 @@ fn draw_collection(
     );
 
     if step >= total_steps {
-        fill_rect(frame, 303, 129, 28, 5, BinaryColor::Off);
-        fill_rect(frame, 307, 140, 22, 5, BinaryColor::Off);
+        draw_collection_selected_band_accent(frame);
     }
 
     draw_text_ellipsized(
@@ -406,6 +417,80 @@ fn draw_collection(
         Alignment::Left,
         COLLECTION_TEXT_RIGHT_EDGE_X - 20,
     );
+}
+
+fn draw_collection_list_step(
+    frame: &mut FrameBuffer,
+    from: &ContentListShell,
+    to: &ContentListShell,
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+) {
+    draw_collection(frame, to, 1, 1, 0);
+
+    if step >= total_steps {
+        return;
+    }
+
+    draw_collection_list_step_overlay(frame, from, to, direction, step, total_steps);
+}
+
+fn draw_collection_list_step_overlay(
+    frame: &mut FrameBuffer,
+    from: &ContentListShell,
+    to: &ContentListShell,
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+) {
+    let band_y = to.band.y;
+    let band_height = to.band.height as i32;
+    let incoming_offset =
+        slide_offset(direction, step, total_steps, COLLECTION_LIST_STEP_TRAVEL_PX);
+    let outgoing_offset = match direction {
+        MotionDirection::Forward => incoming_offset - COLLECTION_LIST_STEP_TRAVEL_PX,
+        MotionDirection::Backward => incoming_offset + COLLECTION_LIST_STEP_TRAVEL_PX,
+    };
+
+    fill_rect(frame, 16, band_y, 320, band_height, BinaryColor::On);
+    draw_selection_band(frame, 16, band_y, 320, band_height, 1, 1);
+
+    draw_collection_selected_row(frame, &from.rows[1], outgoing_offset);
+    draw_collection_selected_row(frame, &to.rows[1], incoming_offset);
+    draw_collection_selected_band_accent(frame);
+}
+
+fn draw_collection_selected_row(frame: &mut FrameBuffer, row: &ContentRow, y_offset: i32) {
+    draw_text_ellipsized(
+        frame,
+        row.meta.as_str(),
+        Point::new(
+            COLLECTION_SELECTED_TEXT_X,
+            COLLECTION_SELECTED_META_Y + y_offset,
+        ),
+        ui_font_body(),
+        BinaryColor::Off,
+        Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - COLLECTION_SELECTED_TEXT_X,
+    );
+    draw_text_ellipsized(
+        frame,
+        row.title.as_str(),
+        Point::new(
+            COLLECTION_SELECTED_TEXT_X,
+            COLLECTION_SELECTED_TITLE_Y + y_offset,
+        ),
+        ui_font_body(),
+        BinaryColor::Off,
+        Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - COLLECTION_SELECTED_TEXT_X,
+    );
+}
+
+fn draw_collection_selected_band_accent(frame: &mut FrameBuffer) {
+    fill_rect(frame, 303, 129, 28, 5, BinaryColor::Off);
+    fill_rect(frame, 307, 140, 22, 5, BinaryColor::Off);
 }
 
 fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
@@ -1418,7 +1503,8 @@ mod tests {
     use super::*;
     use crate::display::diff_dirty_rows;
     use app_runtime::components::{
-        DashboardItem, SelectionBand, StatusCluster, SyncIndicator, VerticalRail,
+        ContentListShell, ContentRow, DashboardItem, HelpHint, SelectionBand, StatusCluster,
+        SyncIndicator, VerticalRail,
     };
     use domain::text::InlineText;
 
@@ -1472,6 +1558,37 @@ mod tests {
         }
     }
 
+    fn make_collection_shell(rows: [(&str, &str); 3]) -> ContentListShell {
+        ContentListShell {
+            appearance: AppearanceMode::Light,
+            status: StatusCluster {
+                battery_percent: 64,
+                wifi_online: true,
+            },
+            rail: VerticalRail { text: "SAVED" },
+            large_rail: true,
+            rows: [
+                ContentRow {
+                    meta: InlineText::from_slice(rows[0].0),
+                    title: InlineText::from_slice(rows[0].1),
+                    selected: false,
+                },
+                ContentRow {
+                    meta: InlineText::from_slice(rows[1].0),
+                    title: InlineText::from_slice(rows[1].1),
+                    selected: true,
+                },
+                ContentRow {
+                    meta: InlineText::from_slice(rows[2].0),
+                    title: InlineText::from_slice(rows[2].1),
+                    selected: false,
+                },
+            ],
+            band: SelectionBand { y: 106, height: 68 },
+            help: HelpHint { text: "BACK" },
+        }
+    }
+
     #[test]
     fn reader_progress_only_dirties_progress_rows() {
         let mut committed = FrameBuffer::new();
@@ -1510,6 +1627,42 @@ mod tests {
         assert!(dirty.count() <= 12);
         for row in dirty.iter() {
             assert!((220..230).contains(&row), "unexpected dirty row {row}");
+        }
+    }
+
+    #[test]
+    fn list_step_followup_frames_stay_within_selection_band() {
+        let from = make_collection_shell([("meta-a", "A"), ("meta-b", "B"), ("meta-c", "C")]);
+        let to = make_collection_shell([("meta-b", "B"), ("meta-c", "C"), ("meta-d", "D")]);
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::Collection(from),
+            to: PreparedScreen::Collection(to),
+            screen: Screen::Saved,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::ListStep(MotionDirection::Forward),
+                3,
+                55,
+            ),
+            step: 1,
+        };
+        let step_2 = step_1.advance();
+        let step_3 = step_2.advance();
+        let mut frame_1 = FrameBuffer::new();
+        let mut frame_2 = FrameBuffer::new();
+        let mut frame_3 = FrameBuffer::new();
+
+        draw_transition_frame(&mut frame_1, &step_1);
+        draw_transition_frame(&mut frame_2, &step_2);
+        draw_transition_frame(&mut frame_3, &step_3);
+
+        for dirty in [
+            diff_dirty_rows(&frame_1, &frame_2),
+            diff_dirty_rows(&frame_2, &frame_3),
+        ] {
+            assert!(dirty.count() <= 80, "dirty rows={}", dirty.count());
+            for row in dirty.iter() {
+                assert!((106..174).contains(&row), "unexpected dirty row {row}");
+            }
         }
     }
 }

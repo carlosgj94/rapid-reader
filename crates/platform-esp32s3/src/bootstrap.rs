@@ -13,7 +13,7 @@ use ::services::storage::StorageError;
 use ::services::{input::InputService, sleep::SleepService};
 use alloc::boxed::Box;
 use app_runtime::{AppRuntime, PreparedScreen, Screen, ScreenUpdate, TransitionPlan};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either5, select, select5};
 use embassy_sync::{
@@ -63,6 +63,8 @@ static PLATFORM_CMD_CH: Channel<
     PLATFORM_COMMAND_QUEUE_CAPACITY,
 > = Channel::new();
 static SCREEN_SIGNAL: Signal<CriticalSectionRawMutex, ScreenUpdate> = Signal::new();
+static PENDING_UI_TICK: AtomicBool = AtomicBool::new(false);
+static PENDING_READER_TICK: AtomicBool = AtomicBool::new(false);
 static DROPPED_UI_TICKS: AtomicU32 = AtomicU32::new(0);
 static DROPPED_READER_TICKS: AtomicU32 = AtomicU32::new(0);
 
@@ -96,6 +98,7 @@ async fn app_task(snapshot: BootstrapSnapshot) {
             APP_EVENT_CH.receive().await
         };
         let timed_event = prioritize_non_tick_event(timed_event, &mut pending_event);
+        release_tick_slot(&timed_event.event);
         let input_gesture = match &timed_event.event {
             Event::InputGestureReceived(gesture) => Some(*gesture),
             _ => None,
@@ -473,7 +476,11 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
 
                 match tick_kind {
                     Either::First(_) => {
-                        publish_event(Event::UiTick(now_ms), now_ms);
+                        if current_prepared_screen(animation, committed_update)
+                            .is_some_and(|screen| prepared_screen_drives_ui_ticks(&screen))
+                        {
+                            publish_event(Event::UiTick(now_ms), now_ms);
+                        }
                     }
                     Either::Second(_) => {
                         if current_prepared_screen(animation, committed_update)
@@ -650,6 +657,10 @@ pub(crate) fn publish_event(event: Event, at_ms: u64) {
     let is_ui_tick = matches!(event, Event::UiTick(_));
     let is_reader_tick = matches!(event, Event::ReaderTick(_));
 
+    if !reserve_tick_slot(&event) {
+        return;
+    }
+
     match APP_EVENT_CH.try_send(TimedEvent { event, at_ms }) {
         Ok(()) => {
             if !is_ui_tick && !is_reader_tick {
@@ -657,6 +668,7 @@ pub(crate) fn publish_event(event: Event, at_ms: u64) {
             }
         }
         Err(embassy_sync::channel::TrySendError::Full(timed_event)) => {
+            release_tick_slot(&timed_event.event);
             if is_ui_tick {
                 record_tick_drop(&DROPPED_UI_TICKS, "ui");
             } else if is_reader_tick {
@@ -696,6 +708,36 @@ fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
 
 fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
     matches!(screen, PreparedScreen::Reader(shell) if shell.pause_modal.is_none())
+}
+
+fn prepared_screen_drives_ui_ticks(screen: &PreparedScreen) -> bool {
+    match screen {
+        PreparedScreen::Dashboard(_) => true,
+        PreparedScreen::Settings(shell) => {
+            matches!(shell.mode, domain::ui::SettingsMode::RefreshLoading)
+        }
+        _ => false,
+    }
+}
+
+fn reserve_tick_slot(event: &Event) -> bool {
+    match event {
+        Event::UiTick(_) => PENDING_UI_TICK
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok(),
+        Event::ReaderTick(_) => PENDING_READER_TICK
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok(),
+        _ => true,
+    }
+}
+
+fn release_tick_slot(event: &Event) {
+    match event {
+        Event::UiTick(_) => PENDING_UI_TICK.store(false, Ordering::Relaxed),
+        Event::ReaderTick(_) => PENDING_READER_TICK.store(false, Ordering::Relaxed),
+        _ => {}
+    }
 }
 
 fn record_tick_drop(counter: &AtomicU32, label: &str) {
@@ -749,8 +791,8 @@ fn schedule_heartbeat_deadline() -> Instant {
 
 #[derive(Clone, Copy)]
 struct PresentTimings {
-    render_ms: u64,
-    diff_ms: u64,
+    render_us: u64,
+    diff_us: u64,
 }
 
 fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
@@ -769,11 +811,11 @@ fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
 {
     let render_started = Instant::now();
     renderer::draw_prepared_screen(working, screen);
-    let render_ms = Instant::now().duration_since(render_started).as_millis();
+    let render_us = Instant::now().duration_since(render_started).as_micros();
 
     let diff_started = Instant::now();
     let dirty_rows = diff_dirty_rows(committed, working);
-    let diff_ms = Instant::now().duration_since(diff_started).as_millis();
+    let diff_us = Instant::now().duration_since(diff_started).as_micros();
 
     present_frame(
         display,
@@ -782,7 +824,7 @@ fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
         &dirty_rows,
         delay,
         kind,
-        PresentTimings { render_ms, diff_ms },
+        PresentTimings { render_us, diff_us },
     );
 }
 
@@ -802,11 +844,11 @@ fn present_transition_frame<SPI, DISP, EMD, CS, D>(
 {
     let render_started = Instant::now();
     renderer::draw_transition_frame(working, animation);
-    let render_ms = Instant::now().duration_since(render_started).as_millis();
+    let render_us = Instant::now().duration_since(render_started).as_micros();
 
     let diff_started = Instant::now();
     let dirty_rows = diff_dirty_rows(committed, working);
-    let diff_ms = Instant::now().duration_since(diff_started).as_millis();
+    let diff_us = Instant::now().duration_since(diff_started).as_micros();
 
     present_frame(
         display,
@@ -815,7 +857,7 @@ fn present_transition_frame<SPI, DISP, EMD, CS, D>(
         &dirty_rows,
         delay,
         kind,
-        PresentTimings { render_ms, diff_ms },
+        PresentTimings { render_us, diff_us },
     );
 }
 
@@ -838,16 +880,21 @@ fn present_frame<SPI, DISP, EMD, CS, D>(
     match display.present(committed, working, dirty_rows, delay) {
         Ok(stats) => {
             if stats.dirty_rows > 0 {
-                let flush_ms = Instant::now().duration_since(flush_started).as_millis();
+                let flush_us = Instant::now().duration_since(flush_started).as_micros();
+                let total_us = timings
+                    .render_us
+                    .saturating_add(timings.diff_us)
+                    .saturating_add(flush_us);
                 info!(
-                    "display present kind={} rows={} bytes={} full={} render_ms={} diff_ms={} flush_ms={}",
+                    "display present kind={} rows={} bytes={} full={} render_us={} diff_us={} flush_us={} total_us={}",
                     kind,
                     stats.dirty_rows,
                     stats.bytes_sent,
                     stats.full_refresh,
-                    timings.render_ms,
-                    timings.diff_ms,
-                    flush_ms,
+                    timings.render_us,
+                    timings.diff_us,
+                    flush_us,
+                    total_us,
                 );
             }
         }
