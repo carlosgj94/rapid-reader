@@ -70,6 +70,7 @@ pub struct ContentListShell {
     pub appearance: AppearanceMode,
     pub status: StatusCluster,
     pub rail: VerticalRail,
+    pub large_rail: bool,
     pub rows: [ContentRow; 3],
     pub band: SelectionBand,
     pub help: HelpHint,
@@ -253,6 +254,10 @@ fn compose_collection(model: ContentListScreenModel) -> ContentListShell {
         rail: VerticalRail {
             text: model.rail_label,
         },
+        large_rail: matches!(
+            model.selected_collection,
+            domain::content::CollectionKind::Saved
+        ),
         rows: [
             ContentRow {
                 meta: model.rows[0].meta,
@@ -270,7 +275,7 @@ fn compose_collection(model: ContentListScreenModel) -> ContentListShell {
                 selected: false,
             },
         ],
-        band: SelectionBand { y: 98, height: 68 },
+        band: SelectionBand { y: 106, height: 68 },
         help: HelpHint {
             text: "long press_",
         },

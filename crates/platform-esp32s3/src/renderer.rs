@@ -26,11 +26,19 @@ use ls027b7dh01::FrameBuffer;
 pub const UI_TICK_MS: u64 = 160;
 pub const MAINTENANCE_REFRESH_TICKS: u8 = 6;
 const NORMALIZED_TEXT_MAX_BYTES: usize = 192;
+const ELLIPSIS: &str = "...";
 const RSVP_STAGE_CENTER_X: i32 = 170;
 const RSVP_STAGE_LEFT_ANCHOR_X: i32 = 169;
 const RSVP_STAGE_RIGHT_ANCHOR_X: i32 = 173;
 const RSVP_STAGE_SCALED_LEFT_ANCHOR_X: i32 = 168;
 const RSVP_STAGE_SCALED_RIGHT_ANCHOR_X: i32 = 172;
+const LARGE_RAIL_SCALE: u32 = 2;
+const LARGE_RAIL_RIGHT_EDGE_X: i32 = 399;
+const LARGE_RAIL_Y: i32 = 18;
+const COLLECTION_TEXT_RIGHT_EDGE_X: i32 = 316;
+const READER_TITLE_MAX_WIDTH_PX: i32 = 250;
+const READER_PREVIEW_MAX_WIDTH_PX: i32 = 360;
+const READER_PREVIEW_Y: i32 = 214;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StageTextSpec {
@@ -218,7 +226,13 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         shell.status.battery_percent,
         shell.status.wifi_online,
     );
-    draw_vertical_rail(frame, shell.rail.text, 398, 26);
+    draw_vertical_rail_scaled(
+        frame,
+        shell.rail.text,
+        LARGE_RAIL_RIGHT_EDGE_X,
+        LARGE_RAIL_Y,
+        LARGE_RAIL_SCALE,
+    );
     draw_text(
         frame,
         shell.items[0].label,
@@ -227,7 +241,6 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         BinaryColor::On,
         Alignment::Left,
     );
-    draw_live_dot(frame, 100, 61, shell.items[0].live_dot);
     draw_selection_band(
         frame,
         16,
@@ -259,7 +272,6 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         BinaryColor::On,
         Alignment::Left,
     );
-    draw_live_dot(frame, 100, 168, shell.items[2].live_dot);
 
     if let Some(sync_indicator) = shell.sync_indicator {
         draw_dashboard_sync_indicator(frame, sync_indicator.label, sync_indicator.spinner_phase);
@@ -314,23 +326,35 @@ fn draw_collection(
         Alignment::Left,
     );
     draw_back_chevron(frame, 20, 12);
-    draw_vertical_rail(frame, shell.rail.text, 398, 26);
+    if shell.large_rail {
+        draw_vertical_rail_scaled(
+            frame,
+            shell.rail.text,
+            LARGE_RAIL_RIGHT_EDGE_X,
+            LARGE_RAIL_Y,
+            LARGE_RAIL_SCALE,
+        );
+    } else {
+        draw_vertical_rail(frame, shell.rail.text, 398, 26);
+    }
 
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.rows[0].meta.as_str(),
-        Point::new(20, 40 + slide_offset),
+        Point::new(20, 48 + slide_offset),
         ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
     );
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.rows[0].title.as_str(),
-        Point::new(20, 58 + slide_offset),
+        Point::new(20, 66 + slide_offset),
         ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
     );
 
     draw_selection_band(
@@ -342,54 +366,59 @@ fn draw_collection(
         step,
         total_steps,
     );
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.rows[1].meta.as_str(),
-        Point::new(28, 110 + slide_offset),
+        Point::new(28, 118 + slide_offset),
         ui_font_body(),
         BinaryColor::Off,
         Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - 28,
     );
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.rows[1].title.as_str(),
-        Point::new(28, 127 + slide_offset),
+        Point::new(28, 135 + slide_offset),
         ui_font_body(),
         BinaryColor::Off,
         Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - 28,
     );
 
     if step >= total_steps {
-        fill_rect(frame, 303, 121, 28, 5, BinaryColor::Off);
-        fill_rect(frame, 307, 132, 22, 5, BinaryColor::Off);
+        fill_rect(frame, 303, 129, 28, 5, BinaryColor::Off);
+        fill_rect(frame, 307, 140, 22, 5, BinaryColor::Off);
     }
 
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.rows[2].meta.as_str(),
-        Point::new(20, 177 + slide_offset),
+        Point::new(20, 185 + slide_offset),
         ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
     );
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.rows[2].title.as_str(),
-        Point::new(20, 195 + slide_offset),
+        Point::new(20, 203 + slide_offset),
         ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
+        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
     );
 }
 
 fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.stage.title.as_str(),
         Point::new(20, 18),
         ui_font_title(),
         BinaryColor::On,
         Alignment::Left,
+        READER_TITLE_MAX_WIDTH_PX,
     );
     draw_text_right(
         frame,
@@ -429,13 +458,14 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
         }
     }
 
-    draw_text(
+    draw_text_ellipsized(
         frame,
         shell.stage.preview.as_str(),
-        Point::new(20, 184),
+        Point::new(20, READER_PREVIEW_Y),
         ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
+        READER_PREVIEW_MAX_WIDTH_PX,
     );
     fill_rect(
         frame,
@@ -459,7 +489,7 @@ fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total
 
     fill_rect(frame, x, y, width as i32, height as i32, BinaryColor::On);
 
-    if step >= 2 {
+    if total_steps == 1 || step >= 2 {
         draw_text(
             frame,
             modal.title,
@@ -878,6 +908,23 @@ fn draw_vertical_rail(frame: &mut FrameBuffer, text: &str, right_edge: i32, y: i
     );
 }
 
+fn draw_vertical_rail_scaled(
+    frame: &mut FrameBuffer,
+    text: &str,
+    right_edge: i32,
+    y: i32,
+    scale: u32,
+) {
+    draw_text_right_scaled(
+        frame,
+        text,
+        Point::new(right_edge, y),
+        ui_font_title(),
+        BinaryColor::On,
+        scale,
+    );
+}
+
 fn draw_paragraph_map_rail(
     frame: &mut FrameBuffer,
     selected_index: u8,
@@ -1099,6 +1146,19 @@ fn draw_text(
         .ok();
 }
 
+fn draw_text_ellipsized(
+    frame: &mut FrameBuffer,
+    text: &str,
+    position: Point,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    color: BinaryColor,
+    alignment: Alignment,
+    max_width_px: i32,
+) {
+    let clipped = ellipsized_text(text, font, 1, max_width_px);
+    draw_text(frame, clipped.as_str(), position, font, color, alignment);
+}
+
 fn draw_text_scaled(
     frame: &mut FrameBuffer,
     text: &str,
@@ -1156,6 +1216,48 @@ fn normalized_text(text: &str) -> HeaplessString<NORMALIZED_TEXT_MAX_BYTES> {
     }
 
     normalized
+}
+
+fn ellipsized_text(
+    text: &str,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    scale: u32,
+    max_width_px: i32,
+) -> HeaplessString<NORMALIZED_TEXT_MAX_BYTES> {
+    let mut normalized = normalized_text(text);
+    let cell_width = (font.character_size.width.saturating_mul(scale.max(1))) as i32;
+    if cell_width <= 0 || max_width_px <= 0 {
+        return HeaplessString::new();
+    }
+
+    let max_chars = (max_width_px / cell_width).max(0) as usize;
+    let char_count = normalized.chars().count();
+    if char_count <= max_chars {
+        return normalized;
+    }
+
+    if max_chars == 0 {
+        return HeaplessString::new();
+    }
+
+    if max_chars <= ELLIPSIS.len() {
+        let mut dots = HeaplessString::new();
+        for _ in 0..max_chars {
+            let _ = dots.push('.');
+        }
+        return dots;
+    }
+
+    let keep_chars = max_chars - ELLIPSIS.len();
+    let mut clipped = HeaplessString::new();
+    for ch in normalized.chars().take(keep_chars) {
+        if clipped.push(ch).is_err() {
+            return clipped;
+        }
+    }
+    let _ = clipped.push_str(ELLIPSIS);
+    normalized.clear();
+    clipped
 }
 
 fn normalize_display_char(ch: char) -> char {
