@@ -33,11 +33,22 @@ const RSVP_STAGE_SCALED_RIGHT_ANCHOR_X: i32 = 172;
 const LARGE_RAIL_SCALE: u32 = 2;
 const LARGE_RAIL_RIGHT_EDGE_X: i32 = 399;
 const LARGE_RAIL_Y: i32 = 18;
+const DASHBOARD_TEXT_RIGHT_EDGE_X: i32 = 296;
+const DASHBOARD_SLOT_TRAVEL_PX: i32 = 14;
+const DASHBOARD_TOP_SLOT_Y: i32 = 42;
+const DASHBOARD_TOP_SLOT_HEIGHT: i32 = 40;
+const DASHBOARD_SELECTED_SLOT_Y: i32 = 82;
+const DASHBOARD_SELECTED_SLOT_HEIGHT: i32 = 60;
+const DASHBOARD_BOTTOM_SLOT_Y: i32 = 149;
+const DASHBOARD_BOTTOM_SLOT_HEIGHT: i32 = 42;
 const COLLECTION_TEXT_RIGHT_EDGE_X: i32 = 316;
-const COLLECTION_SELECTED_TEXT_X: i32 = 28;
-const COLLECTION_SELECTED_META_Y: i32 = 118;
-const COLLECTION_SELECTED_TITLE_Y: i32 = 135;
-const COLLECTION_LIST_STEP_TRAVEL_PX: i32 = 12;
+const COLLECTION_LIST_STEP_TRAVEL_PX: i32 = 16;
+const COLLECTION_TOP_SLOT_Y: i32 = 42;
+const COLLECTION_TOP_SLOT_HEIGHT: i32 = 42;
+const COLLECTION_SELECTED_SLOT_Y: i32 = 106;
+const COLLECTION_SELECTED_SLOT_HEIGHT: i32 = 68;
+const COLLECTION_BOTTOM_SLOT_Y: i32 = 179;
+const COLLECTION_BOTTOM_SLOT_HEIGHT: i32 = 42;
 const READER_TITLE_MAX_WIDTH_PX: i32 = 250;
 const READER_PREVIEW_MAX_WIDTH_PX: i32 = 360;
 const READER_PREVIEW_Y: i32 = 214;
@@ -49,6 +60,31 @@ struct StageTextSpec {
     scale: u32,
     left_anchor_x: i32,
     right_anchor_x: i32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ClipRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct CollectionRowSlot {
+    text_x: i32,
+    meta_y: i32,
+    title_y: i32,
+    color: BinaryColor,
+    clip: ClipRect,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ClippedTextSpec {
+    position: Point,
+    color: BinaryColor,
+    alignment: Alignment,
+    max_width_px: i32,
 }
 
 fn ui_font_small() -> &'static MonoFont<'static> {
@@ -142,9 +178,20 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
 
     match playback.plan.animation {
         AnimationDescriptor::None => draw_prepared_screen(frame, &playback.to),
-        AnimationDescriptor::BandReveal(_) => match playback.to {
+        AnimationDescriptor::BandReveal(direction) => match playback.to {
             PreparedScreen::Dashboard(shell) => {
-                draw_dashboard(frame, &shell, playback.step, playback.plan.steps)
+                if let PreparedScreen::Dashboard(from_shell) = playback.from {
+                    draw_dashboard_band_transition(
+                        frame,
+                        &from_shell,
+                        &shell,
+                        direction,
+                        playback.step,
+                        playback.plan.steps,
+                    );
+                } else {
+                    draw_dashboard(frame, &shell, playback.step, playback.plan.steps);
+                }
             }
             PreparedScreen::Settings(shell) => {
                 draw_settings(frame, &shell, playback.step, playback.plan.steps)
@@ -231,26 +278,8 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
 }
 
 fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, total_steps: u8) {
-    draw_status_cluster(
-        frame,
-        shell.status.battery_percent,
-        shell.status.wifi_online,
-    );
-    draw_vertical_rail_scaled(
-        frame,
-        shell.rail.text,
-        LARGE_RAIL_RIGHT_EDGE_X,
-        LARGE_RAIL_Y,
-        LARGE_RAIL_SCALE,
-    );
-    draw_text(
-        frame,
-        shell.items[0].label,
-        Point::new(20, 54),
-        ui_font_title(),
-        BinaryColor::On,
-        Alignment::Left,
-    );
+    draw_dashboard_chrome(frame, shell);
+    draw_dashboard_row_at(frame, shell.items[0].label, dashboard_top_slot());
     draw_selection_band(
         frame,
         16,
@@ -260,32 +289,13 @@ fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, tot
         step,
         total_steps,
     );
-    draw_text(
-        frame,
-        shell.items[1].label,
-        Point::new(30, 92),
-        ui_font_title(),
-        BinaryColor::Off,
-        Alignment::Left,
-    );
+    draw_dashboard_row_at(frame, shell.items[1].label, dashboard_selected_slot());
 
     if step >= total_steps {
-        fill_rect(frame, 303, 105, 28, 5, BinaryColor::Off);
-        fill_rect(frame, 307, 116, 22, 5, BinaryColor::Off);
+        draw_dashboard_selected_band_accent(frame);
     }
 
-    draw_text(
-        frame,
-        shell.items[2].label,
-        Point::new(20, 161),
-        ui_font_title(),
-        BinaryColor::On,
-        Alignment::Left,
-    );
-
-    if let Some(sync_indicator) = shell.sync_indicator {
-        draw_dashboard_sync_indicator(frame, sync_indicator.label, sync_indicator.spinner_phase);
-    }
+    draw_dashboard_row_at(frame, shell.items[2].label, dashboard_bottom_slot());
 }
 
 fn draw_dashboard_sync_indicator(frame: &mut FrameBuffer, label: &str, spinner_phase: u8) {
@@ -306,6 +316,144 @@ fn draw_dashboard_sync_indicator(frame: &mut FrameBuffer, label: &str, spinner_p
     );
 }
 
+fn draw_dashboard_band_transition(
+    frame: &mut FrameBuffer,
+    from: &DashboardShell,
+    to: &DashboardShell,
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+) {
+    if step >= total_steps {
+        draw_dashboard(frame, to, 1, 1);
+        return;
+    }
+
+    draw_dashboard_chrome(frame, to);
+    draw_dashboard_slot_transition(
+        frame,
+        from.items[0].label,
+        to.items[0].label,
+        dashboard_top_slot(),
+        direction,
+        step,
+        total_steps,
+    );
+    fill_rect(
+        frame,
+        16,
+        DASHBOARD_SELECTED_SLOT_Y,
+        320,
+        DASHBOARD_SELECTED_SLOT_HEIGHT,
+        BinaryColor::On,
+    );
+    draw_selection_band(
+        frame,
+        16,
+        DASHBOARD_SELECTED_SLOT_Y,
+        320,
+        DASHBOARD_SELECTED_SLOT_HEIGHT,
+        1,
+        1,
+    );
+    draw_dashboard_slot_transition(
+        frame,
+        from.items[1].label,
+        to.items[1].label,
+        dashboard_selected_slot(),
+        direction,
+        step,
+        total_steps,
+    );
+    draw_dashboard_selected_band_accent(frame);
+    draw_dashboard_slot_transition(
+        frame,
+        from.items[2].label,
+        to.items[2].label,
+        dashboard_bottom_slot(),
+        direction,
+        step,
+        total_steps,
+    );
+}
+
+fn draw_dashboard_chrome(frame: &mut FrameBuffer, shell: &DashboardShell) {
+    draw_status_cluster(
+        frame,
+        shell.status.battery_percent,
+        shell.status.wifi_online,
+    );
+    draw_vertical_rail_scaled(
+        frame,
+        shell.rail.text,
+        LARGE_RAIL_RIGHT_EDGE_X,
+        LARGE_RAIL_Y,
+        LARGE_RAIL_SCALE,
+    );
+
+    if let Some(sync_indicator) = shell.sync_indicator {
+        draw_dashboard_sync_indicator(frame, sync_indicator.label, sync_indicator.spinner_phase);
+    }
+}
+
+fn draw_dashboard_row_at(frame: &mut FrameBuffer, label: &str, slot: CollectionRowSlot) {
+    draw_text_ellipsized(
+        frame,
+        label,
+        Point::new(slot.text_x, slot.meta_y),
+        ui_font_title(),
+        slot.color,
+        Alignment::Left,
+        DASHBOARD_TEXT_RIGHT_EDGE_X - slot.text_x,
+    );
+}
+
+fn draw_dashboard_slot_transition(
+    frame: &mut FrameBuffer,
+    from: &str,
+    to: &str,
+    slot: CollectionRowSlot,
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+) {
+    let incoming_offset = slide_offset(direction, step, total_steps, DASHBOARD_SLOT_TRAVEL_PX);
+    let outgoing_offset = match direction {
+        MotionDirection::Forward => incoming_offset - DASHBOARD_SLOT_TRAVEL_PX,
+        MotionDirection::Backward => incoming_offset + DASHBOARD_SLOT_TRAVEL_PX,
+    };
+
+    draw_text_ellipsized_clipped(
+        frame,
+        from,
+        ui_font_title(),
+        ClippedTextSpec {
+            position: Point::new(slot.text_x, slot.meta_y + outgoing_offset),
+            color: slot.color,
+            alignment: Alignment::Left,
+            max_width_px: DASHBOARD_TEXT_RIGHT_EDGE_X - slot.text_x,
+        },
+        slot.clip,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        to,
+        ui_font_title(),
+        ClippedTextSpec {
+            position: Point::new(slot.text_x, slot.meta_y + incoming_offset),
+            color: slot.color,
+            alignment: Alignment::Left,
+            max_width_px: DASHBOARD_TEXT_RIGHT_EDGE_X - slot.text_x,
+        },
+        slot.clip,
+    );
+}
+
+fn draw_dashboard_selected_band_accent(frame: &mut FrameBuffer) {
+    fill_rect(frame, 303, 105, 28, 5, BinaryColor::Off);
+    fill_rect(frame, 307, 116, 22, 5, BinaryColor::Off);
+}
+
 fn sync_spinner_frame(spinner_phase: u8) -> &'static str {
     match spinner_phase % 4 {
         0 => "|",
@@ -315,6 +463,101 @@ fn sync_spinner_frame(spinner_phase: u8) -> &'static str {
     }
 }
 
+const fn collection_slot(
+    text_x: i32,
+    meta_y: i32,
+    title_y: i32,
+    color: BinaryColor,
+    clip_y: i32,
+    clip_height: i32,
+) -> CollectionRowSlot {
+    CollectionRowSlot {
+        text_x,
+        meta_y,
+        title_y,
+        color,
+        clip: ClipRect {
+            x: 16,
+            y: clip_y,
+            width: 320,
+            height: clip_height,
+        },
+    }
+}
+
+const fn collection_top_slot() -> CollectionRowSlot {
+    collection_slot(
+        20,
+        48,
+        66,
+        BinaryColor::On,
+        COLLECTION_TOP_SLOT_Y,
+        COLLECTION_TOP_SLOT_HEIGHT,
+    )
+}
+
+const fn collection_selected_slot() -> CollectionRowSlot {
+    collection_slot(
+        28,
+        118,
+        135,
+        BinaryColor::Off,
+        COLLECTION_SELECTED_SLOT_Y,
+        COLLECTION_SELECTED_SLOT_HEIGHT,
+    )
+}
+
+const fn collection_bottom_slot() -> CollectionRowSlot {
+    collection_slot(
+        20,
+        185,
+        203,
+        BinaryColor::On,
+        COLLECTION_BOTTOM_SLOT_Y,
+        COLLECTION_BOTTOM_SLOT_HEIGHT,
+    )
+}
+
+const fn dashboard_slot(
+    text_x: i32,
+    text_y: i32,
+    color: BinaryColor,
+    clip_y: i32,
+    clip_height: i32,
+) -> CollectionRowSlot {
+    collection_slot(text_x, text_y, text_y, color, clip_y, clip_height)
+}
+
+const fn dashboard_top_slot() -> CollectionRowSlot {
+    dashboard_slot(
+        20,
+        54,
+        BinaryColor::On,
+        DASHBOARD_TOP_SLOT_Y,
+        DASHBOARD_TOP_SLOT_HEIGHT,
+    )
+}
+
+const fn dashboard_selected_slot() -> CollectionRowSlot {
+    dashboard_slot(
+        30,
+        92,
+        BinaryColor::Off,
+        DASHBOARD_SELECTED_SLOT_Y,
+        DASHBOARD_SELECTED_SLOT_HEIGHT,
+    )
+}
+
+const fn dashboard_bottom_slot() -> CollectionRowSlot {
+    dashboard_slot(
+        20,
+        161,
+        BinaryColor::On,
+        DASHBOARD_BOTTOM_SLOT_Y,
+        DASHBOARD_BOTTOM_SLOT_HEIGHT,
+    )
+}
+
 fn draw_collection(
     frame: &mut FrameBuffer,
     shell: &ContentListShell,
@@ -322,6 +565,63 @@ fn draw_collection(
     total_steps: u8,
     slide_offset: i32,
 ) {
+    draw_collection_chrome(frame, shell);
+    draw_collection_row_at(
+        frame,
+        &shell.rows[0],
+        Point::new(20, 48 + slide_offset),
+        Point::new(20, 66 + slide_offset),
+        BinaryColor::On,
+    );
+
+    draw_selection_band(
+        frame,
+        16,
+        shell.band.y,
+        320,
+        shell.band.height as i32,
+        step,
+        total_steps,
+    );
+    draw_collection_row_at(
+        frame,
+        &shell.rows[1],
+        Point::new(28, 118 + slide_offset),
+        Point::new(28, 135 + slide_offset),
+        BinaryColor::Off,
+    );
+
+    if step >= total_steps {
+        draw_collection_selected_band_accent(frame);
+    }
+
+    draw_collection_row_at(
+        frame,
+        &shell.rows[2],
+        Point::new(20, 185 + slide_offset),
+        Point::new(20, 203 + slide_offset),
+        BinaryColor::On,
+    );
+}
+
+fn draw_collection_list_step(
+    frame: &mut FrameBuffer,
+    from: &ContentListShell,
+    to: &ContentListShell,
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+) {
+    if step >= total_steps {
+        draw_collection(frame, to, 1, 1, 0);
+        return;
+    }
+
+    draw_collection_chrome(frame, to);
+    draw_collection_list_step_slots(frame, from, to, direction, step, total_steps);
+}
+
+fn draw_collection_chrome(frame: &mut FrameBuffer, shell: &ContentListShell) {
     draw_status_cluster(
         frame,
         shell.status.battery_percent,
@@ -347,79 +647,9 @@ fn draw_collection(
     } else {
         draw_vertical_rail(frame, shell.rail.text, 398, 26);
     }
-
-    draw_text_ellipsized(
-        frame,
-        shell.rows[0].meta.as_str(),
-        Point::new(20, 48 + slide_offset),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
-    );
-    draw_text_ellipsized(
-        frame,
-        shell.rows[0].title.as_str(),
-        Point::new(20, 66 + slide_offset),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
-    );
-
-    draw_selection_band(
-        frame,
-        16,
-        shell.band.y,
-        320,
-        shell.band.height as i32,
-        step,
-        total_steps,
-    );
-    draw_text_ellipsized(
-        frame,
-        shell.rows[1].meta.as_str(),
-        Point::new(28, 118 + slide_offset),
-        ui_font_body(),
-        BinaryColor::Off,
-        Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - 28,
-    );
-    draw_text_ellipsized(
-        frame,
-        shell.rows[1].title.as_str(),
-        Point::new(28, 135 + slide_offset),
-        ui_font_body(),
-        BinaryColor::Off,
-        Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - 28,
-    );
-
-    if step >= total_steps {
-        draw_collection_selected_band_accent(frame);
-    }
-
-    draw_text_ellipsized(
-        frame,
-        shell.rows[2].meta.as_str(),
-        Point::new(20, 185 + slide_offset),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
-    );
-    draw_text_ellipsized(
-        frame,
-        shell.rows[2].title.as_str(),
-        Point::new(20, 203 + slide_offset),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - 20,
-    );
 }
 
-fn draw_collection_list_step(
+fn draw_collection_list_step_slots(
     frame: &mut FrameBuffer,
     from: &ContentListShell,
     to: &ContentListShell,
@@ -427,25 +657,6 @@ fn draw_collection_list_step(
     step: u8,
     total_steps: u8,
 ) {
-    draw_collection(frame, to, 1, 1, 0);
-
-    if step >= total_steps {
-        return;
-    }
-
-    draw_collection_list_step_overlay(frame, from, to, direction, step, total_steps);
-}
-
-fn draw_collection_list_step_overlay(
-    frame: &mut FrameBuffer,
-    from: &ContentListShell,
-    to: &ContentListShell,
-    direction: MotionDirection,
-    step: u8,
-    total_steps: u8,
-) {
-    let band_y = to.band.y;
-    let band_height = to.band.height as i32;
     let incoming_offset =
         slide_offset(direction, step, total_steps, COLLECTION_LIST_STEP_TRAVEL_PX);
     let outgoing_offset = match direction {
@@ -453,44 +664,140 @@ fn draw_collection_list_step_overlay(
         MotionDirection::Backward => incoming_offset + COLLECTION_LIST_STEP_TRAVEL_PX,
     };
 
-    fill_rect(frame, 16, band_y, 320, band_height, BinaryColor::On);
-    draw_selection_band(frame, 16, band_y, 320, band_height, 1, 1);
-
-    draw_collection_selected_row(frame, &from.rows[1], outgoing_offset);
-    draw_collection_selected_row(frame, &to.rows[1], incoming_offset);
+    draw_collection_row_slot_transition(
+        frame,
+        &from.rows[0],
+        &to.rows[0],
+        collection_top_slot(),
+        incoming_offset,
+        outgoing_offset,
+    );
+    fill_rect(
+        frame,
+        16,
+        COLLECTION_SELECTED_SLOT_Y,
+        320,
+        COLLECTION_SELECTED_SLOT_HEIGHT,
+        BinaryColor::On,
+    );
+    draw_selection_band(
+        frame,
+        16,
+        COLLECTION_SELECTED_SLOT_Y,
+        320,
+        COLLECTION_SELECTED_SLOT_HEIGHT,
+        1,
+        1,
+    );
+    draw_collection_row_slot_transition(
+        frame,
+        &from.rows[1],
+        &to.rows[1],
+        collection_selected_slot(),
+        incoming_offset,
+        outgoing_offset,
+    );
     draw_collection_selected_band_accent(frame);
+    draw_collection_row_slot_transition(
+        frame,
+        &from.rows[2],
+        &to.rows[2],
+        collection_bottom_slot(),
+        incoming_offset,
+        outgoing_offset,
+    );
 }
 
-fn draw_collection_selected_row(frame: &mut FrameBuffer, row: &ContentRow, y_offset: i32) {
+fn draw_collection_row_slot_transition(
+    frame: &mut FrameBuffer,
+    from: &ContentRow,
+    to: &ContentRow,
+    slot: CollectionRowSlot,
+    incoming_offset: i32,
+    outgoing_offset: i32,
+) {
+    draw_collection_row_at_clipped(
+        frame,
+        from,
+        Point::new(slot.text_x, slot.meta_y + outgoing_offset),
+        Point::new(slot.text_x, slot.title_y + outgoing_offset),
+        slot.color,
+        slot.clip,
+    );
+    draw_collection_row_at_clipped(
+        frame,
+        to,
+        Point::new(slot.text_x, slot.meta_y + incoming_offset),
+        Point::new(slot.text_x, slot.title_y + incoming_offset),
+        slot.color,
+        slot.clip,
+    );
+}
+
+fn draw_collection_row_at(
+    frame: &mut FrameBuffer,
+    row: &ContentRow,
+    meta_position: Point,
+    title_position: Point,
+    color: BinaryColor,
+) {
     draw_text_ellipsized(
         frame,
         row.meta.as_str(),
-        Point::new(
-            COLLECTION_SELECTED_TEXT_X,
-            COLLECTION_SELECTED_META_Y + y_offset,
-        ),
+        meta_position,
         ui_font_body(),
-        BinaryColor::Off,
+        color,
         Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - COLLECTION_SELECTED_TEXT_X,
+        COLLECTION_TEXT_RIGHT_EDGE_X - meta_position.x,
     );
     draw_text_ellipsized(
         frame,
         row.title.as_str(),
-        Point::new(
-            COLLECTION_SELECTED_TEXT_X,
-            COLLECTION_SELECTED_TITLE_Y + y_offset,
-        ),
+        title_position,
         ui_font_body(),
-        BinaryColor::Off,
+        color,
         Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - COLLECTION_SELECTED_TEXT_X,
+        COLLECTION_TEXT_RIGHT_EDGE_X - title_position.x,
     );
 }
 
 fn draw_collection_selected_band_accent(frame: &mut FrameBuffer) {
     fill_rect(frame, 303, 129, 28, 5, BinaryColor::Off);
     fill_rect(frame, 307, 140, 22, 5, BinaryColor::Off);
+}
+
+fn draw_collection_row_at_clipped(
+    frame: &mut FrameBuffer,
+    row: &ContentRow,
+    meta_position: Point,
+    title_position: Point,
+    color: BinaryColor,
+    clip: ClipRect,
+) {
+    draw_text_ellipsized_clipped(
+        frame,
+        row.meta.as_str(),
+        ui_font_body(),
+        ClippedTextSpec {
+            position: meta_position,
+            color,
+            alignment: Alignment::Left,
+            max_width_px: COLLECTION_TEXT_RIGHT_EDGE_X - meta_position.x,
+        },
+        clip,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        row.title.as_str(),
+        ui_font_body(),
+        ClippedTextSpec {
+            position: title_position,
+            color,
+            alignment: Alignment::Left,
+            max_width_px: COLLECTION_TEXT_RIGHT_EDGE_X - title_position.x,
+        },
+        clip,
+    );
 }
 
 fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
@@ -1224,6 +1531,29 @@ fn draw_text_ellipsized(
     draw_text(frame, clipped.as_str(), position, font, color, alignment);
 }
 
+fn draw_text_ellipsized_clipped(
+    frame: &mut FrameBuffer,
+    text: &str,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    spec: ClippedTextSpec,
+    clip: ClipRect,
+) {
+    let clipped = ellipsized_text(text, font, 1, spec.max_width_px);
+    let style = MonoTextStyleBuilder::new()
+        .font(font)
+        .text_color(spec.color)
+        .build();
+    let text_style = TextStyleBuilder::new()
+        .alignment(spec.alignment)
+        .baseline(Baseline::Top)
+        .build();
+    let mut clipped_frame = ClippedFrameBuffer::new(frame, clip);
+
+    Text::with_text_style(clipped.as_str(), spec.position, style, text_style)
+        .draw(&mut clipped_frame)
+        .ok();
+}
+
 fn draw_text_scaled(
     frame: &mut FrameBuffer,
     text: &str,
@@ -1401,6 +1731,61 @@ impl OriginDimensions for ScaledFrameBuffer<'_> {
     }
 }
 
+struct ClippedFrameBuffer<'a> {
+    frame: &'a mut FrameBuffer,
+    clip_x: i32,
+    clip_y: i32,
+    clip_width: i32,
+    clip_height: i32,
+}
+
+impl<'a> ClippedFrameBuffer<'a> {
+    fn new(frame: &'a mut FrameBuffer, clip: ClipRect) -> Self {
+        Self {
+            frame,
+            clip_x: clip.x,
+            clip_y: clip.y,
+            clip_width: clip.width,
+            clip_height: clip.height,
+        }
+    }
+
+    fn contains(&self, point: Point) -> bool {
+        point.x >= self.clip_x
+            && point.y >= self.clip_y
+            && point.x < self.clip_x + self.clip_width
+            && point.y < self.clip_y + self.clip_height
+    }
+}
+
+impl DrawTarget for ClippedFrameBuffer<'_> {
+    type Color = BinaryColor;
+    type Error = Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(point, color) in pixels {
+            if point.x < 0 || point.y < 0 || !self.contains(point) {
+                continue;
+            }
+
+            let _ = self
+                .frame
+                .set_pixel(point.x as usize, point.y as usize, color.is_on());
+        }
+
+        Ok(())
+    }
+}
+
+impl OriginDimensions for ClippedFrameBuffer<'_> {
+    fn size(&self) -> Size {
+        self.frame.size()
+    }
+}
+
 fn battery_label(percent: u8) -> &'static str {
     match percent {
         0..=9 => "09%",
@@ -1526,6 +1911,13 @@ mod tests {
     }
 
     fn make_dashboard_shell(spinner_phase: u8) -> DashboardShell {
+        make_dashboard_shell_with_labels(spinner_phase, ["INBOX", "SAVED", "RECS"])
+    }
+
+    fn make_dashboard_shell_with_labels(
+        spinner_phase: u8,
+        labels: [&'static str; 3],
+    ) -> DashboardShell {
         DashboardShell {
             appearance: AppearanceMode::Light,
             status: StatusCluster {
@@ -1539,17 +1931,17 @@ mod tests {
             rail: VerticalRail { text: "HOME" },
             items: [
                 DashboardItem {
-                    label: "INBOX",
+                    label: labels[0],
                     live_dot: true,
                     selected: false,
                 },
                 DashboardItem {
-                    label: "SAVED",
+                    label: labels[1],
                     live_dot: false,
                     selected: true,
                 },
                 DashboardItem {
-                    label: "RECS",
+                    label: labels[2],
                     live_dot: true,
                     selected: false,
                 },
@@ -1631,7 +2023,105 @@ mod tests {
     }
 
     #[test]
-    fn list_step_followup_frames_stay_within_selection_band() {
+    fn dashboard_transition_frames_stay_within_visible_rows() {
+        let from = make_dashboard_shell_with_labels(0, ["INBOX", "SAVED", "RECS"]);
+        let to = make_dashboard_shell_with_labels(0, ["SAVED", "RECS", "SETTINGS"]);
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::Dashboard(from),
+            to: PreparedScreen::Dashboard(to),
+            screen: Screen::Dashboard,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::BandReveal(MotionDirection::Forward),
+                3,
+                50,
+            ),
+            step: 1,
+        };
+        let step_2 = step_1.advance();
+        let step_3 = step_2.advance();
+        let mut committed = FrameBuffer::new();
+        let mut frame_1 = FrameBuffer::new();
+        let mut frame_2 = FrameBuffer::new();
+        let mut frame_3 = FrameBuffer::new();
+
+        draw_prepared_screen(&mut committed, &PreparedScreen::Dashboard(from));
+        draw_transition_frame(&mut frame_1, &step_1);
+        draw_transition_frame(&mut frame_2, &step_2);
+        draw_transition_frame(&mut frame_3, &step_3);
+
+        for dirty in [
+            diff_dirty_rows(&committed, &frame_1),
+            diff_dirty_rows(&frame_1, &frame_2),
+            diff_dirty_rows(&frame_2, &frame_3),
+        ] {
+            assert!(dirty.count() <= 120, "dirty rows={}", dirty.count());
+            for row in dirty.iter() {
+                assert!((42..191).contains(&row), "unexpected dirty row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn list_step_transition_start_stays_within_visible_rows() {
+        let from = make_collection_shell([("meta-a", "A"), ("meta-b", "B"), ("meta-c", "C")]);
+        let to = make_collection_shell([("meta-b", "B"), ("meta-c", "C"), ("meta-d", "D")]);
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::Collection(from),
+            to: PreparedScreen::Collection(to),
+            screen: Screen::Saved,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::ListStep(MotionDirection::Forward),
+                3,
+                55,
+            ),
+            step: 1,
+        };
+        let mut committed = FrameBuffer::new();
+        let mut frame_1 = FrameBuffer::new();
+
+        draw_prepared_screen(&mut committed, &PreparedScreen::Collection(from));
+        draw_transition_frame(&mut frame_1, &step_1);
+
+        let dirty = diff_dirty_rows(&committed, &frame_1);
+
+        assert!(dirty.count() <= 120, "dirty rows={}", dirty.count());
+        for row in dirty.iter() {
+            assert!((42..221).contains(&row), "unexpected dirty row {row}");
+        }
+    }
+
+    #[test]
+    fn list_step_intermediate_frames_stay_within_visible_rows() {
+        let from = make_collection_shell([("meta-a", "A"), ("meta-b", "B"), ("meta-c", "C")]);
+        let to = make_collection_shell([("meta-b", "B"), ("meta-c", "C"), ("meta-d", "D")]);
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::Collection(from),
+            to: PreparedScreen::Collection(to),
+            screen: Screen::Saved,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::ListStep(MotionDirection::Forward),
+                3,
+                55,
+            ),
+            step: 1,
+        };
+        let step_2 = step_1.advance();
+        let mut frame_1 = FrameBuffer::new();
+        let mut frame_2 = FrameBuffer::new();
+
+        draw_transition_frame(&mut frame_1, &step_1);
+        draw_transition_frame(&mut frame_2, &step_2);
+
+        let dirty = diff_dirty_rows(&frame_1, &frame_2);
+
+        assert!(dirty.count() <= 120, "dirty rows={}", dirty.count());
+        for row in dirty.iter() {
+            assert!((42..221).contains(&row), "unexpected dirty row {row}");
+        }
+    }
+
+    #[test]
+    fn list_step_final_commit_stays_within_visible_rows() {
         let from = make_collection_shell([("meta-a", "A"), ("meta-b", "B"), ("meta-c", "C")]);
         let to = make_collection_shell([("meta-b", "B"), ("meta-c", "C"), ("meta-d", "D")]);
         let step_1 = AnimationPlayback {
@@ -1647,22 +2137,17 @@ mod tests {
         };
         let step_2 = step_1.advance();
         let step_3 = step_2.advance();
-        let mut frame_1 = FrameBuffer::new();
         let mut frame_2 = FrameBuffer::new();
         let mut frame_3 = FrameBuffer::new();
 
-        draw_transition_frame(&mut frame_1, &step_1);
         draw_transition_frame(&mut frame_2, &step_2);
         draw_transition_frame(&mut frame_3, &step_3);
 
-        for dirty in [
-            diff_dirty_rows(&frame_1, &frame_2),
-            diff_dirty_rows(&frame_2, &frame_3),
-        ] {
-            assert!(dirty.count() <= 80, "dirty rows={}", dirty.count());
-            for row in dirty.iter() {
-                assert!((106..174).contains(&row), "unexpected dirty row {row}");
-            }
+        let dirty = diff_dirty_rows(&frame_2, &frame_3);
+
+        assert!(dirty.count() <= 120, "dirty rows={}", dirty.count());
+        for row in dirty.iter() {
+            assert!((42..221).contains(&row), "unexpected dirty row {row}");
         }
     }
 }
