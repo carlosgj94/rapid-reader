@@ -49,8 +49,26 @@ const COLLECTION_SELECTED_SLOT_Y: i32 = 106;
 const COLLECTION_SELECTED_SLOT_HEIGHT: i32 = 68;
 const COLLECTION_BOTTOM_SLOT_Y: i32 = 179;
 const COLLECTION_BOTTOM_SLOT_HEIGHT: i32 = 42;
-const READER_TITLE_MAX_WIDTH_PX: i32 = 250;
-const READER_PREVIEW_MAX_WIDTH_PX: i32 = 360;
+const COLLECTION_SPINNER_CENTER_X: i32 = 350;
+const COLLECTION_SPINNER_CLIP_RIGHT_PAD: i32 = 24;
+const PARAGRAPH_SLOT_TRAVEL_PX: i32 = 18;
+const PARAGRAPH_TOP_SLOT_Y: i32 = 52;
+const PARAGRAPH_TOP_SLOT_HEIGHT: i32 = 24;
+const PARAGRAPH_SELECTED_SLOT_Y: i32 = 88;
+const PARAGRAPH_SELECTED_SLOT_HEIGHT: i32 = 82;
+const PARAGRAPH_BOTTOM_SLOT_Y: i32 = 184;
+const PARAGRAPH_BOTTOM_SLOT_HEIGHT: i32 = 44;
+const PAUSE_MODAL_CENTER_X: i32 = 200;
+const PAUSE_MODAL_CENTER_Y: i32 = 118;
+const PAUSE_MODAL_MIN_WIDTH: u32 = 112;
+const PAUSE_MODAL_MIN_HEIGHT: u32 = 52;
+const PAUSE_MODAL_MAX_WIDTH: u32 = 286;
+const PAUSE_MODAL_MAX_HEIGHT: u32 = 166;
+const PAUSE_MODAL_CONTENT_OFFSET_PX: i32 = 8;
+const READER_TEXT_LEFT_X: i32 = 20;
+const READER_TEXT_RIGHT_X: i32 = 380;
+const READER_TITLE_MAX_WIDTH_PX: i32 = READER_TEXT_RIGHT_X - READER_TEXT_LEFT_X;
+const READER_FOOTER_WPM_GAP_PX: i32 = 16;
 const READER_PREVIEW_Y: i32 = 214;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,6 +102,13 @@ struct ClippedTextSpec {
     position: Point,
     color: BinaryColor,
     alignment: Alignment,
+    max_width_px: i32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TextPairSlotSpec {
+    slot: CollectionRowSlot,
+    font: &'static MonoFont<'static>,
     max_width_px: i32,
 }
 
@@ -227,19 +252,52 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
         AnimationDescriptor::ReaderExit => {
             draw_prepared_screen(frame, &playback.to);
         }
-        AnimationDescriptor::ModalReveal | AnimationDescriptor::ModalHide => {
-            if let PreparedScreen::Reader(shell) = playback.to {
+        AnimationDescriptor::ModalReveal => {
+            if let (PreparedScreen::Reader(from_shell), PreparedScreen::Reader(to_shell)) =
+                (playback.from, playback.to)
+            {
+                draw_reader_modal_transition(
+                    frame,
+                    &from_shell,
+                    &to_shell,
+                    true,
+                    playback.step,
+                    playback.plan.steps,
+                );
+            } else if let PreparedScreen::Reader(shell) = playback.to {
+                draw_reader(frame, &shell, playback.step, playback.plan.steps);
+            } else {
+                draw_prepared_screen(frame, &playback.to);
+            }
+        }
+        AnimationDescriptor::ModalHide => {
+            if let (PreparedScreen::Reader(from_shell), PreparedScreen::Reader(to_shell)) =
+                (playback.from, playback.to)
+            {
+                draw_reader_modal_transition(
+                    frame,
+                    &from_shell,
+                    &to_shell,
+                    false,
+                    playback.step,
+                    playback.plan.steps,
+                );
+            } else if let PreparedScreen::Reader(shell) = playback.to {
                 draw_reader(frame, &shell, playback.step, playback.plan.steps);
             } else {
                 draw_prepared_screen(frame, &playback.to);
             }
         }
         AnimationDescriptor::ParagraphTickMove(direction) => {
-            if let PreparedScreen::ParagraphNavigation(shell) = playback.to {
-                draw_paragraph_navigation(frame, &shell, playback.step, playback.plan.steps);
-                draw_tick_motion_accent(
+            if let (
+                PreparedScreen::ParagraphNavigation(from_shell),
+                PreparedScreen::ParagraphNavigation(to_shell),
+            ) = (playback.from, playback.to)
+            {
+                draw_paragraph_navigation_transition(
                     frame,
-                    &shell.rail,
+                    &from_shell,
+                    &to_shell,
                     direction,
                     playback.step,
                     playback.plan.steps,
@@ -558,6 +616,63 @@ const fn dashboard_bottom_slot() -> CollectionRowSlot {
     )
 }
 
+const fn paragraph_top_slot() -> CollectionRowSlot {
+    collection_slot(
+        20,
+        58,
+        58,
+        BinaryColor::On,
+        PARAGRAPH_TOP_SLOT_Y,
+        PARAGRAPH_TOP_SLOT_HEIGHT,
+    )
+}
+
+const fn paragraph_selected_slot() -> CollectionRowSlot {
+    collection_slot(
+        34,
+        106,
+        126,
+        BinaryColor::Off,
+        PARAGRAPH_SELECTED_SLOT_Y,
+        PARAGRAPH_SELECTED_SLOT_HEIGHT,
+    )
+}
+
+const fn paragraph_bottom_slot() -> CollectionRowSlot {
+    collection_slot(
+        20,
+        188,
+        210,
+        BinaryColor::On,
+        PARAGRAPH_BOTTOM_SLOT_Y,
+        PARAGRAPH_BOTTOM_SLOT_HEIGHT,
+    )
+}
+
+fn paragraph_top_slot_spec() -> TextPairSlotSpec {
+    TextPairSlotSpec {
+        slot: paragraph_top_slot(),
+        font: ui_font_body(),
+        max_width_px: 320,
+    }
+}
+
+fn paragraph_selected_slot_spec() -> TextPairSlotSpec {
+    TextPairSlotSpec {
+        slot: paragraph_selected_slot(),
+        font: ui_font_body(),
+        max_width_px: 290,
+    }
+}
+
+fn paragraph_bottom_slot_spec() -> TextPairSlotSpec {
+    TextPairSlotSpec {
+        slot: paragraph_bottom_slot(),
+        font: ui_font_body(),
+        max_width_px: 320,
+    }
+}
+
 fn draw_collection(
     frame: &mut FrameBuffer,
     shell: &ContentListShell,
@@ -759,6 +874,16 @@ fn draw_collection_row_at(
         Alignment::Left,
         COLLECTION_TEXT_RIGHT_EDGE_X - title_position.x,
     );
+
+    if let Some(spinner_phase) = row.loading_phase {
+        draw_collection_loading_spinner(
+            frame,
+            spinner_phase,
+            collection_spinner_center(meta_position, title_position),
+            color,
+            None,
+        );
+    }
 }
 
 fn draw_collection_selected_band_accent(frame: &mut FrameBuffer) {
@@ -798,24 +923,77 @@ fn draw_collection_row_at_clipped(
         },
         clip,
     );
+
+    if let Some(spinner_phase) = row.loading_phase {
+        draw_collection_loading_spinner(
+            frame,
+            spinner_phase,
+            collection_spinner_center(meta_position, title_position),
+            color,
+            Some(collection_spinner_clip(clip)),
+        );
+    }
+}
+
+fn collection_spinner_center(meta_position: Point, title_position: Point) -> Point {
+    Point::new(
+        COLLECTION_SPINNER_CENTER_X,
+        meta_position.y + ((title_position.y - meta_position.y) / 2) + 2,
+    )
+}
+
+const fn collection_spinner_clip(clip: ClipRect) -> ClipRect {
+    ClipRect {
+        x: clip.x,
+        y: clip.y,
+        width: clip.width + COLLECTION_SPINNER_CLIP_RIGHT_PAD,
+        height: clip.height,
+    }
+}
+
+fn draw_collection_loading_spinner(
+    frame: &mut FrameBuffer,
+    spinner_phase: u8,
+    center: Point,
+    color: BinaryColor,
+    clip: Option<ClipRect>,
+) {
+    fill_rect_clipped(frame, center.x - 1, center.y - 1, 3, 3, color, clip);
+
+    for (x, y) in [
+        (center.x, center.y - 4),
+        (center.x + 4, center.y),
+        (center.x, center.y + 4),
+        (center.x - 4, center.y),
+    ] {
+        fill_rect_clipped(frame, x, y, 1, 1, color, clip);
+    }
+
+    match spinner_phase % 4 {
+        0 => fill_rect_clipped(frame, center.x - 1, center.y - 6, 3, 3, color, clip),
+        1 => fill_rect_clipped(frame, center.x + 4, center.y - 1, 3, 3, color, clip),
+        2 => fill_rect_clipped(frame, center.x - 1, center.y + 4, 3, 3, color, clip),
+        _ => fill_rect_clipped(frame, center.x - 6, center.y - 1, 3, 3, color, clip),
+    }
 }
 
 fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
+    draw_reader_base(frame, shell, step, total_steps);
+
+    if let Some(modal) = shell.pause_modal {
+        draw_pause_modal(frame, &modal, step, total_steps);
+    }
+}
+
+fn draw_reader_base(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
     draw_text_ellipsized(
         frame,
         shell.stage.title.as_str(),
-        Point::new(20, 18),
+        Point::new(READER_TEXT_LEFT_X, 18),
         ui_font_title(),
         BinaryColor::On,
         Alignment::Left,
         READER_TITLE_MAX_WIDTH_PX,
-    );
-    draw_text_right(
-        frame,
-        wpm_label(shell.stage.wpm),
-        Point::new(380, 18),
-        ui_font_body(),
-        BinaryColor::On,
     );
 
     let stage_ready = step.saturating_mul(2) >= total_steps;
@@ -851,11 +1029,18 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
     draw_text_ellipsized(
         frame,
         shell.stage.preview.as_str(),
-        Point::new(20, READER_PREVIEW_Y),
+        Point::new(READER_TEXT_LEFT_X, READER_PREVIEW_Y),
         ui_font_body(),
         BinaryColor::On,
         Alignment::Left,
-        READER_PREVIEW_MAX_WIDTH_PX,
+        reader_preview_max_width_px(shell.stage.wpm),
+    );
+    draw_text_right(
+        frame,
+        wpm_label(shell.stage.wpm),
+        Point::new(READER_TEXT_RIGHT_X, READER_PREVIEW_Y),
+        ui_font_body(),
+        BinaryColor::On,
     );
     fill_rect(
         frame,
@@ -865,89 +1050,161 @@ fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_ste
         8,
         BinaryColor::On,
     );
-
-    if let Some(modal) = shell.pause_modal {
-        draw_pause_modal(frame, &modal, step, total_steps);
-    }
 }
 
 fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total_steps: u8) {
-    let width = lerp_u32(112, 286, step, total_steps);
-    let height = lerp_u32(52, 166, step, total_steps);
-    let x = 200 - (width as i32 / 2);
-    let y = 118 - (height as i32 / 2);
+    draw_pause_modal_transition(frame, modal, step, total_steps, true);
+}
+
+fn draw_reader_modal_transition(
+    frame: &mut FrameBuffer,
+    from: &ReaderShell,
+    to: &ReaderShell,
+    revealing: bool,
+    step: u8,
+    total_steps: u8,
+) {
+    draw_reader_base(frame, to, 1, 1);
+
+    let modal = if revealing {
+        to.pause_modal
+    } else {
+        from.pause_modal
+    };
+
+    if let Some(modal) = modal {
+        draw_pause_modal_transition(frame, &modal, step, total_steps, revealing);
+    }
+}
+
+fn draw_pause_modal_transition(
+    frame: &mut FrameBuffer,
+    modal: &PauseModal,
+    step: u8,
+    total_steps: u8,
+    revealing: bool,
+) {
+    let phase = if revealing {
+        step
+    } else {
+        total_steps.saturating_sub(step).saturating_add(1)
+    };
+    let content_phase = if revealing {
+        phase
+    } else {
+        total_steps.saturating_sub(step)
+    };
+
+    if !revealing && content_phase == 0 {
+        return;
+    }
+
+    let width = lerp_u32(
+        PAUSE_MODAL_MIN_WIDTH,
+        PAUSE_MODAL_MAX_WIDTH,
+        phase,
+        total_steps,
+    );
+    let height = lerp_u32(
+        PAUSE_MODAL_MIN_HEIGHT,
+        PAUSE_MODAL_MAX_HEIGHT,
+        phase,
+        total_steps,
+    );
+    let x = PAUSE_MODAL_CENTER_X - (width as i32 / 2);
+    let y = PAUSE_MODAL_CENTER_Y - (height as i32 / 2);
+    let clip = ClipRect {
+        x,
+        y,
+        width: width as i32,
+        height: height as i32,
+    };
+    let content_offset = ((total_steps.saturating_sub(content_phase) as i32)
+        * PAUSE_MODAL_CONTENT_OFFSET_PX)
+        / total_steps.max(1) as i32;
+    let divider_width = lerp_u32(0, width.saturating_sub(32), content_phase, total_steps) as i32;
 
     fill_rect(frame, x, y, width as i32, height as i32, BinaryColor::On);
+    stroke_rect(frame, x, y, width as i32, height as i32, BinaryColor::Off);
 
-    if total_steps == 1 || step >= 2 {
-        draw_text(
-            frame,
-            modal.title,
-            Point::new(200, y + 14),
-            ui_font_title(),
-            BinaryColor::Off,
-            Alignment::Center,
-        );
+    draw_text_ellipsized_clipped(
+        frame,
+        modal.title,
+        ui_font_title(),
+        ClippedTextSpec {
+            position: Point::new(PAUSE_MODAL_CENTER_X, y + 14 + content_offset),
+            color: BinaryColor::Off,
+            alignment: Alignment::Center,
+            max_width_px: width as i32 - 32,
+        },
+        clip,
+    );
+
+    if divider_width > 0 {
         fill_rect(
             frame,
-            x + 16,
+            PAUSE_MODAL_CENTER_X - (divider_width / 2),
             y + 46,
-            width as i32 - 32,
+            divider_width,
             1,
             BinaryColor::Off,
         );
     }
 
-    if step >= total_steps {
-        draw_text(
+    if content_phase >= 1 {
+        draw_pause_modal_row(
             frame,
-            modal.rows[0].label,
-            Point::new(x + 18, y + 60),
-            ui_font_small(),
-            BinaryColor::Off,
-            Alignment::Left,
-        );
-        draw_text(
-            frame,
-            modal.rows[0].action,
-            Point::new(x + 166, y + 60),
-            ui_font_small(),
-            BinaryColor::Off,
-            Alignment::Left,
-        );
-        draw_text(
-            frame,
-            modal.rows[1].label,
-            Point::new(x + 18, y + 88),
-            ui_font_small(),
-            BinaryColor::Off,
-            Alignment::Left,
-        );
-        draw_text(
-            frame,
-            modal.rows[1].action,
-            Point::new(x + 166, y + 88),
-            ui_font_small(),
-            BinaryColor::Off,
-            Alignment::Left,
-        );
-        draw_text(
-            frame,
-            modal.rows[2].label,
-            Point::new(x + 18, y + 116),
-            ui_font_small(),
-            BinaryColor::Off,
-            Alignment::Left,
-        );
-        draw_text(
-            frame,
-            modal.rows[2].action,
-            Point::new(x + 166, y + 116),
-            ui_font_small(),
-            BinaryColor::Off,
-            Alignment::Left,
+            &modal.rows[0],
+            Point::new(x + 18, y + 60 + content_offset),
+            clip,
         );
     }
+    if content_phase >= 2 {
+        draw_pause_modal_row(
+            frame,
+            &modal.rows[1],
+            Point::new(x + 18, y + 88 + content_offset),
+            clip,
+        );
+        draw_pause_modal_row(
+            frame,
+            &modal.rows[2],
+            Point::new(x + 18, y + 116 + content_offset),
+            clip,
+        );
+    }
+}
+
+fn draw_pause_modal_row(
+    frame: &mut FrameBuffer,
+    row: &app_runtime::components::PauseModalRow,
+    position: Point,
+    clip: ClipRect,
+) {
+    draw_text_ellipsized_clipped(
+        frame,
+        row.label,
+        ui_font_small(),
+        ClippedTextSpec {
+            position,
+            color: BinaryColor::Off,
+            alignment: Alignment::Left,
+            max_width_px: 140,
+        },
+        clip,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        row.action,
+        ui_font_small(),
+        ClippedTextSpec {
+            position: Point::new(position.x + 148, position.y),
+            color: BinaryColor::Off,
+            alignment: Alignment::Left,
+            max_width_px: 110,
+        },
+        clip,
+    );
 }
 
 fn draw_stage_token(frame: &mut FrameBuffer, left: &str, right: &str, font: StageFont) {
@@ -993,9 +1250,69 @@ fn draw_stage_token(frame: &mut FrameBuffer, left: &str, right: &str, font: Stag
 fn draw_paragraph_navigation(
     frame: &mut FrameBuffer,
     shell: &ParagraphNavigationShell,
+    _step: u8,
+    _total_steps: u8,
+) {
+    draw_paragraph_navigation_chrome(frame, shell);
+    draw_paragraph_body(frame, shell);
+    draw_paragraph_map_rail(frame, shell.rail.selected_index, shell.rail.total_ticks);
+}
+
+fn draw_paragraph_navigation_transition(
+    frame: &mut FrameBuffer,
+    from: &ParagraphNavigationShell,
+    to: &ParagraphNavigationShell,
+    direction: MotionDirection,
     step: u8,
     total_steps: u8,
 ) {
+    if step >= total_steps {
+        draw_paragraph_navigation(frame, to, 1, 1);
+        return;
+    }
+
+    let offsets = slot_transition_offsets(direction, step, total_steps, PARAGRAPH_SLOT_TRAVEL_PX);
+
+    draw_paragraph_navigation_chrome(frame, to);
+    draw_text_pair_slot_transition(
+        frame,
+        from.previous_top.as_str(),
+        None,
+        to.previous_top.as_str(),
+        None,
+        paragraph_top_slot_spec(),
+        offsets,
+    );
+    fill_rect(frame, 20, 88, 304, 82, BinaryColor::On);
+    draw_text_pair_slot_transition(
+        frame,
+        from.selected_label.as_str(),
+        Some(from.selected_excerpt.as_str()),
+        to.selected_label.as_str(),
+        Some(to.selected_excerpt.as_str()),
+        paragraph_selected_slot_spec(),
+        offsets,
+    );
+    draw_text_pair_slot_transition(
+        frame,
+        from.previous_bottom.as_str(),
+        Some(from.final_excerpt.as_str()),
+        to.previous_bottom.as_str(),
+        Some(to.final_excerpt.as_str()),
+        paragraph_bottom_slot_spec(),
+        offsets,
+    );
+    draw_paragraph_map_rail_transition(
+        frame,
+        from.rail.selected_index,
+        to.rail.selected_index,
+        to.rail.total_ticks,
+        step,
+        total_steps,
+    );
+}
+
+fn draw_paragraph_navigation_chrome(frame: &mut FrameBuffer, shell: &ParagraphNavigationShell) {
     draw_text(
         frame,
         shell.title.as_str(),
@@ -1011,66 +1328,27 @@ fn draw_paragraph_navigation(
         ui_font_body(),
         BinaryColor::On,
     );
-    draw_text(
+}
+
+fn draw_paragraph_body(frame: &mut FrameBuffer, shell: &ParagraphNavigationShell) {
+    draw_text_pair_slot(
         frame,
         shell.previous_top.as_str(),
-        Point::new(20, 58),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
+        None,
+        paragraph_top_slot_spec(),
     );
-
-    let card_color = if step == 2 {
-        BinaryColor::Off
-    } else {
-        BinaryColor::On
-    };
-    let card_text = if matches!(card_color, BinaryColor::Off) {
-        BinaryColor::On
-    } else {
-        BinaryColor::Off
-    };
-    fill_rect(frame, 20, 88, 304, 82, card_color);
-    draw_text(
+    fill_rect(frame, 20, 88, 304, 82, BinaryColor::On);
+    draw_text_pair_slot(
         frame,
         shell.selected_label.as_str(),
-        Point::new(34, 106),
-        ui_font_body(),
-        card_text,
-        Alignment::Left,
+        Some(shell.selected_excerpt.as_str()),
+        paragraph_selected_slot_spec(),
     );
-    draw_text(
-        frame,
-        shell.selected_excerpt.as_str(),
-        Point::new(34, 126),
-        ui_font_body(),
-        card_text,
-        Alignment::Left,
-    );
-
-    draw_text(
+    draw_text_pair_slot(
         frame,
         shell.previous_bottom.as_str(),
-        Point::new(20, 188),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
-    );
-    draw_text(
-        frame,
-        shell.final_excerpt.as_str(),
-        Point::new(20, 210),
-        ui_font_body(),
-        BinaryColor::On,
-        Alignment::Left,
-    );
-
-    draw_paragraph_map_rail(
-        frame,
-        shell.rail.selected_index,
-        shell.rail.total_ticks,
-        step,
-        total_steps,
+        Some(shell.final_excerpt.as_str()),
+        paragraph_bottom_slot_spec(),
     );
 }
 
@@ -1288,6 +1566,105 @@ fn draw_status_cluster(frame: &mut FrameBuffer, battery_percent: u8, wifi_online
     );
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SlotTransitionOffsets {
+    incoming: i32,
+    outgoing: i32,
+}
+
+fn slot_transition_offsets(
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+    amplitude: i32,
+) -> SlotTransitionOffsets {
+    let incoming = slide_offset(direction, step, total_steps, amplitude);
+    let outgoing = match direction {
+        MotionDirection::Forward => incoming - amplitude,
+        MotionDirection::Backward => incoming + amplitude,
+    };
+
+    SlotTransitionOffsets { incoming, outgoing }
+}
+
+fn draw_text_pair_slot(
+    frame: &mut FrameBuffer,
+    primary: &str,
+    secondary: Option<&str>,
+    spec: TextPairSlotSpec,
+) {
+    draw_text_ellipsized(
+        frame,
+        primary,
+        Point::new(spec.slot.text_x, spec.slot.meta_y),
+        spec.font,
+        spec.slot.color,
+        Alignment::Left,
+        spec.max_width_px,
+    );
+
+    if let Some(secondary) = secondary {
+        draw_text_ellipsized(
+            frame,
+            secondary,
+            Point::new(spec.slot.text_x, spec.slot.title_y),
+            spec.font,
+            spec.slot.color,
+            Alignment::Left,
+            spec.max_width_px,
+        );
+    }
+}
+
+fn draw_text_pair_slot_transition(
+    frame: &mut FrameBuffer,
+    from_primary: &str,
+    from_secondary: Option<&str>,
+    to_primary: &str,
+    to_secondary: Option<&str>,
+    spec: TextPairSlotSpec,
+    offsets: SlotTransitionOffsets,
+) {
+    draw_text_pair_slot_clipped(frame, from_primary, from_secondary, spec, offsets.outgoing);
+    draw_text_pair_slot_clipped(frame, to_primary, to_secondary, spec, offsets.incoming);
+}
+
+fn draw_text_pair_slot_clipped(
+    frame: &mut FrameBuffer,
+    primary: &str,
+    secondary: Option<&str>,
+    spec: TextPairSlotSpec,
+    y_offset: i32,
+) {
+    draw_text_ellipsized_clipped(
+        frame,
+        primary,
+        spec.font,
+        ClippedTextSpec {
+            position: Point::new(spec.slot.text_x, spec.slot.meta_y + y_offset),
+            color: spec.slot.color,
+            alignment: Alignment::Left,
+            max_width_px: spec.max_width_px,
+        },
+        spec.slot.clip,
+    );
+
+    if let Some(secondary) = secondary {
+        draw_text_ellipsized_clipped(
+            frame,
+            secondary,
+            spec.font,
+            ClippedTextSpec {
+                position: Point::new(spec.slot.text_x, spec.slot.title_y + y_offset),
+                color: spec.slot.color,
+                alignment: Alignment::Left,
+                max_width_px: spec.max_width_px,
+            },
+            spec.slot.clip,
+        );
+    }
+}
+
 fn draw_vertical_rail(frame: &mut FrameBuffer, text: &str, right_edge: i32, y: i32) {
     draw_text_right(
         frame,
@@ -1315,9 +1692,26 @@ fn draw_vertical_rail_scaled(
     );
 }
 
-fn draw_paragraph_map_rail(
+const fn paragraph_tick_offset(index: u8) -> i32 {
+    match index {
+        0 => 0,
+        1 => 24,
+        2 => 48,
+        3 => 76,
+        4 => 116,
+        5 => 140,
+        _ => 162,
+    }
+}
+
+fn draw_paragraph_map_rail(frame: &mut FrameBuffer, selected_index: u8, total_ticks: u8) {
+    draw_paragraph_map_rail_transition(frame, selected_index, selected_index, total_ticks, 1, 1);
+}
+
+fn draw_paragraph_map_rail_transition(
     frame: &mut FrameBuffer,
-    selected_index: u8,
+    from_index: u8,
+    to_index: u8,
     total_ticks: u8,
     step: u8,
     total_steps: u8,
@@ -1327,71 +1721,27 @@ fn draw_paragraph_map_rail(
 
     let mut index = 0;
     while index < total_ticks as i32 {
-        let tick_y = y + match index {
-            0 => 0,
-            1 => 24,
-            2 => 48,
-            3 => 76,
-            4 => 116,
-            5 => 140,
-            _ => 162,
-        };
-
-        if index == selected_index as i32 {
-            let accent_width = lerp_u32(4, 12, step, total_steps) as i32;
-            stroke_rect(
-                frame,
-                x + (12 - accent_width),
-                tick_y,
-                accent_width,
-                28,
-                BinaryColor::On,
-            );
-            fill_rect(
-                frame,
-                x + (12 - accent_width),
-                tick_y,
-                accent_width,
-                28,
-                BinaryColor::On,
-            );
+        let tick_y = y + paragraph_tick_offset(index as u8);
+        let width = if index == from_index as i32 && index == to_index as i32 {
+            12
+        } else if index == from_index as i32 {
+            lerp_u32(12, 4, step, total_steps) as i32
+        } else if index == to_index as i32 {
+            lerp_u32(4, 12, step, total_steps) as i32
         } else {
-            fill_rect(frame, x + 8, tick_y, 4, 14, BinaryColor::On);
-        }
+            4
+        };
+        let height = if index == from_index as i32 || index == to_index as i32 {
+            28
+        } else {
+            14
+        };
+        let tick_x = x + (12 - width);
+
+        fill_rect(frame, tick_x, tick_y, width, height, BinaryColor::On);
 
         index += 1;
     }
-}
-
-fn draw_tick_motion_accent(
-    frame: &mut FrameBuffer,
-    rail: &app_runtime::components::ParagraphMapRail,
-    direction: MotionDirection,
-    step: u8,
-    total_steps: u8,
-) {
-    let accent_x = match direction {
-        MotionDirection::Forward => 348 + (step as i32 * 2),
-        MotionDirection::Backward => 352 - (step as i32 * 2),
-    };
-    let accent_y = match rail.selected_index {
-        0 => 40,
-        1 => 64,
-        2 => 88,
-        3 => 116,
-        4 => 156,
-        5 => 180,
-        _ => 202,
-    };
-
-    stroke_rect(
-        frame,
-        accent_x,
-        accent_y,
-        lerp_u32(4, 12, step, total_steps) as i32,
-        28,
-        BinaryColor::On,
-    );
 }
 
 fn draw_refresh_pulse(frame: &mut FrameBuffer, step: u8, total_steps: u8) {
@@ -1475,6 +1825,36 @@ fn draw_pill(frame: &mut FrameBuffer, x: i32, y: i32, width: i32, height: i32, f
 
 fn fill_rect(frame: &mut FrameBuffer, x: i32, y: i32, width: i32, height: i32, color: BinaryColor) {
     frame.fill_rect(x, y, width, height, color.is_on());
+}
+
+fn fill_rect_clipped(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: BinaryColor,
+    clip: Option<ClipRect>,
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let Some(clip) = clip else {
+        fill_rect(frame, x, y, width, height, color);
+        return;
+    };
+
+    let left = x.max(clip.x);
+    let top = y.max(clip.y);
+    let right = (x + width).min(clip.x + clip.width);
+    let bottom = (y + height).min(clip.y + clip.height);
+
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    fill_rect(frame, left, top, right - left, bottom - top, color);
 }
 
 fn stroke_rect(
@@ -1817,6 +2197,20 @@ fn wpm_label(wpm: u16) -> &'static str {
     }
 }
 
+fn reader_preview_max_width_px(wpm: u16) -> i32 {
+    let wpm_width = mono_text_width_px(wpm_label(wpm), ui_font_body(), 1);
+    (READER_TEXT_RIGHT_X - READER_TEXT_LEFT_X - wpm_width - READER_FOOTER_WPM_GAP_PX).max(0)
+}
+
+fn mono_text_width_px(
+    text: &str,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    scale: u32,
+) -> i32 {
+    let char_width = (font.character_size.width.saturating_mul(scale.max(1))) as i32;
+    normalized_text(text).chars().count() as i32 * char_width
+}
+
 fn slide_offset(direction: MotionDirection, step: u8, total_steps: u8, amplitude: i32) -> i32 {
     let remaining = total_steps.saturating_sub(step) as i32;
     let total = total_steps.max(1) as i32;
@@ -1888,12 +2282,19 @@ mod tests {
     use super::*;
     use crate::display::diff_dirty_rows;
     use app_runtime::components::{
-        ContentListShell, ContentRow, DashboardItem, HelpHint, SelectionBand, StatusCluster,
-        SyncIndicator, VerticalRail,
+        ContentListShell, ContentRow, DashboardItem, HelpHint, ParagraphMapRail, PauseModalRow,
+        SelectionBand, StatusCluster, SyncIndicator, VerticalRail,
     };
     use domain::text::InlineText;
 
     fn make_reader_shell(progress_width: u16) -> ReaderShell {
+        make_reader_shell_with_modal(progress_width, None)
+    }
+
+    fn make_reader_shell_with_modal(
+        progress_width: u16,
+        pause_modal: Option<PauseModal>,
+    ) -> ReaderShell {
         ReaderShell {
             appearance: AppearanceMode::Light,
             stage: app_runtime::components::RsvpStage {
@@ -1906,7 +2307,51 @@ mod tests {
                 progress_width,
             },
             badge: None,
-            pause_modal: None,
+            pause_modal,
+        }
+    }
+
+    fn make_pause_modal() -> PauseModal {
+        PauseModal {
+            title: "PAUSED",
+            rows: [
+                PauseModalRow {
+                    label: "RESUME",
+                    action: "CLICK",
+                },
+                PauseModalRow {
+                    label: "PARAGRAPH",
+                    action: "PRESS",
+                },
+                PauseModalRow {
+                    label: "SPEED",
+                    action: "TURN",
+                },
+            ],
+        }
+    }
+
+    fn make_paragraph_shell(
+        selected_index: u8,
+        top: &'static str,
+        label: &'static str,
+        excerpt: &'static str,
+        bottom: &'static str,
+        final_excerpt: &'static str,
+    ) -> ParagraphNavigationShell {
+        ParagraphNavigationShell {
+            appearance: AppearanceMode::Light,
+            title: InlineText::from_slice("PARAGRAPHS"),
+            counter: InlineText::from_slice("4 / 12"),
+            previous_top: InlineText::from_slice(top),
+            selected_label: InlineText::from_slice(label),
+            selected_excerpt: InlineText::from_slice(excerpt),
+            previous_bottom: InlineText::from_slice(bottom),
+            final_excerpt: InlineText::from_slice(final_excerpt),
+            rail: ParagraphMapRail {
+                selected_index,
+                total_ticks: 7,
+            },
         }
     }
 
@@ -1951,6 +2396,13 @@ mod tests {
     }
 
     fn make_collection_shell(rows: [(&str, &str); 3]) -> ContentListShell {
+        make_collection_shell_with_spinner(rows, None)
+    }
+
+    fn make_collection_shell_with_spinner(
+        rows: [(&str, &str); 3],
+        selected_spinner_phase: Option<u8>,
+    ) -> ContentListShell {
         ContentListShell {
             appearance: AppearanceMode::Light,
             status: StatusCluster {
@@ -1963,16 +2415,19 @@ mod tests {
                 ContentRow {
                     meta: InlineText::from_slice(rows[0].0),
                     title: InlineText::from_slice(rows[0].1),
+                    loading_phase: None,
                     selected: false,
                 },
                 ContentRow {
                     meta: InlineText::from_slice(rows[1].0),
                     title: InlineText::from_slice(rows[1].1),
+                    loading_phase: selected_spinner_phase,
                     selected: true,
                 },
                 ContentRow {
                     meta: InlineText::from_slice(rows[2].0),
                     title: InlineText::from_slice(rows[2].1),
+                    loading_phase: None,
                     selected: false,
                 },
             ],
@@ -1997,6 +2452,90 @@ mod tests {
         assert!(!dirty.is_empty());
         for row in dirty.iter() {
             assert!((232..240).contains(&row), "unexpected dirty row {row}");
+        }
+    }
+
+    #[test]
+    fn reader_footer_reserves_gap_for_wpm_label() {
+        let wpm_width = mono_text_width_px(wpm_label(300), ui_font_body(), 1);
+
+        assert_eq!(READER_TITLE_MAX_WIDTH_PX, 360);
+        assert_eq!(reader_preview_max_width_px(300), 288);
+        assert_eq!(
+            reader_preview_max_width_px(300) + READER_FOOTER_WPM_GAP_PX + wpm_width,
+            READER_TITLE_MAX_WIDTH_PX
+        );
+    }
+
+    #[test]
+    fn pause_modal_reveal_frames_stay_within_modal_rows() {
+        let modal = make_pause_modal();
+        let from = make_reader_shell_with_modal(32, None);
+        let to = make_reader_shell_with_modal(32, Some(modal));
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::Reader(from),
+            to: PreparedScreen::Reader(to),
+            screen: Screen::Reader,
+            plan: TransitionPlan::new(AnimationDescriptor::ModalReveal, 3, 55),
+            step: 1,
+        };
+        let step_2 = step_1.advance();
+        let step_3 = step_2.advance();
+        let mut committed = FrameBuffer::new();
+        let mut frame_1 = FrameBuffer::new();
+        let mut frame_2 = FrameBuffer::new();
+        let mut frame_3 = FrameBuffer::new();
+
+        draw_prepared_screen(&mut committed, &PreparedScreen::Reader(from));
+        draw_transition_frame(&mut frame_1, &step_1);
+        draw_transition_frame(&mut frame_2, &step_2);
+        draw_transition_frame(&mut frame_3, &step_3);
+
+        for dirty in [
+            diff_dirty_rows(&committed, &frame_1),
+            diff_dirty_rows(&frame_1, &frame_2),
+            diff_dirty_rows(&frame_2, &frame_3),
+        ] {
+            assert!(dirty.count() <= 166, "dirty rows={}", dirty.count());
+            for row in dirty.iter() {
+                assert!((35..202).contains(&row), "unexpected dirty row {row}");
+            }
+        }
+    }
+
+    #[test]
+    fn pause_modal_hide_frames_stay_within_modal_rows() {
+        let modal = make_pause_modal();
+        let from = make_reader_shell_with_modal(32, Some(modal));
+        let to = make_reader_shell_with_modal(32, None);
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::Reader(from),
+            to: PreparedScreen::Reader(to),
+            screen: Screen::Reader,
+            plan: TransitionPlan::new(AnimationDescriptor::ModalHide, 3, 55),
+            step: 1,
+        };
+        let step_2 = step_1.advance();
+        let step_3 = step_2.advance();
+        let mut committed = FrameBuffer::new();
+        let mut frame_1 = FrameBuffer::new();
+        let mut frame_2 = FrameBuffer::new();
+        let mut frame_3 = FrameBuffer::new();
+
+        draw_prepared_screen(&mut committed, &PreparedScreen::Reader(from));
+        draw_transition_frame(&mut frame_1, &step_1);
+        draw_transition_frame(&mut frame_2, &step_2);
+        draw_transition_frame(&mut frame_3, &step_3);
+
+        for dirty in [
+            diff_dirty_rows(&committed, &frame_1),
+            diff_dirty_rows(&frame_1, &frame_2),
+            diff_dirty_rows(&frame_2, &frame_3),
+        ] {
+            assert!(dirty.count() <= 166, "dirty rows={}", dirty.count());
+            for row in dirty.iter() {
+                assert!((35..202).contains(&row), "unexpected dirty row {row}");
+            }
         }
     }
 
@@ -2058,6 +2597,33 @@ mod tests {
             for row in dirty.iter() {
                 assert!((42..191).contains(&row), "unexpected dirty row {row}");
             }
+        }
+    }
+
+    #[test]
+    fn collection_row_spinner_dirty_rows_stay_localized() {
+        let rows = [
+            ("SOURCE", "Previous item"),
+            ("SOURCE", "Fetching item"),
+            ("SOURCE", "Next item"),
+        ];
+        let mut committed = FrameBuffer::new();
+        let mut working = FrameBuffer::new();
+
+        draw_prepared_screen(
+            &mut committed,
+            &PreparedScreen::Collection(make_collection_shell_with_spinner(rows, Some(0))),
+        );
+        draw_prepared_screen(
+            &mut working,
+            &PreparedScreen::Collection(make_collection_shell_with_spinner(rows, Some(1))),
+        );
+
+        let dirty = diff_dirty_rows(&committed, &working);
+
+        assert!(dirty.count() <= 16);
+        for row in dirty.iter() {
+            assert!((122..136).contains(&row), "unexpected dirty row {row}");
         }
     }
 
@@ -2148,6 +2714,59 @@ mod tests {
         assert!(dirty.count() <= 120, "dirty rows={}", dirty.count());
         for row in dirty.iter() {
             assert!((42..221).contains(&row), "unexpected dirty row {row}");
+        }
+    }
+
+    #[test]
+    fn paragraph_transition_frames_stay_within_selector_rows() {
+        let from = make_paragraph_shell(
+            2,
+            "A previous top preview",
+            "P4",
+            "Selected paragraph excerpt",
+            "A previous bottom preview",
+            "Final excerpt for paragraph",
+        );
+        let to = make_paragraph_shell(
+            3,
+            "Selected paragraph excerpt",
+            "P5",
+            "Next paragraph excerpt",
+            "Final excerpt for paragraph",
+            "Another final paragraph",
+        );
+        let step_1 = AnimationPlayback {
+            from: PreparedScreen::ParagraphNavigation(from),
+            to: PreparedScreen::ParagraphNavigation(to),
+            screen: Screen::ParagraphNavigation,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::ParagraphTickMove(MotionDirection::Forward),
+                3,
+                55,
+            ),
+            step: 1,
+        };
+        let step_2 = step_1.advance();
+        let step_3 = step_2.advance();
+        let mut committed = FrameBuffer::new();
+        let mut frame_1 = FrameBuffer::new();
+        let mut frame_2 = FrameBuffer::new();
+        let mut frame_3 = FrameBuffer::new();
+
+        draw_prepared_screen(&mut committed, &PreparedScreen::ParagraphNavigation(from));
+        draw_transition_frame(&mut frame_1, &step_1);
+        draw_transition_frame(&mut frame_2, &step_2);
+        draw_transition_frame(&mut frame_3, &step_3);
+
+        for dirty in [
+            diff_dirty_rows(&committed, &frame_1),
+            diff_dirty_rows(&frame_1, &frame_2),
+            diff_dirty_rows(&frame_2, &frame_3),
+        ] {
+            assert!(dirty.count() <= 191, "dirty rows={}", dirty.count());
+            for row in dirty.iter() {
+                assert!((40..231).contains(&row), "unexpected dirty row {row}");
+            }
         }
     }
 }

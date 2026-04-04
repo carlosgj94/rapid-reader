@@ -146,7 +146,7 @@ impl Store {
                 );
             }
             Event::UiTick(tick_ms) => {
-                if matches!(self.ui.route, UiRoute::Dashboard) {
+                if matches!(self.ui.route, UiRoute::Dashboard | UiRoute::Collection(_)) {
                     self.backend_sync.advance_spinner();
                 }
                 if matches!(self.settings.refresh_state, RefreshState::Refreshing) {
@@ -657,6 +657,29 @@ mod tests {
         store
             .handle_event(
                 Event::BackendSyncStatusChanged(SyncStatus::RefreshingSession),
+                0,
+            )
+            .unwrap();
+
+        store.handle_event(Event::UiTick(160), 0).unwrap();
+
+        assert_eq!(store.backend_sync.spinner_phase, 1);
+
+        store
+            .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
+            .unwrap();
+        store.handle_event(Event::UiTick(320), 0).unwrap();
+
+        assert_eq!(store.backend_sync.spinner_phase, 0);
+    }
+
+    #[test]
+    fn collection_ui_tick_advances_sync_spinner_only_while_active() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        store
+            .handle_event(
+                Event::BackendSyncStatusChanged(SyncStatus::SyncingContent),
                 0,
             )
             .unwrap();

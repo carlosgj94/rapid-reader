@@ -38,7 +38,7 @@ use crate::{
     backend,
     board::BoardConfig,
     content_storage,
-    display::{HEARTBEAT_INTERVAL_MS, PlatformDisplay, diff_dirty_rows},
+    display::{DisplayPresentStats, HEARTBEAT_INTERVAL_MS, PlatformDisplay, diff_dirty_rows},
     input::PlatformInputService,
     internet,
     renderer::{self, AnimationPlayback},
@@ -54,6 +54,10 @@ const READER_TICK_MS: u64 = 20;
 const APP_EVENT_QUEUE_CAPACITY: usize = 8;
 const PLATFORM_COMMAND_QUEUE_CAPACITY: usize = 4;
 const DROP_LOG_SAMPLE_EVERY: u32 = 64;
+const DISPLAY_LOG_MIN_ROWS: u16 = 96;
+const DISPLAY_LOG_MIN_TOTAL_US: u64 = 25_000;
+const DISPLAY_LOG_TRANSITION_MIN_ROWS: u16 = 48;
+const DISPLAY_LOG_TRANSITION_MIN_TOTAL_US: u64 = 20_000;
 
 static APP_EVENT_CH: Channel<CriticalSectionRawMutex, TimedEvent, APP_EVENT_QUEUE_CAPACITY> =
     Channel::new();
@@ -795,6 +799,20 @@ struct PresentTimings {
     diff_us: u64,
 }
 
+fn should_log_display_present(kind: &str, stats: DisplayPresentStats, total_us: u64) -> bool {
+    if kind == "initial" || stats.full_refresh {
+        return true;
+    }
+
+    match kind {
+        "transition-start" => {
+            stats.dirty_rows >= DISPLAY_LOG_TRANSITION_MIN_ROWS
+                || total_us >= DISPLAY_LOG_TRANSITION_MIN_TOTAL_US
+        }
+        _ => stats.dirty_rows >= DISPLAY_LOG_MIN_ROWS || total_us >= DISPLAY_LOG_MIN_TOTAL_US,
+    }
+}
+
 fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
     display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
     committed: &mut FrameBuffer,
@@ -885,17 +903,19 @@ fn present_frame<SPI, DISP, EMD, CS, D>(
                     .render_us
                     .saturating_add(timings.diff_us)
                     .saturating_add(flush_us);
-                info!(
-                    "display present kind={} rows={} bytes={} full={} render_us={} diff_us={} flush_us={} total_us={}",
-                    kind,
-                    stats.dirty_rows,
-                    stats.bytes_sent,
-                    stats.full_refresh,
-                    timings.render_us,
-                    timings.diff_us,
-                    flush_us,
-                    total_us,
-                );
+                if should_log_display_present(kind, stats, total_us) {
+                    info!(
+                        "display present kind={} rows={} bytes={} full={} render_us={} diff_us={} flush_us={} total_us={}",
+                        kind,
+                        stats.dirty_rows,
+                        stats.bytes_sent,
+                        stats.full_refresh,
+                        timings.render_us,
+                        timings.diff_us,
+                        flush_us,
+                        total_us,
+                    );
+                }
             }
         }
         Err(err) => {

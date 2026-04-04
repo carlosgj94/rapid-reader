@@ -57,6 +57,7 @@ pub struct DashboardShell {
 pub struct ContentRow {
     pub meta: domain::text::InlineText<CONTENT_META_MAX_BYTES>,
     pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub loading_phase: Option<u8>,
     pub selected: bool,
 }
 
@@ -262,16 +263,19 @@ fn compose_collection(model: ContentListScreenModel) -> ContentListShell {
             ContentRow {
                 meta: model.rows[0].meta,
                 title: model.rows[0].title,
+                loading_phase: model.rows[0].loading_phase,
                 selected: false,
             },
             ContentRow {
                 meta: model.rows[1].meta,
                 title: model.rows[1].title,
+                loading_phase: model.rows[1].loading_phase,
                 selected: true,
             },
             ContentRow {
                 meta: model.rows[2].meta,
                 title: model.rows[2].title,
+                loading_phase: model.rows[2].loading_phase,
                 selected: false,
             },
         ],

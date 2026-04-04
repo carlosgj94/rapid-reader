@@ -51,6 +51,7 @@ pub struct SyncIndicatorModel {
 pub struct ContentRowModel {
     pub meta: InlineText<CONTENT_META_MAX_BYTES>,
     pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub loading_phase: Option<u8>,
     pub selected: bool,
 }
 
@@ -200,7 +201,12 @@ pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
 
 pub fn select_collection(store: &Store, kind: CollectionKind) -> ContentListScreenModel {
     let selected_index = store.ui.collection_index(kind);
-    let rows = select_collection_rows(store.content(), kind, selected_index);
+    let rows = select_collection_rows(
+        store.content(),
+        kind,
+        selected_index,
+        store.backend_sync.spinner_phase,
+    );
 
     ContentListScreenModel {
         appearance: store.settings.appearance,
@@ -392,14 +398,21 @@ fn select_collection_rows(
     content: &ContentState,
     kind: CollectionKind,
     selected_index: usize,
+    spinner_phase: u8,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
-    select_manifest_collection_rows(content.collection_state(kind), kind, selected_index)
+    select_manifest_collection_rows(
+        content.collection_state(kind),
+        kind,
+        selected_index,
+        spinner_phase,
+    )
 }
 
 fn select_manifest_collection_rows(
     collection: &CollectionManifestState,
     kind: CollectionKind,
     selected_index: usize,
+    spinner_phase: u8,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
     let Some(selected) = collection.item_at(selected_index) else {
         return empty_collection_rows(kind);
@@ -407,7 +420,7 @@ fn select_manifest_collection_rows(
     if collection.len() == 1 {
         return [
             content_row("", "", false),
-            content_row_from_manifest(selected, true),
+            content_row_from_manifest(selected, kind, true, spinner_phase),
             content_row("", "", false),
         ];
     }
@@ -419,9 +432,9 @@ fn select_manifest_collection_rows(
         .unwrap_or(selected);
 
     [
-        content_row_from_manifest(previous, false),
-        content_row_from_manifest(selected, true),
-        content_row_from_manifest(next, false),
+        content_row_from_manifest(previous, kind, false, spinner_phase),
+        content_row_from_manifest(selected, kind, true, spinner_phase),
+        content_row_from_manifest(next, kind, false, spinner_phase),
     ]
 }
 
@@ -429,35 +442,76 @@ fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
     ContentRowModel {
         meta: InlineText::from_slice(meta),
         title: InlineText::from_slice(title),
+        loading_phase: None,
         selected,
     }
 }
 
-fn content_row_from_manifest(item: CollectionManifestItem, selected: bool) -> ContentRowModel {
+fn content_row_from_manifest(
+    item: CollectionManifestItem,
+    kind: CollectionKind,
+    selected: bool,
+    spinner_phase: u8,
+) -> ContentRowModel {
     ContentRowModel {
-        meta: content_row_meta(item),
+        meta: content_row_meta(kind, item),
         title: item.title,
+        loading_phase: row_loading_phase(kind, item.package_state, spinner_phase),
         selected,
     }
 }
 
-fn content_row_meta(item: CollectionManifestItem) -> InlineText<CONTENT_META_MAX_BYTES> {
-    let mut meta = item.meta;
-    let Some(label) = package_state_hint(item.package_state) else {
+fn content_row_meta(
+    kind: CollectionKind,
+    item: CollectionManifestItem,
+) -> InlineText<CONTENT_META_MAX_BYTES> {
+    let mut meta = collection_row_base_meta(kind, item.meta);
+    let Some(label) = package_state_hint(kind, item.package_state) else {
         return meta;
     };
 
-    let _ = meta.try_push_str(" / ");
+    if !meta.is_empty() {
+        let _ = meta.try_push_str(" / ");
+    }
     let _ = meta.try_push_str(label);
     meta
 }
 
-const fn package_state_hint(state: PackageState) -> Option<&'static str> {
-    match state {
-        PackageState::Fetching => Some("FETCHING"),
-        PackageState::PendingRemote => Some("REMOTE"),
-        PackageState::Failed => Some("FAILED"),
-        PackageState::Missing | PackageState::Cached | PackageState::Stale => None,
+fn collection_row_base_meta(
+    kind: CollectionKind,
+    meta: InlineText<CONTENT_META_MAX_BYTES>,
+) -> InlineText<CONTENT_META_MAX_BYTES> {
+    if !matches!(kind, CollectionKind::Saved) {
+        return meta;
+    }
+
+    let mut stripped = InlineText::new();
+    let base = meta
+        .as_str()
+        .strip_suffix(" / SAVED")
+        .unwrap_or(meta.as_str());
+    stripped.set_truncated(base);
+    stripped
+}
+
+const fn package_state_hint(kind: CollectionKind, state: PackageState) -> Option<&'static str> {
+    match (kind, state) {
+        (CollectionKind::Saved, PackageState::Fetching) => None,
+        (_, PackageState::Fetching) => Some("FETCHING"),
+        (_, PackageState::PendingRemote) => Some("REMOTE"),
+        (_, PackageState::Failed) => Some("FAILED"),
+        (_, PackageState::Missing | PackageState::Cached | PackageState::Stale) => None,
+    }
+}
+
+const fn row_loading_phase(
+    kind: CollectionKind,
+    state: PackageState,
+    spinner_phase: u8,
+) -> Option<u8> {
+    match (kind, state) {
+        (CollectionKind::Saved, PackageState::Fetching) => Some(spinner_phase),
+        _ => None,
     }
 }
 
@@ -465,7 +519,7 @@ fn empty_collection_rows(kind: CollectionKind) -> [ContentRowModel; VISIBLE_LIST
     match kind {
         CollectionKind::Saved => [
             content_row("", "", false),
-            content_row("MOTIF / SAVED", "No saved items synced yet", true),
+            content_row("MOTIF", "No saved items synced yet", true),
             content_row("PHONE / APP", "Save links, then refresh data", false),
         ],
         CollectionKind::Inbox => [
@@ -590,13 +644,15 @@ mod tests {
 
         let model = select_collection(&store, CollectionKind::Saved);
 
-        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED");
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
         assert_eq!(model.rows[1].title.as_str(), "Example saved title");
+        assert_eq!(model.rows[1].loading_phase, None);
     }
 
     #[test]
-    fn fetching_saved_collection_selector_surfaces_fetching_state() {
+    fn fetching_saved_collection_selector_uses_spinner_instead_of_fetching_label() {
         let mut store = Store::new();
+        store.backend_sync.spinner_phase = 3;
         let mut item = CollectionManifestItem::empty();
         item.meta.set_truncated("EXAMPLE / SAVED");
         item.title.set_truncated("Example saved title");
@@ -609,7 +665,8 @@ mod tests {
 
         let model = select_collection(&store, CollectionKind::Saved);
 
-        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED / FETCHING");
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
+        assert_eq!(model.rows[1].loading_phase, Some(3));
     }
 
     #[test]
@@ -627,8 +684,9 @@ mod tests {
 
         assert!(model.rows[0].meta.is_empty());
         assert!(model.rows[0].title.is_empty());
-        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / SAVED");
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
         assert_eq!(model.rows[1].title.as_str(), "Example saved title");
+        assert_eq!(model.rows[1].loading_phase, None);
         assert!(model.rows[2].meta.is_empty());
         assert!(model.rows[2].title.is_empty());
     }
@@ -646,7 +704,7 @@ mod tests {
 
         let model = select_collection(&store, CollectionKind::Saved);
 
-        assert_eq!(model.rows[1].meta.as_str(), "MOTIF / SAVED");
+        assert_eq!(model.rows[1].meta.as_str(), "MOTIF");
         assert_eq!(model.rows[1].title.as_str(), "No saved items synced yet");
     }
 }
