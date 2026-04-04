@@ -1602,6 +1602,9 @@ where
     let mut config = ClientSessionConfig::new();
     config.ca_chain = Some(ca_chain.clone());
     config.server_name = Some(backend_host_cstr());
+    // TLS 1.3 client hello key exchange is currently the failing allocation path on device
+    // (`psa_export_public_key() -> MBEDTLS_ERR_SSL_ALLOC_FAILED`), so pin the device client
+    // to TLS 1.2 until we can ship a lower-memory custom mbedTLS build.
     config.min_version = TlsVersion::Tls1_2;
 
     Session::new(tls, stream, &SessionConfig::Client(config)).map_err(|_| BackendError::Tls)

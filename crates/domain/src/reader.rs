@@ -34,7 +34,6 @@ pub struct ReaderProgress {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub struct ReaderParagraphInfo {
     pub start_unit_index: u32,
-    pub preview: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -146,7 +145,6 @@ impl ReaderSession {
         while paragraph_index < paragraph_count {
             paragraphs.push(ReaderParagraphInfo {
                 start_unit_index: document.paragraphs[paragraph_index].start_unit_index as u32,
-                preview: document.paragraphs[paragraph_index].preview,
             });
             paragraph_index += 1;
         }
@@ -398,13 +396,13 @@ impl ReaderSession {
         &self,
         paragraph_index: u16,
     ) -> InlineText<MAX_PARAGRAPH_PREVIEW_BYTES> {
-        let Some(paragraphs) = self.paragraphs.as_deref() else {
-            return InlineText::new();
-        };
-        let safe_index = paragraph_index
-            .saturating_sub(1)
-            .min(paragraphs.len().saturating_sub(1) as u16) as usize;
-        paragraphs[safe_index].preview
+        Self::preview_from_window(self.active_window(), paragraph_index)
+            .or_else(|| {
+                self.prefetched_window
+                    .as_deref()
+                    .and_then(|window| Self::preview_from_window(window, paragraph_index))
+            })
+            .unwrap_or_default()
     }
 
     pub fn paragraph_start(&self, paragraph_index: u16) -> u32 {
@@ -531,6 +529,43 @@ impl ReaderSession {
     fn window_start_for_unit(&self, unit_index: u32) -> u32 {
         unit_index.saturating_sub(READER_WINDOW_OVERLAP_UNITS)
     }
+
+    fn preview_from_window(
+        window: &ReaderWindow,
+        paragraph_index: u16,
+    ) -> Option<InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>> {
+        if window.is_empty() {
+            return None;
+        }
+
+        let target = paragraph_index.min(u8::MAX as u16) as u8;
+        let mut preview = InlineText::new();
+        let mut found = false;
+        let mut unit_index = 0usize;
+        while unit_index < window.unit_count as usize {
+            let unit = &window.units[unit_index];
+            if unit.paragraph_index < target {
+                unit_index += 1;
+                continue;
+            }
+            if unit.paragraph_index > target {
+                break;
+            }
+
+            if found {
+                let _ = preview.try_push_char(' ');
+            }
+            let _ = preview.try_push_str(unit.display.as_str());
+            found = true;
+
+            if unit.flags.paragraph_end {
+                break;
+            }
+            unit_index += 1;
+        }
+
+        found.then_some(preview)
+    }
 }
 
 impl Default for ReaderSession {
@@ -587,15 +622,12 @@ mod tests {
             alloc::vec![
                 ReaderParagraphInfo {
                     start_unit_index: 0,
-                    preview: InlineText::from_slice("one"),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 5,
-                    preview: InlineText::from_slice("two"),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 9,
-                    preview: InlineText::from_slice("three"),
                 },
             ]
             .into_boxed_slice(),
@@ -619,7 +651,6 @@ mod tests {
             alloc::vec![
                 ReaderParagraphInfo {
                     start_unit_index: 0,
-                    preview: InlineText::from_slice("one"),
                 };
                 10
             ]
