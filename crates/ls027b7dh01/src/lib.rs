@@ -2,12 +2,14 @@
 
 //! LS027B7DH01 (2.7" 400x240 Sharp Memory LCD) driver primitives.
 
+mod dirty_rows;
 mod framebuffer;
 pub mod protocol;
 
 #[cfg(feature = "embedded-graphics")]
 mod graphics;
 
+pub use dirty_rows::{DirtyRowSpan, DirtyRows};
 pub use framebuffer::FrameBuffer;
 
 use core::convert::TryFrom;
@@ -42,7 +44,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            spi_hz: 1_000_000,
+            spi_hz: 2_000_000,
             extcomin_hz: 1,
             inversion: InversionMode::ExtComInPin,
             m1_high: false,

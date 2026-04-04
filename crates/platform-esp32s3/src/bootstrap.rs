@@ -38,7 +38,7 @@ use crate::{
     backend,
     board::BoardConfig,
     content_storage,
-    display::PlatformDisplay,
+    display::{HEARTBEAT_INTERVAL_MS, PlatformDisplay, diff_dirty_rows},
     input::PlatformInputService,
     internet,
     renderer::{self, AnimationPlayback},
@@ -46,7 +46,7 @@ use crate::{
     storage::PlatformStorageService,
 };
 
-const DISPLAY_SPI_HZ: u32 = 1_000_000;
+const DISPLAY_SPI_HZ: u32 = 2_000_000;
 const SD_SPI_HZ: u32 = 400_000;
 const INPUT_POLL_MS: u64 = 2;
 const READER_TICK_MS: u64 = 20;
@@ -426,10 +426,12 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
 
     log_gpio_contract(&board);
 
-    let mut frame = FrameBuffer::new();
+    let mut committed_frame = FrameBuffer::new();
+    let mut working_frame = FrameBuffer::new();
     let mut committed_update: Option<ScreenUpdate> = None;
     let mut animation: Option<AnimationPlayback> = None;
-    let mut maintenance_ticks = 0u8;
+    let mut next_animation_deadline: Option<Instant> = None;
+    let mut next_heartbeat_deadline = Instant::now() + Duration::from_millis(HEARTBEAT_INTERVAL_MS);
 
     let mut input_tick = Ticker::every(Duration::from_millis(INPUT_POLL_MS));
     let mut ui_tick = Ticker::every(Duration::from_millis(renderer::UI_TICK_MS));
@@ -439,13 +441,15 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         let suppress_sleep = current_prepared_screen(animation, committed_update)
             .is_some_and(|screen| prepared_screen_suppresses_sleep(&screen));
         let sleep_deadline = next_sleep_deadline(sleep.model(), suppress_sleep);
+        let display_deadline =
+            next_display_deadline(next_animation_deadline, next_heartbeat_deadline);
 
         match select5(
             input_tick.next(),
             select(ui_tick.next(), reader_tick.next()),
             Timer::at(sleep_deadline),
             PLATFORM_CMD_CH.receive(),
-            SCREEN_SIGNAL.wait(),
+            select(Timer::at(display_deadline), SCREEN_SIGNAL.wait()),
         )
         .await
         {
@@ -470,39 +474,6 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                 match tick_kind {
                     Either::First(_) => {
                         publish_event(Event::UiTick(now_ms), now_ms);
-
-                        if let Some(active_animation) = animation {
-                            let next_frame = active_animation.advance();
-                            flush_transition_frame(
-                                &mut display,
-                                &mut frame,
-                                &mut delay,
-                                &next_frame,
-                            );
-                            maintenance_ticks = 0;
-
-                            if next_frame.is_complete() {
-                                committed_update = Some(ScreenUpdate {
-                                    screen: next_frame.screen,
-                                    prepared: next_frame.target_screen(),
-                                    transition: TransitionPlan::none(),
-                                });
-                                animation = None;
-                            } else {
-                                animation = Some(next_frame);
-                            }
-                        } else if let Some(update) = committed_update {
-                            maintenance_ticks = maintenance_ticks.saturating_add(1);
-                            if maintenance_ticks >= renderer::MAINTENANCE_REFRESH_TICKS {
-                                flush_prepared_screen(
-                                    &mut display,
-                                    &mut frame,
-                                    &mut delay,
-                                    &update.prepared,
-                                );
-                                maintenance_ticks = 0;
-                            }
-                        }
                     }
                     Either::Second(_) => {
                         if current_prepared_screen(animation, committed_update)
@@ -546,70 +517,131 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                     }
                 }
             },
-            Either5::Fifth(update) => {
-                let previous_screen = animation
-                    .map(|active| active.screen)
-                    .or(committed_update.map(|committed| committed.screen));
-                let previous_prepared = animation
-                    .map(|active| active.target_screen())
-                    .or(committed_update.map(|committed| committed.prepared));
+            Either5::Fifth(display_event) => match display_event {
+                Either::First(_) => {
+                    let now = Instant::now();
 
-                if previous_screen != Some(update.screen) {
-                    info!("app screen={:?}", update.screen);
-                }
+                    if next_animation_deadline.is_some_and(|deadline| deadline <= now) {
+                        if let Some(active_animation) = animation {
+                            let next_frame = active_animation.advance();
+                            present_transition_frame(
+                                &mut display,
+                                &mut committed_frame,
+                                &mut working_frame,
+                                &mut delay,
+                                &next_frame,
+                                "animation",
+                            );
+                            next_heartbeat_deadline = schedule_heartbeat_deadline();
 
-                if update.screen == Screen::Reader && previous_screen != Some(Screen::Reader) {
-                    let reset = input.reset_after_reader_open();
-                    if reset.cleared_gestures > 0
-                        || reset.cleared_dropped_gestures > 0
-                        || reset.button_was_pressed
-                    {
-                        info!(
-                            "input reset for reader cleared_gestures={} cleared_dropped={} button_pressed={}",
-                            reset.cleared_gestures,
-                            reset.cleared_dropped_gestures,
-                            reset.button_was_pressed,
-                        );
-                    }
-                }
-
-                if let Some(previous) = previous_prepared {
-                    if update.transition == TransitionPlan::none() {
-                        animation = None;
-                        committed_update = Some(update);
-                        flush_prepared_screen(
-                            &mut display,
-                            &mut frame,
-                            &mut delay,
-                            &update.prepared,
-                        );
-                    } else {
-                        let next_animation = AnimationPlayback::new(previous, update);
-                        flush_transition_frame(
-                            &mut display,
-                            &mut frame,
-                            &mut delay,
-                            &next_animation,
-                        );
-                        maintenance_ticks = 0;
-
-                        if next_animation.is_complete() {
-                            committed_update = Some(ScreenUpdate {
-                                screen: next_animation.screen,
-                                prepared: next_animation.target_screen(),
-                                transition: TransitionPlan::none(),
-                            });
-                            animation = None;
+                            if next_frame.is_complete() {
+                                committed_update = Some(ScreenUpdate {
+                                    screen: next_frame.screen,
+                                    prepared: next_frame.target_screen(),
+                                    transition: TransitionPlan::none(),
+                                });
+                                animation = None;
+                                next_animation_deadline = None;
+                            } else {
+                                animation = Some(next_frame);
+                                next_animation_deadline =
+                                    Some(schedule_animation_deadline(next_frame.plan.frame_ms));
+                            }
                         } else {
-                            animation = Some(next_animation);
+                            next_animation_deadline = None;
+                        }
+                    } else if now >= next_heartbeat_deadline {
+                        if let Err(err) = display.heartbeat(&mut delay) {
+                            info!("display heartbeat failed: {:?}", err);
+                            let _ = display.disable_output();
+                        } else {
+                            next_heartbeat_deadline = schedule_heartbeat_deadline();
                         }
                     }
-                } else {
-                    committed_update = Some(update);
-                    flush_prepared_screen(&mut display, &mut frame, &mut delay, &update.prepared);
-                    maintenance_ticks = 0;
                 }
-            }
+                Either::Second(update) => {
+                    let previous_screen = animation
+                        .map(|active| active.screen)
+                        .or(committed_update.map(|committed| committed.screen));
+                    let previous_prepared = animation
+                        .map(|active| active.target_screen())
+                        .or(committed_update.map(|committed| committed.prepared));
+
+                    if previous_screen != Some(update.screen) {
+                        info!("app screen={:?}", update.screen);
+                    }
+
+                    if update.screen == Screen::Reader && previous_screen != Some(Screen::Reader) {
+                        let reset = input.reset_after_reader_open();
+                        if reset.cleared_gestures > 0
+                            || reset.cleared_dropped_gestures > 0
+                            || reset.button_was_pressed
+                        {
+                            info!(
+                                "input reset for reader cleared_gestures={} cleared_dropped={} button_pressed={}",
+                                reset.cleared_gestures,
+                                reset.cleared_dropped_gestures,
+                                reset.button_was_pressed,
+                            );
+                        }
+                    }
+
+                    if let Some(previous) = previous_prepared {
+                        if update.transition == TransitionPlan::none() {
+                            animation = None;
+                            next_animation_deadline = None;
+                            committed_update = Some(update);
+                            present_prepared_screen(
+                                &mut display,
+                                &mut committed_frame,
+                                &mut working_frame,
+                                &mut delay,
+                                &update.prepared,
+                                "screen",
+                            );
+                            next_heartbeat_deadline = schedule_heartbeat_deadline();
+                        } else {
+                            let next_animation = AnimationPlayback::new(previous, update);
+                            present_transition_frame(
+                                &mut display,
+                                &mut committed_frame,
+                                &mut working_frame,
+                                &mut delay,
+                                &next_animation,
+                                "transition-start",
+                            );
+                            next_heartbeat_deadline = schedule_heartbeat_deadline();
+
+                            if next_animation.is_complete() {
+                                committed_update = Some(ScreenUpdate {
+                                    screen: next_animation.screen,
+                                    prepared: next_animation.target_screen(),
+                                    transition: TransitionPlan::none(),
+                                });
+                                animation = None;
+                                next_animation_deadline = None;
+                            } else {
+                                animation = Some(next_animation);
+                                next_animation_deadline =
+                                    Some(schedule_animation_deadline(next_animation.plan.frame_ms));
+                            }
+                        }
+                    } else {
+                        animation = None;
+                        next_animation_deadline = None;
+                        committed_update = Some(update);
+                        present_prepared_screen(
+                            &mut display,
+                            &mut committed_frame,
+                            &mut working_frame,
+                            &mut delay,
+                            &update.prepared,
+                            "initial",
+                        );
+                        next_heartbeat_deadline = schedule_heartbeat_deadline();
+                    }
+                }
+            },
         }
     }
 }
@@ -698,30 +730,36 @@ fn next_sleep_deadline(model: &SleepModel, suppress_inactivity_sleep: bool) -> I
     )
 }
 
-fn flush_prepared_screen<SPI, DISP, EMD, CS, D>(
-    display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
-    frame: &mut FrameBuffer,
-    delay: &mut D,
-    screen: &PreparedScreen,
-) where
-    SPI: embedded_hal::spi::SpiBus<u8>,
-    DISP: embedded_hal::digital::OutputPin,
-    EMD: embedded_hal::digital::OutputPin,
-    CS: embedded_hal::digital::OutputPin,
-    D: DelayNs,
-{
-    renderer::draw_prepared_screen(frame, screen);
-    if let Err(err) = display.flush_frame(frame, delay) {
-        info!("display flush failed: {:?}", err);
-        let _ = display.disable_output();
-    }
+fn next_display_deadline(
+    next_animation_deadline: Option<Instant>,
+    next_heartbeat_deadline: Instant,
+) -> Instant {
+    next_animation_deadline
+        .map(|deadline| deadline.min(next_heartbeat_deadline))
+        .unwrap_or(next_heartbeat_deadline)
 }
 
-fn flush_transition_frame<SPI, DISP, EMD, CS, D>(
+fn schedule_animation_deadline(frame_ms: u16) -> Instant {
+    Instant::now() + Duration::from_millis(frame_ms.max(1) as u64)
+}
+
+fn schedule_heartbeat_deadline() -> Instant {
+    Instant::now() + Duration::from_millis(HEARTBEAT_INTERVAL_MS)
+}
+
+#[derive(Clone, Copy)]
+struct PresentTimings {
+    render_ms: u64,
+    diff_ms: u64,
+}
+
+fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
     display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
-    frame: &mut FrameBuffer,
+    committed: &mut FrameBuffer,
+    working: &mut FrameBuffer,
     delay: &mut D,
-    animation: &AnimationPlayback,
+    screen: &PreparedScreen,
+    kind: &str,
 ) where
     SPI: embedded_hal::spi::SpiBus<u8>,
     DISP: embedded_hal::digital::OutputPin,
@@ -729,10 +767,94 @@ fn flush_transition_frame<SPI, DISP, EMD, CS, D>(
     CS: embedded_hal::digital::OutputPin,
     D: DelayNs,
 {
-    renderer::draw_transition_frame(frame, animation);
-    if let Err(err) = display.flush_frame(frame, delay) {
-        info!("display flush failed: {:?}", err);
-        let _ = display.disable_output();
+    let render_started = Instant::now();
+    renderer::draw_prepared_screen(working, screen);
+    let render_ms = Instant::now().duration_since(render_started).as_millis();
+
+    let diff_started = Instant::now();
+    let dirty_rows = diff_dirty_rows(committed, working);
+    let diff_ms = Instant::now().duration_since(diff_started).as_millis();
+
+    present_frame(
+        display,
+        committed,
+        working,
+        &dirty_rows,
+        delay,
+        kind,
+        PresentTimings { render_ms, diff_ms },
+    );
+}
+
+fn present_transition_frame<SPI, DISP, EMD, CS, D>(
+    display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
+    committed: &mut FrameBuffer,
+    working: &mut FrameBuffer,
+    delay: &mut D,
+    animation: &AnimationPlayback,
+    kind: &str,
+) where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DISP: embedded_hal::digital::OutputPin,
+    EMD: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    D: DelayNs,
+{
+    let render_started = Instant::now();
+    renderer::draw_transition_frame(working, animation);
+    let render_ms = Instant::now().duration_since(render_started).as_millis();
+
+    let diff_started = Instant::now();
+    let dirty_rows = diff_dirty_rows(committed, working);
+    let diff_ms = Instant::now().duration_since(diff_started).as_millis();
+
+    present_frame(
+        display,
+        committed,
+        working,
+        &dirty_rows,
+        delay,
+        kind,
+        PresentTimings { render_ms, diff_ms },
+    );
+}
+
+fn present_frame<SPI, DISP, EMD, CS, D>(
+    display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
+    committed: &mut FrameBuffer,
+    working: &FrameBuffer,
+    dirty_rows: &ls027b7dh01::DirtyRows,
+    delay: &mut D,
+    kind: &str,
+    timings: PresentTimings,
+) where
+    SPI: embedded_hal::spi::SpiBus<u8>,
+    DISP: embedded_hal::digital::OutputPin,
+    EMD: embedded_hal::digital::OutputPin,
+    CS: embedded_hal::digital::OutputPin,
+    D: DelayNs,
+{
+    let flush_started = Instant::now();
+    match display.present(committed, working, dirty_rows, delay) {
+        Ok(stats) => {
+            if stats.dirty_rows > 0 {
+                let flush_ms = Instant::now().duration_since(flush_started).as_millis();
+                info!(
+                    "display present kind={} rows={} bytes={} full={} render_ms={} diff_ms={} flush_ms={}",
+                    kind,
+                    stats.dirty_rows,
+                    stats.bytes_sent,
+                    stats.full_refresh,
+                    timings.render_ms,
+                    timings.diff_ms,
+                    flush_ms,
+                );
+            }
+        }
+        Err(err) => {
+            info!("display flush failed: {:?}", err);
+            let _ = display.disable_output();
+        }
     }
 }
 

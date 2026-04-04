@@ -24,10 +24,18 @@ pub const WRITE_LINE_PACKET_SIZE: usize = 1 + 1 + LINE_BYTES + 2;
 /// - 1 byte mode + dummy
 /// - >=13 dummy bits (sent as 2 bytes)
 pub const CLEAR_PACKET_SIZE: usize = 3;
+/// Packet size for display mode / COM heartbeat.
+pub const DISPLAY_MODE_PACKET_SIZE: usize = 3;
 
 #[inline]
 const fn mode_byte(m0: bool, m1: bool, m2: bool) -> u8 {
     ((m0 as u8) << 7) | ((m1 as u8) << 6) | ((m2 as u8) << 5)
+}
+
+/// Builds the write-mode command byte used for one-line and multi-line updates.
+#[inline]
+pub const fn build_write_command(m1_high: bool) -> u8 {
+    mode_byte(true, m1_high, false)
 }
 
 /// Builds a wire address byte (`AG0..AG7`) for line 1..=240.
@@ -46,6 +54,12 @@ pub fn encode_line_address(line: u16) -> Option<u8> {
 #[inline]
 pub fn build_clear_packet(m1_high: bool) -> [u8; CLEAR_PACKET_SIZE] {
     [mode_byte(false, m1_high, true), 0x00, 0x00]
+}
+
+/// Builds a display-mode packet used to keep COM inversion alive without updating pixels.
+#[inline]
+pub fn build_display_mode_packet(m1_high: bool) -> [u8; DISPLAY_MODE_PACKET_SIZE] {
+    [mode_byte(false, m1_high, false), 0x00, 0x00]
 }
 
 /// Builds a one-line update command packet.
@@ -75,12 +89,13 @@ mod tests {
     fn mode_bits_match_expected_bytes() {
         assert_eq!(
             build_write_line_packet(1, &[0; LINE_BYTES], false).unwrap()[0],
-            0x80
+            build_write_command(false)
         );
         assert_eq!(build_clear_packet(false)[0], 0x20);
+        assert_eq!(build_display_mode_packet(false)[0], 0x00);
         assert_eq!(
             build_write_line_packet(1, &[0; LINE_BYTES], true).unwrap()[0],
-            0xC0
+            build_write_command(true)
         );
     }
 

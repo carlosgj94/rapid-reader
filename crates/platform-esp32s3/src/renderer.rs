@@ -17,14 +17,12 @@ use embedded_graphics::{
     },
     pixelcolor::BinaryColor,
     prelude::*,
-    primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
 use heapless::String as HeaplessString;
 use ls027b7dh01::FrameBuffer;
 
 pub const UI_TICK_MS: u64 = 160;
-pub const MAINTENANCE_REFRESH_TICKS: u8 = 6;
 const NORMALIZED_TEXT_MAX_BYTES: usize = 192;
 const ELLIPSIS: &str = "...";
 const RSVP_STAGE_CENTER_X: i32 = 170;
@@ -1027,9 +1025,7 @@ fn apply_theme(frame: &mut FrameBuffer, appearance: AppearanceMode) {
 }
 
 fn invert_frame(frame: &mut FrameBuffer) {
-    for byte in frame.bytes_mut() {
-        *byte = !*byte;
-    }
+    frame.invert();
 }
 
 fn draw_wifi_icon(frame: &mut FrameBuffer, x: i32, y: i32, online: bool) {
@@ -1072,11 +1068,7 @@ fn draw_selection_band(
     while row < height {
         let diagonal_right = x + width - ((14 * row) / height.max(1));
         let visible_right = (x + revealed).min(diagonal_right);
-        let mut column = x;
-        while column < visible_right {
-            set_pixel_color(frame, column, y + row, BinaryColor::On);
-            column += 1;
-        }
+        frame.fill_span(x, y + row, visible_right - x, true);
         row += 1;
     }
 }
@@ -1090,14 +1082,7 @@ fn draw_pill(frame: &mut FrameBuffer, x: i32, y: i32, width: i32, height: i32, f
 }
 
 fn fill_rect(frame: &mut FrameBuffer, x: i32, y: i32, width: i32, height: i32, color: BinaryColor) {
-    if width <= 0 || height <= 0 {
-        return;
-    }
-
-    Rectangle::new(Point::new(x, y), Size::new(width as u32, height as u32))
-        .into_styled(PrimitiveStyle::with_fill(color))
-        .draw(frame)
-        .ok();
+    frame.fill_rect(x, y, width, height, color.is_on());
 }
 
 fn stroke_rect(
@@ -1112,15 +1097,10 @@ fn stroke_rect(
         return;
     }
 
-    Rectangle::new(Point::new(x, y), Size::new(width as u32, height as u32))
-        .into_styled(
-            PrimitiveStyleBuilder::new()
-                .stroke_color(color)
-                .stroke_width(1)
-                .build(),
-        )
-        .draw(frame)
-        .ok();
+    fill_rect(frame, x, y, width, 1, color);
+    fill_rect(frame, x, y + height - 1, width, 1, color);
+    fill_rect(frame, x, y, 1, height, color);
+    fill_rect(frame, x + width - 1, y, 1, height, color);
 }
 
 fn draw_text(
@@ -1431,4 +1411,105 @@ fn set_pixel_color(frame: &mut FrameBuffer, x: i32, y: i32, color: BinaryColor) 
     }
 
     let _ = frame.set_pixel(x as usize, y as usize, color.is_on());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display::diff_dirty_rows;
+    use app_runtime::components::{
+        DashboardItem, SelectionBand, StatusCluster, SyncIndicator, VerticalRail,
+    };
+    use domain::text::InlineText;
+
+    fn make_reader_shell(progress_width: u16) -> ReaderShell {
+        ReaderShell {
+            appearance: AppearanceMode::Light,
+            stage: app_runtime::components::RsvpStage {
+                title: InlineText::from_slice("TITLE"),
+                wpm: 260,
+                left_word: InlineText::from_slice("LEFT"),
+                right_word: InlineText::from_slice("RIGHT"),
+                preview: InlineText::from_slice("preview"),
+                font: StageFont::Large,
+                progress_width,
+            },
+            badge: None,
+            pause_modal: None,
+        }
+    }
+
+    fn make_dashboard_shell(spinner_phase: u8) -> DashboardShell {
+        DashboardShell {
+            appearance: AppearanceMode::Light,
+            status: StatusCluster {
+                battery_percent: 64,
+                wifi_online: true,
+            },
+            sync_indicator: Some(SyncIndicator {
+                label: "SYNC",
+                spinner_phase,
+            }),
+            rail: VerticalRail { text: "HOME" },
+            items: [
+                DashboardItem {
+                    label: "INBOX",
+                    live_dot: true,
+                    selected: false,
+                },
+                DashboardItem {
+                    label: "SAVED",
+                    live_dot: false,
+                    selected: true,
+                },
+                DashboardItem {
+                    label: "RECS",
+                    live_dot: true,
+                    selected: false,
+                },
+            ],
+            band: SelectionBand { y: 82, height: 60 },
+        }
+    }
+
+    #[test]
+    fn reader_progress_only_dirties_progress_rows() {
+        let mut committed = FrameBuffer::new();
+        let mut working = FrameBuffer::new();
+
+        draw_prepared_screen(
+            &mut committed,
+            &PreparedScreen::Reader(make_reader_shell(0)),
+        );
+        draw_prepared_screen(&mut working, &PreparedScreen::Reader(make_reader_shell(80)));
+
+        let dirty = diff_dirty_rows(&committed, &working);
+
+        assert!(!dirty.is_empty());
+        for row in dirty.iter() {
+            assert!((232..240).contains(&row), "unexpected dirty row {row}");
+        }
+    }
+
+    #[test]
+    fn dashboard_spinner_dirty_rows_stay_localized() {
+        let mut committed = FrameBuffer::new();
+        let mut working = FrameBuffer::new();
+
+        draw_prepared_screen(
+            &mut committed,
+            &PreparedScreen::Dashboard(make_dashboard_shell(0)),
+        );
+        draw_prepared_screen(
+            &mut working,
+            &PreparedScreen::Dashboard(make_dashboard_shell(1)),
+        );
+
+        let dirty = diff_dirty_rows(&committed, &working);
+
+        assert!(dirty.count() <= 12);
+        for row in dirty.iter() {
+            assert!((220..230).contains(&row), "unexpected dirty row {row}");
+        }
+    }
 }

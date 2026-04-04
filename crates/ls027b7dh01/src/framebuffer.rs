@@ -2,7 +2,10 @@
 
 use core::convert::TryFrom;
 
-use crate::protocol::{BUFFER_SIZE, HEIGHT, LINE_BYTES, WIDTH};
+use crate::{
+    DirtyRows,
+    protocol::{BUFFER_SIZE, HEIGHT, LINE_BYTES, WIDTH},
+};
 
 /// 1bpp framebuffer for the panel.
 ///
@@ -39,6 +42,13 @@ impl FrameBuffer {
     /// Clears framebuffer to white (`on = false`) or black (`on = true`).
     pub fn clear(&mut self, on: bool) {
         self.bytes.fill(if on { 0xFF } else { 0x00 });
+    }
+
+    /// Inverts the framebuffer in place.
+    pub fn invert(&mut self) {
+        for byte in &mut self.bytes {
+            *byte = !*byte;
+        }
     }
 
     /// Sets a pixel state.
@@ -83,6 +93,17 @@ impl FrameBuffer {
         <&[u8; LINE_BYTES]>::try_from(&self.bytes[start..end]).ok()
     }
 
+    /// Returns a zero-based row payload.
+    pub fn row(&self, row: usize) -> Option<&[u8; LINE_BYTES]> {
+        if row >= HEIGHT {
+            return None;
+        }
+
+        let start = row * LINE_BYTES;
+        let end = start + LINE_BYTES;
+        <&[u8; LINE_BYTES]>::try_from(&self.bytes[start..end]).ok()
+    }
+
     /// Overwrites a line payload for line 1..=240.
     pub fn set_line(&mut self, line: u16, data: &[u8; LINE_BYTES]) -> bool {
         if !(1..=HEIGHT as u16).contains(&line) {
@@ -93,6 +114,76 @@ impl FrameBuffer {
         let end = start + LINE_BYTES;
         self.bytes[start..end].copy_from_slice(data);
         true
+    }
+
+    /// Copies only the dirty rows from `other`.
+    pub fn copy_dirty_rows_from(&mut self, other: &Self, dirty_rows: &DirtyRows) {
+        for span in dirty_rows.iter_spans() {
+            let start = span.start_row * LINE_BYTES;
+            let end = (span.end_row + 1) * LINE_BYTES;
+            self.bytes[start..end].copy_from_slice(&other.bytes[start..end]);
+        }
+    }
+
+    /// Fills a clipped horizontal span.
+    pub fn fill_span(&mut self, x: i32, y: i32, width: i32, on: bool) {
+        if width <= 0 || y < 0 || y >= HEIGHT as i32 {
+            return;
+        }
+
+        let start_x = x.max(0) as usize;
+        let end_x = (x + width).min(WIDTH as i32).max(0) as usize;
+        if start_x >= end_x {
+            return;
+        }
+
+        let row_start = y as usize * LINE_BYTES;
+        let start_byte = start_x / 8;
+        let end_byte = (end_x - 1) / 8;
+        let start_mask = 0xFFu8 >> (start_x % 8);
+        let end_mask = match end_x % 8 {
+            0 => 0xFF,
+            remainder => 0xFFu8 << (8 - remainder),
+        };
+
+        if start_byte == end_byte {
+            let mask = start_mask & end_mask;
+            if on {
+                self.bytes[row_start + start_byte] |= mask;
+            } else {
+                self.bytes[row_start + start_byte] &= !mask;
+            }
+            return;
+        }
+
+        if on {
+            self.bytes[row_start + start_byte] |= start_mask;
+        } else {
+            self.bytes[row_start + start_byte] &= !start_mask;
+        }
+
+        for byte_index in (start_byte + 1)..end_byte {
+            self.bytes[row_start + byte_index] = if on { 0xFF } else { 0x00 };
+        }
+
+        if on {
+            self.bytes[row_start + end_byte] |= end_mask;
+        } else {
+            self.bytes[row_start + end_byte] &= !end_mask;
+        }
+    }
+
+    /// Fills a clipped rectangle.
+    pub fn fill_rect(&mut self, x: i32, y: i32, width: i32, height: i32, on: bool) {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+
+        let start_y = y.max(0) as usize;
+        let end_y = (y + height).min(HEIGHT as i32).max(0) as usize;
+        for row in start_y..end_y {
+            self.fill_span(x, row as i32, width, on);
+        }
     }
 }
 
@@ -129,5 +220,32 @@ mod tests {
         assert!(fb.set_pixel(WIDTH - 1, HEIGHT - 1, true));
         assert_eq!(fb.pixel(WIDTH - 1, HEIGHT - 1), Some(true));
         assert_eq!(fb.pixel(WIDTH, HEIGHT), None);
+    }
+
+    #[test]
+    fn fill_span_sets_expected_bit_range() {
+        let mut fb = FrameBuffer::new();
+
+        fb.fill_span(3, 0, 10, true);
+
+        let line = fb.row(0).unwrap();
+        assert_eq!(line[0], 0b0001_1111);
+        assert_eq!(line[1], 0b1111_1000);
+    }
+
+    #[test]
+    fn copy_dirty_rows_updates_only_selected_rows() {
+        let mut source = FrameBuffer::new();
+        let mut target = FrameBuffer::new();
+        let mut dirty = DirtyRows::new();
+
+        source.fill_rect(0, 4, 16, 2, true);
+        let _ = dirty.mark_row(4);
+        let _ = dirty.mark_row(5);
+        target.copy_dirty_rows_from(&source, &dirty);
+
+        assert_eq!(target.row(4), source.row(4));
+        assert_eq!(target.row(5), source.row(5));
+        assert_eq!(target.row(6).unwrap(), &[0u8; LINE_BYTES]);
     }
 }
