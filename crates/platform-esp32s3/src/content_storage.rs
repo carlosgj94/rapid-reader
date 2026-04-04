@@ -42,7 +42,10 @@ const MAX_MANIFEST_SNAPSHOT_LEN: usize = 4096;
 const MAX_CACHE_INDEX_LEN: usize = 4096;
 const MAX_PACKAGE_META_LEN: usize = 128;
 const PACKAGE_COPY_BUFFER_LEN: usize = 512;
-const STAGE_WRITE_CHUNK_LEN: usize = 512;
+// Keep this aligned with the backend download chunk. Moving from 512 B to 1 KiB
+// adds roughly 2 KiB to the 4-slot storage command queue plus a 512 B sender
+// scratch increase, which is a safer tradeoff than jumping straight to 2 KiB.
+const STAGE_WRITE_CHUNK_LEN: usize = 1024;
 const CACHE_ENTRY_CAPACITY: usize = 48;
 const CACHE_SIZE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 const PACKAGE_READ_BUFFER_LEN: usize = 512;
