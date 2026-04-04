@@ -49,11 +49,11 @@ pub(crate) const BACKEND_HOST: &str = "motif-backend-production-a143.up.railway.
 const BACKEND_HOST_CSTR_BYTES: &[u8] = b"motif-backend-production-a143.up.railway.app\0";
 const BACKEND_BASE_URL: &str = "https://motif-backend-production-a143.up.railway.app";
 const HEALTH_PATH: &str = "/health";
-const REFRESH_PATH: &str = "/auth/session/refresh";
-const ME_PATH: &str = "/me";
-const INBOX_PATH: &str = "/me/inbox?limit=16";
-const SAVED_CONTENT_PATH: &str = "/me/saved-content?limit=16&archived=false";
-const RECOMMENDATIONS_PATH: &str = "/me/recommendations/content?limit=16";
+const REFRESH_PATH: &str = "/device/v1/auth/session/refresh";
+const ME_PATH: &str = "/device/v1/me";
+const INBOX_PATH: &str = "/device/v1/me/inbox?limit=16";
+const SAVED_CONTENT_PATH: &str = "/device/v1/me/saved-content?limit=16&archived=false";
+const RECOMMENDATIONS_PATH: &str = "/device/v1/me/recommendations/content?limit=16";
 pub(crate) const BACKEND_PORT: u16 = 443;
 const NETWORK_POLL_MS: u64 = 500;
 const RETRY_BACKOFF_MS: u64 = 10_000;
@@ -2424,19 +2424,19 @@ fn build_detail_path(
     let mut path = heapless::String::<128>::new();
     match request.detail_locator {
         DetailLocator::Saved => {
-            path.push_str("/me/saved-content/")
+            path.push_str("/device/v1/me/saved-content/")
                 .map_err(|_| BackendError::ResponseTooLarge)?;
             path.push_str(request.remote_item_id.as_str())
                 .map_err(|_| BackendError::ResponseTooLarge)?;
         }
         DetailLocator::Inbox => {
-            path.push_str("/me/inbox/")
+            path.push_str("/device/v1/me/inbox/")
                 .map_err(|_| BackendError::ResponseTooLarge)?;
             path.push_str(request.remote_item_id.as_str())
                 .map_err(|_| BackendError::ResponseTooLarge)?;
         }
         DetailLocator::Content => {
-            path.push_str("/me/content/")
+            path.push_str("/device/v1/me/content/")
                 .map_err(|_| BackendError::ResponseTooLarge)?;
             path.push_str(request.content_id.as_str())
                 .map_err(|_| BackendError::ResponseTooLarge)?;
