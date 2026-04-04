@@ -354,12 +354,13 @@ enum StorageCommand {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum StorageResponse {
     Snapshot(Result<Box<CollectionManifestState>, StorageError>),
     OpenedPackage(Result<Box<OpenedReaderPackage>, StorageError>),
     Opened(Result<Box<OpenedReaderContent>, StorageError>),
-    LoadedWindow(Result<Box<ReaderWindow>, StorageError>),
+    LoadedWindow(Result<ReaderWindow, StorageError>),
     Unit(Result<(), StorageError>),
 }
 
@@ -692,7 +693,7 @@ pub async fn open_cached_reader_package(
 pub async fn load_reader_window(
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     window_start_unit_index: u32,
-) -> Result<Box<ReaderWindow>, StorageError> {
+) -> Result<ReaderWindow, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
@@ -811,9 +812,7 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
                 content_id,
                 window_start_unit_index,
             } => StorageResponse::LoadedWindow(
-                storage
-                    .load_reader_window(content_id, window_start_unit_index)
-                    .map(Box::new),
+                storage.load_reader_window(content_id, window_start_unit_index),
             ),
             StorageCommand::OpenCachedReaderContent { content_id } => StorageResponse::Opened(
                 storage.open_cached_reader_content(content_id).map(Box::new),

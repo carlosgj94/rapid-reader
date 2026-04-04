@@ -219,14 +219,38 @@ const fn is_collection_screen(screen: Screen) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::{runtime::UiCommand, store::Store};
+    use domain::{
+        input::{InputGesture, RotationDirection},
+        runtime::UiCommand,
+        store::Store,
+    };
 
     #[test]
     fn gesture_mapping_uses_typed_ui_commands() {
         let mut runtime = AppRuntime::new();
-        let command = runtime.handle_input_gesture(domain::input::InputGesture::Click);
+        let command = runtime.handle_input_gesture(InputGesture::Click);
 
         assert_eq!(command, Command::Ui(UiCommand::Confirm));
+    }
+
+    #[test]
+    fn clockwise_rotation_maps_to_focus_next() {
+        let mut runtime = AppRuntime::new();
+        let command = runtime.handle_input_gesture(InputGesture::Rotate {
+            direction: RotationDirection::Clockwise,
+        });
+
+        assert_eq!(command, Command::Ui(UiCommand::FocusNext));
+    }
+
+    #[test]
+    fn counterclockwise_rotation_maps_to_focus_previous() {
+        let mut runtime = AppRuntime::new();
+        let command = runtime.handle_input_gesture(InputGesture::Rotate {
+            direction: RotationDirection::CounterClockwise,
+        });
+
+        assert_eq!(command, Command::Ui(UiCommand::FocusPrevious));
     }
 
     #[test]

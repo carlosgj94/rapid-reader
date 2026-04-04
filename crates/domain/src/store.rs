@@ -203,7 +203,7 @@ impl Store {
         self.ui.route = UiRoute::Reader;
     }
 
-    pub fn load_reader_window(&mut self, window: Box<crate::reader::ReaderWindow>) {
+    pub fn load_reader_window(&mut self, window: crate::reader::ReaderWindow) {
         self.reader.apply_loaded_window(window);
     }
 
@@ -340,8 +340,16 @@ impl Store {
     fn dispatch_reader(&mut self, command: UiCommand) -> Effect {
         match self.reader.mode {
             crate::reader::ReaderMode::Normal | crate::reader::ReaderMode::Chat => match command {
-                UiCommand::FocusPrevious => self.reader.show_normal(),
-                UiCommand::FocusNext => self.reader.show_chat(),
+                UiCommand::FocusPrevious => {
+                    if let Some(request) = self.reader.jump_live_previous_paragraph() {
+                        return Effect::LoadReaderWindow(request);
+                    }
+                }
+                UiCommand::FocusNext => {
+                    if let Some(request) = self.reader.jump_live_next_paragraph() {
+                        return Effect::LoadReaderWindow(request);
+                    }
+                }
                 UiCommand::Confirm => self.reader.pause(),
                 UiCommand::Back => {
                     self.ui.route = UiRoute::Collection(self.reader.active_collection);
@@ -529,6 +537,7 @@ mod tests {
         device::{BootState, DeviceState},
         formatter::{article_document_from_script, format_article_document},
         network::{NetworkState, NetworkStatus},
+        reader::{ReaderParagraphInfo, ReaderWindow},
         runtime::CollectionConfirmIgnoredReason,
         settings::{AppearanceMode, PersistedSettings},
         storage::{StorageHealth, StorageRecoveryStatus},
@@ -553,6 +562,13 @@ mod tests {
             4 * 1024 * 1024,
             3 * 1024 * 1024,
         )
+    }
+
+    fn make_reader_window(start_unit_index: u32, unit_count: u16) -> Box<ReaderWindow> {
+        let mut window = Box::new(ReaderWindow::empty());
+        window.start_unit_index = start_unit_index;
+        window.unit_count = unit_count;
+        window
     }
 
     #[test]
@@ -932,6 +948,89 @@ mod tests {
         store.handle_event(Event::ReaderTick(250), 0).unwrap();
 
         assert_eq!(store.sleep.last_activity_ms, 10);
+    }
+
+    #[test]
+    fn live_reader_scroll_back_jumps_to_current_paragraph_start() {
+        let mut store = Store::new();
+        store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            crate::text::InlineText::from_slice("Example"),
+            120,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 10,
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 20,
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 64),
+        );
+        store.reader.progress.unit_index = 14;
+        store.reader.progress.paragraph_index = 2;
+        store.reader.progress.total_paragraphs = 3;
+        store.reader.next_due_at_ms = Some(1_000);
+
+        let effect = store
+            .dispatch(Command::Ui(UiCommand::FocusPrevious))
+            .unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.reader.progress.unit_index, 10);
+        assert_eq!(store.reader.progress.paragraph_index, 2);
+        assert_eq!(store.reader.next_due_at_ms, None);
+    }
+
+    #[test]
+    fn live_reader_scroll_forward_requests_reader_window_for_next_paragraph() {
+        let mut store = Store::new();
+        store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            crate::text::InlineText::from_slice("Example"),
+            200,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 32),
+        );
+
+        let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::LoadReaderWindow(crate::reader::ReaderWindowLoadRequest {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                window_start_unit_index: 32,
+            })
+        );
+        assert_eq!(store.reader.progress.unit_index, 0);
+    }
+
+    #[test]
+    fn paragraph_navigation_scroll_still_moves_selected_paragraph() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Reader;
+        store.reader.mode = crate::reader::ReaderMode::ParagraphNavigation;
+        store.reader.progress.paragraph_index = 2;
+        store.reader.progress.total_paragraphs = 4;
+
+        let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.reader.progress.paragraph_index, 3);
     }
 
     #[test]

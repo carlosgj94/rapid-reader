@@ -83,13 +83,19 @@ enum PlatformCommand {
 async fn app_task(snapshot: BootstrapSnapshot) {
     let mut store = Store::from_bootstrap(snapshot);
     let mut app = AppRuntime::new();
+    let mut pending_event: Option<TimedEvent> = None;
 
     info!("settings loaded={:?}", store.settings);
     let mut last_update = app.tick(&store);
     SCREEN_SIGNAL.signal(last_update);
 
     loop {
-        let timed_event = APP_EVENT_CH.receive().await;
+        let timed_event = if let Some(event) = pending_event.take() {
+            event
+        } else {
+            APP_EVENT_CH.receive().await
+        };
+        let timed_event = prioritize_non_tick_event(timed_event, &mut pending_event);
         let input_gesture = match &timed_event.event {
             Event::InputGestureReceived(gesture) => Some(*gesture),
             _ => None,
@@ -115,6 +121,28 @@ async fn app_task(snapshot: BootstrapSnapshot) {
             last_update = next_update;
         }
     }
+}
+
+fn prioritize_non_tick_event(
+    timed_event: TimedEvent,
+    pending_event: &mut Option<TimedEvent>,
+) -> TimedEvent {
+    if !is_tick_event(&timed_event.event) {
+        return timed_event;
+    }
+
+    let mut latest_tick = timed_event;
+    while let Ok(next_event) = APP_EVENT_CH.try_receive() {
+        if is_tick_event(&next_event.event) {
+            latest_tick = next_event;
+            continue;
+        }
+
+        *pending_event = Some(latest_tick);
+        return next_event;
+    }
+
+    latest_tick
 }
 
 async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
@@ -607,6 +635,10 @@ pub(crate) fn publish_event(event: Event, at_ms: u64) {
             }
         }
     }
+}
+
+const fn is_tick_event(event: &Event) -> bool {
+    matches!(event, Event::UiTick(_) | Event::ReaderTick(_))
 }
 
 pub(crate) async fn persist_backend_credential(credential: crate::storage::BackendCredential) {

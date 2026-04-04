@@ -15,10 +15,10 @@ impl NavigationState {
         match gesture {
             InputGesture::Rotate {
                 direction: RotationDirection::Clockwise,
-            } => Command::Ui(UiCommand::FocusPrevious),
+            } => Command::Ui(UiCommand::FocusNext),
             InputGesture::Rotate {
                 direction: RotationDirection::CounterClockwise,
-            } => Command::Ui(UiCommand::FocusNext),
+            } => Command::Ui(UiCommand::FocusPrevious),
             InputGesture::Click => Command::Ui(UiCommand::Confirm),
             InputGesture::LongPress => Command::Ui(UiCommand::Back),
         }

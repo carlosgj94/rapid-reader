@@ -200,14 +200,14 @@ impl ReaderSession {
         self.next_due_at_ms = None;
     }
 
-    pub fn apply_loaded_window(&mut self, window: Box<ReaderWindow>) {
+    pub fn apply_loaded_window(&mut self, window: ReaderWindow) {
         let pending_seek = self.pending_seek_unit_index;
         self.pending_window_start_unit_index = None;
 
         if let Some(target_unit_index) = pending_seek
             && window.contains(target_unit_index)
         {
-            self.active_window = Some(window);
+            Self::write_window_slot(&mut self.active_window, window);
             self.prefetched_window = None;
             self.pending_seek_unit_index = None;
             self.progress.unit_index = target_unit_index;
@@ -221,10 +221,10 @@ impl ReaderSession {
         });
 
         if replace_active {
-            self.active_window = Some(window);
+            Self::write_window_slot(&mut self.active_window, window);
             self.sync_progress();
         } else {
-            self.prefetched_window = Some(window);
+            Self::write_window_slot(&mut self.prefetched_window, window);
         }
     }
 
@@ -302,17 +302,7 @@ impl ReaderSession {
         }
 
         self.mode = self.resume_mode;
-        self.next_due_at_ms = None;
-
-        let target_unit_index = self.paragraph_start(self.progress.paragraph_index);
-        if self.active_window().contains(target_unit_index) {
-            self.progress.unit_index = target_unit_index;
-            self.sync_progress();
-            return None;
-        }
-
-        self.pending_seek_unit_index = Some(target_unit_index);
-        self.load_request_for_window_start(self.window_start_for_unit(target_unit_index))
+        self.seek_to_unit(self.paragraph_start(self.progress.paragraph_index))
     }
 
     pub fn move_paragraph(&mut self, previous: bool) {
@@ -330,6 +320,33 @@ impl ReaderSession {
                 .saturating_add(1)
                 .min(max_paragraph)
         };
+    }
+
+    pub fn jump_live_previous_paragraph(&mut self) -> Option<ReaderWindowLoadRequest> {
+        if !self.is_active_reading() {
+            return None;
+        }
+
+        let current_start = self.paragraph_start(self.progress.paragraph_index);
+        if self.progress.unit_index > current_start {
+            return self.seek_to_unit(current_start);
+        }
+
+        if self.progress.paragraph_index > 1 {
+            return self.seek_to_unit(self.paragraph_start(self.progress.paragraph_index - 1));
+        }
+
+        None
+    }
+
+    pub fn jump_live_next_paragraph(&mut self) -> Option<ReaderWindowLoadRequest> {
+        if !self.is_active_reading()
+            || self.progress.paragraph_index >= self.progress.total_paragraphs.max(1)
+        {
+            return None;
+        }
+
+        self.seek_to_unit(self.paragraph_start(self.progress.paragraph_index + 1))
     }
 
     pub const fn is_active_reading(&self) -> bool {
@@ -526,6 +543,41 @@ impl ReaderSession {
         })
     }
 
+    fn seek_to_unit(&mut self, target_unit_index: u32) -> Option<ReaderWindowLoadRequest> {
+        if self.total_units == 0 {
+            return None;
+        }
+
+        let target_unit_index = target_unit_index.min(self.total_units.saturating_sub(1));
+        if target_unit_index == self.progress.unit_index {
+            return None;
+        }
+
+        self.next_due_at_ms = None;
+
+        if self.active_window().contains(target_unit_index) {
+            self.pending_seek_unit_index = None;
+            self.progress.unit_index = target_unit_index;
+            self.sync_progress();
+            return None;
+        }
+
+        if self
+            .prefetched_window
+            .as_ref()
+            .is_some_and(|window| window.contains(target_unit_index))
+        {
+            self.active_window = self.prefetched_window.take();
+            self.pending_seek_unit_index = None;
+            self.progress.unit_index = target_unit_index;
+            self.sync_progress();
+            return None;
+        }
+
+        self.pending_seek_unit_index = Some(target_unit_index);
+        self.load_request_for_window_start(self.window_start_for_unit(target_unit_index))
+    }
+
     fn window_start_for_unit(&self, unit_index: u32) -> u32 {
         unit_index.saturating_sub(READER_WINDOW_OVERLAP_UNITS)
     }
@@ -566,6 +618,14 @@ impl ReaderSession {
 
         found.then_some(preview)
     }
+
+    fn write_window_slot(slot: &mut Option<Box<ReaderWindow>>, window: ReaderWindow) {
+        if let Some(existing) = slot.as_mut() {
+            **existing = window;
+        } else {
+            *slot = Some(Box::new(window));
+        }
+    }
 }
 
 impl Default for ReaderSession {
@@ -582,6 +642,37 @@ mod tests {
         formatter::format_article_document,
         source::SourceKind,
     };
+
+    fn make_test_window(start_unit_index: u32, unit_count: u16) -> ReaderWindow {
+        let mut window = ReaderWindow::empty();
+        window.start_unit_index = start_unit_index;
+        window.unit_count = unit_count;
+        window
+    }
+
+    fn make_seekable_session(
+        active_start_unit_index: u32,
+        active_unit_count: u16,
+        paragraph_starts: &[u32],
+    ) -> ReaderSession {
+        let mut session = ReaderSession::new();
+        session.active_content_id = InlineText::from_slice("content-1");
+        session.total_units = 400;
+        session.progress.total_paragraphs = paragraph_starts.len() as u16;
+        session.paragraphs = Some(
+            paragraph_starts
+                .iter()
+                .copied()
+                .map(|start_unit_index| ReaderParagraphInfo { start_unit_index })
+                .collect::<alloc::vec::Vec<_>>()
+                .into_boxed_slice(),
+        );
+        session.active_window = Some(Box::new(make_test_window(
+            active_start_unit_index,
+            active_unit_count,
+        )));
+        session
+    }
 
     #[test]
     fn built_in_document_opens_inside_windowed_reader() {
@@ -639,6 +730,108 @@ mod tests {
     }
 
     #[test]
+    fn live_previous_jump_rewinds_to_current_paragraph_start() {
+        let mut session = make_seekable_session(0, 32, &[0, 5, 10]);
+        session.progress.unit_index = 7;
+        session.next_due_at_ms = Some(500);
+        session.sync_progress();
+
+        let request = session.jump_live_previous_paragraph();
+
+        assert_eq!(request, None);
+        assert_eq!(session.progress.unit_index, 5);
+        assert_eq!(session.progress.paragraph_index, 2);
+        assert_eq!(session.next_due_at_ms, None);
+    }
+
+    #[test]
+    fn live_previous_jump_at_paragraph_start_moves_to_previous_paragraph() {
+        let mut session = make_seekable_session(0, 32, &[0, 5, 10]);
+        session.progress.unit_index = 5;
+        session.sync_progress();
+
+        let request = session.jump_live_previous_paragraph();
+
+        assert_eq!(request, None);
+        assert_eq!(session.progress.unit_index, 0);
+        assert_eq!(session.progress.paragraph_index, 1);
+    }
+
+    #[test]
+    fn live_previous_jump_at_first_paragraph_start_is_noop() {
+        let mut session = make_seekable_session(0, 32, &[0, 5, 10]);
+        session.next_due_at_ms = Some(750);
+        session.sync_progress();
+
+        let request = session.jump_live_previous_paragraph();
+
+        assert_eq!(request, None);
+        assert_eq!(session.progress.unit_index, 0);
+        assert_eq!(session.progress.paragraph_index, 1);
+        assert_eq!(session.next_due_at_ms, Some(750));
+    }
+
+    #[test]
+    fn live_next_jump_requests_window_when_target_is_not_loaded() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.total_units = 300;
+        session.sync_progress();
+
+        let request = session.jump_live_next_paragraph().unwrap();
+
+        assert_eq!(request.window_start_unit_index, 32);
+        assert_eq!(request.content_id.as_str(), "content-1");
+        assert_eq!(session.pending_seek_unit_index, Some(64));
+        assert_eq!(session.next_due_at_ms, None);
+    }
+
+    #[test]
+    fn live_jump_promotes_prefetched_window_when_target_is_already_loaded() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.total_units = 300;
+        session.prefetched_window = Some(Box::new(make_test_window(32, 96)));
+        session.sync_progress();
+
+        let request = session.jump_live_next_paragraph();
+
+        assert_eq!(request, None);
+        assert_eq!(session.active_window().start_unit_index, 32);
+        assert_eq!(session.progress.unit_index, 64);
+        assert_eq!(session.progress.paragraph_index, 2);
+        assert!(session.prefetched_window.is_none());
+    }
+
+    #[test]
+    fn apply_loaded_window_completes_pending_live_jump() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.total_units = 300;
+        let request = session.jump_live_next_paragraph().unwrap();
+
+        session.apply_loaded_window(make_test_window(request.window_start_unit_index, 128));
+
+        assert_eq!(session.progress.unit_index, 64);
+        assert_eq!(session.progress.paragraph_index, 2);
+        assert_eq!(session.pending_seek_unit_index, None);
+        assert_eq!(session.active_window().start_unit_index, 32);
+    }
+
+    #[test]
+    fn live_jump_preserves_chat_mode() {
+        let mut session = make_seekable_session(0, 32, &[0, 5, 10]);
+        session.progress.unit_index = 7;
+        session.sync_progress();
+        session.mode = ReaderMode::Chat;
+        session.resume_mode = ReaderMode::Chat;
+
+        let request = session.jump_live_previous_paragraph();
+
+        assert_eq!(request, None);
+        assert_eq!(session.mode, ReaderMode::Chat);
+        assert_eq!(session.resume_mode, ReaderMode::Chat);
+        assert_eq!(session.progress.unit_index, 5);
+    }
+
+    #[test]
     fn commit_navigation_requests_window_when_target_is_not_loaded() {
         let mut session = ReaderSession::new();
         session.active_content_id = InlineText::from_slice("content-1");
@@ -665,5 +858,22 @@ mod tests {
 
         assert_eq!(request.window_start_unit_index, 224);
         assert_eq!(request.content_id.as_str(), "content-1");
+    }
+
+    #[test]
+    fn commit_navigation_uses_prefetched_window_when_available() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.mode = ReaderMode::ParagraphNavigation;
+        session.resume_mode = ReaderMode::Normal;
+        session.progress.paragraph_index = 2;
+        session.prefetched_window = Some(Box::new(make_test_window(32, 96)));
+
+        let request = session.commit_paragraph_navigation();
+
+        assert_eq!(request, None);
+        assert_eq!(session.mode, ReaderMode::Normal);
+        assert_eq!(session.active_window().start_unit_index, 32);
+        assert_eq!(session.progress.unit_index, 64);
+        assert_eq!(session.progress.paragraph_index, 2);
     }
 }
