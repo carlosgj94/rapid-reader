@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::net::IpAddr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_net::{Runner, Stack, StackResources, dns::DnsSocket, tcp::TcpSocket};
@@ -27,6 +28,8 @@ use crate::{
 const STATUS_POLL_MS: u64 = 500;
 const RECONNECT_BACKOFF_MS: u64 = 5_000;
 const NETWORK_STACK_SOCKET_CAPACITY: usize = 4;
+
+static PROBE_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct WifiCredentials {
@@ -127,6 +130,10 @@ pub fn install(spawner: Spawner, wifi: WIFI<'static>) -> Option<Stack<'static>> 
     Some(stack)
 }
 
+pub(crate) fn set_probe_suspended(suspended: bool) {
+    PROBE_SUSPENDED.store(suspended, Ordering::Relaxed);
+}
+
 #[embassy_executor::task]
 async fn connection_task(mut controller: WifiController<'static>, credentials: WifiCredentials) {
     info!(
@@ -201,6 +208,11 @@ async fn probe_task(stack: Stack<'static>) {
             Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
             continue;
         };
+
+        if PROBE_SUSPENDED.load(Ordering::Relaxed) {
+            Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
+            continue;
+        }
 
         if probe_ready {
             Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;

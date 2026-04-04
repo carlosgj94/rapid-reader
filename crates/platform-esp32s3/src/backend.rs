@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::net::IpAddr;
-use core::{ffi::CStr, fmt::Write as _, net::SocketAddr, ptr::addr_of_mut, str};
+use core::{ffi::CStr, fmt::Write as _, future::Future, net::SocketAddr, ptr::addr_of_mut, str};
 
 use embassy_executor::Spawner;
 use embassy_net::{
@@ -11,7 +11,7 @@ use embassy_net::{
     tcp::client::{TcpClient, TcpClientState},
 };
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io as eio06;
 use embedded_io_07 as eio07;
 use embedded_io_async::{Read as AsyncRead06, Write as AsyncWrite06};
@@ -57,7 +57,11 @@ const RECOMMENDATIONS_PATH: &str = "/me/recommendations/content?limit=16";
 pub(crate) const BACKEND_PORT: u16 = 443;
 const NETWORK_POLL_MS: u64 = 500;
 const RETRY_BACKOFF_MS: u64 = 10_000;
-const HTTP_TIMEOUT_SECS: u64 = 15;
+const TRANSPORT_RETRY_ATTEMPTS: usize = 2;
+const TRANSPORT_RETRY_BACKOFF_MS: u64 = 750;
+const CONNECT_TIMEOUT_SECS: u64 = 5;
+const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
+const HTTP_BODY_TIMEOUT_SECS: u64 = 15;
 const HTTP_RESPONSE_MAX_LEN: usize = 8 * 1024;
 const DIRECT_OPEN_RESPONSE_MAX_LEN: usize = 64 * 1024;
 const HTTP_STREAM_HEADER_MAX_LEN: usize = 2048;
@@ -374,18 +378,21 @@ async fn backend_task(
         info!("backend network ready ip={:?}", network.address);
         log_heap("backend network ready");
         let mut tcp_client = BackendTcpClient::new(stack, tcp_state.as_ref());
-        tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
+        tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
 
         log_status(SyncStatus::RefreshingSession);
-        let startup_sync = match perform_startup_refresh_and_saved_sync(
+        crate::internet::set_probe_suspended(true);
+        let startup_sync = perform_startup_refresh_and_saved_sync(
             stack,
             tls.reference(),
             &ca_chain,
             &tcp_client,
             &current.credential,
         )
-        .await
-        {
+        .await;
+        crate::internet::set_probe_suspended(false);
+
+        let startup_sync = match startup_sync {
             Ok(result) => result,
             Err(RefreshError::Rejected(status)) => {
                 log_status(SyncStatus::AuthFailed);
@@ -666,6 +673,33 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
     tcp_client: &'a BackendTcpClient<'a>,
     credential: &BackendCredential,
 ) -> Result<StartupSyncResult, RefreshError> {
+    let mut attempt = 0usize;
+
+    loop {
+        let result = perform_startup_refresh_and_saved_sync_once(
+            stack, tls, ca_chain, tcp_client, credential,
+        )
+        .await;
+        match result {
+            Err(RefreshError::Other(err))
+                if is_transient_transport_error(err) && attempt + 1 < TRANSPORT_RETRY_ATTEMPTS =>
+            {
+                attempt += 1;
+                info!("backend startup retry attempt={} err={:?}", attempt, err);
+                Timer::after(Duration::from_millis(TRANSPORT_RETRY_BACKOFF_MS)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn perform_startup_refresh_and_saved_sync_once<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'a>,
+    ca_chain: &Certificate<'static>,
+    tcp_client: &'a BackendTcpClient<'a>,
+    credential: &BackendCredential,
+) -> Result<StartupSyncResult, RefreshError> {
     let refresh_token = credential
         .refresh_token()
         .map_err(|_| RefreshError::Other(BackendError::InvalidResponse))?;
@@ -695,14 +729,21 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         }
     };
     let connect_started_ms = now_ms();
-    let connection = tcp_client
-        .connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT))
-        .await
-        .map_err(|_| {
-            info!("backend request connect failed path={}", REFRESH_PATH);
-            log_request_heap(REFRESH_PATH, "connect failed");
-            RefreshError::Other(BackendError::Connect)
-        })?;
+    let connection = with_timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        tcp_client.connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT)),
+    )
+    .await
+    .map_err(|_| {
+        info!("backend request connect timed out path={}", REFRESH_PATH);
+        log_request_heap(REFRESH_PATH, "connect timeout");
+        RefreshError::Other(BackendError::Connect)
+    })?
+    .map_err(|_| {
+        info!("backend request connect failed path={}", REFRESH_PATH);
+        log_request_heap(REFRESH_PATH, "connect failed");
+        RefreshError::Other(BackendError::Connect)
+    })?;
     refresh_metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
@@ -711,9 +752,9 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         })
         .map_err(RefreshError::Other)?;
     let tls_started_ms = now_ms();
-    session.connect().await.map_err(|err| {
-        RefreshError::Other(map_logged_session_error(REFRESH_PATH, "handshake", err))
-    })?;
+    await_tls_handshake(&mut session, REFRESH_PATH)
+        .await
+        .map_err(RefreshError::Other)?;
     refresh_metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
@@ -778,6 +819,16 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         false,
     )
     .await;
+
+    if let Err(err) = saved_result.as_ref()
+        && let CollectionQueryError::Other(err) = *err
+        && is_transient_transport_error(err)
+    {
+        if let Err(close_err) = session.close().await {
+            info!("backend tls close failed: {:?}", close_err);
+        }
+        return Err(RefreshError::Other(err));
+    }
 
     if let Ok(result) = &mut saved_result {
         prefetch_startup_saved_content(&mut session, refresh_session.access_token.as_str(), result)
@@ -1171,9 +1222,54 @@ async fn send_https_request<'a>(
     request: HttpRequest<'_>,
     response_buffer: &'a mut [u8],
 ) -> Result<HttpResponse<'a>, BackendError> {
+    // The second attempt only happens after the first attempt returned an error,
+    // so no successful response still borrows the shared buffer.
+    let response_buffer_ptr: *mut [u8] = response_buffer;
+    let first_attempt = unsafe {
+        send_https_request_once(
+            stack,
+            tls,
+            ca_chain,
+            tcp_state,
+            request,
+            &mut *response_buffer_ptr,
+        )
+        .await
+    };
+    match first_attempt {
+        Err(err) if is_transient_transport_error(err) && TRANSPORT_RETRY_ATTEMPTS > 1 => {
+            info!(
+                "backend request retry path={} attempt=1 err={:?}",
+                request.path, err
+            );
+            Timer::after(Duration::from_millis(TRANSPORT_RETRY_BACKOFF_MS)).await;
+            unsafe {
+                send_https_request_once(
+                    stack,
+                    tls,
+                    ca_chain,
+                    tcp_state,
+                    request,
+                    &mut *response_buffer_ptr,
+                )
+                .await
+            }
+        }
+        other => other,
+    }
+}
+
+async fn send_https_request_once<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'_>,
+    ca_chain: &Certificate<'static>,
+    tcp_state: &BackendTcpClientState,
+    request: HttpRequest<'_>,
+    response_buffer: &'a mut [u8],
+) -> Result<HttpResponse<'a>, BackendError> {
     let mut metrics = RequestMetrics::new(false, false);
     let mut tcp_client = TcpClient::new(stack, tcp_state);
-    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
+    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
 
     let dns = DnsSocket::new(stack);
     let dns_started_ms = now_ms();
@@ -1195,14 +1291,21 @@ async fn send_https_request<'a>(
         }
     };
     let connect_started_ms = now_ms();
-    let connection = tcp_client
-        .connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT))
-        .await
-        .map_err(|_| {
-            info!("backend request connect failed path={}", request.path);
-            log_request_heap(request.path, "connect failed");
-            BackendError::Connect
-        })?;
+    let connection = with_timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        tcp_client.connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT)),
+    )
+    .await
+    .map_err(|_| {
+        info!("backend request connect timed out path={}", request.path);
+        log_request_heap(request.path, "connect timeout");
+        BackendError::Connect
+    })?
+    .map_err(|_| {
+        info!("backend request connect failed path={}", request.path);
+        log_request_heap(request.path, "connect failed");
+        BackendError::Connect
+    })?;
     metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
@@ -1210,10 +1313,7 @@ async fn send_https_request<'a>(
             log_request_heap(request.path, "tls setup failed");
         })?;
     let tls_started_ms = now_ms();
-    session
-        .connect()
-        .await
-        .map_err(|err| map_logged_session_error(request.path, "handshake", err))?;
+    await_tls_handshake(&mut session, request.path).await?;
     metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
@@ -1338,6 +1438,38 @@ fn map_logged_session_error(path: &str, stage: &str, error: SessionError) -> Bac
     }
 }
 
+fn log_request_timeout(path: &str, stage: &str, error: BackendError) -> BackendError {
+    info!("backend request {} timed out path={}", stage, path);
+    log_request_heap(path, stage);
+    error
+}
+
+async fn await_tls_handshake<T>(
+    session: &mut Session<'_, T>,
+    path: &str,
+) -> Result<(), BackendError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    with_timeout(
+        Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+        session.connect(),
+    )
+    .await
+    .map_err(|_| log_request_timeout(path, "handshake", BackendError::Tls))?
+    .map_err(|err| map_logged_session_error(path, "handshake", err))
+}
+
+async fn await_body_io_timeout<T, F>(path: &str, stage: &str, future: F) -> Result<T, BackendError>
+where
+    F: Future<Output = Result<T, SessionError>>,
+{
+    with_timeout(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS), future)
+        .await
+        .map_err(|_| log_request_timeout(path, stage, BackendError::Io))?
+        .map_err(|err| map_logged_session_error(path, stage, err))
+}
+
 async fn write_http_request<T>(
     session: &mut Session<'_, T>,
     path: &str,
@@ -1350,96 +1482,145 @@ async fn write_http_request<T>(
 where
     T: AsyncRead07 + AsyncWrite07,
 {
-    AsyncWrite07::write_all(session, method.as_bytes())
-        .await
-        .map_err(|err| map_logged_session_error(path, "write method", err))?;
-    AsyncWrite07::write_all(session, b" ")
-        .await
-        .map_err(|err| map_logged_session_error(path, "write separator", err))?;
-    AsyncWrite07::write_all(session, path.as_bytes())
-        .await
-        .map_err(|err| map_logged_session_error(path, "write path", err))?;
-    AsyncWrite07::write_all(session, b" HTTP/1.1\r\nHost: ")
-        .await
-        .map_err(|err| map_logged_session_error(path, "write request line", err))?;
-    AsyncWrite07::write_all(session, BACKEND_HOST.as_bytes())
-        .await
-        .map_err(|err| map_logged_session_error(path, "write host", err))?;
-    AsyncWrite07::write_all(session, b"\r\nUser-Agent: ")
-        .await
-        .map_err(|err| map_logged_session_error(path, "write user agent header", err))?;
-    AsyncWrite07::write_all(session, USER_AGENT.as_bytes())
-        .await
-        .map_err(|err| map_logged_session_error(path, "write user agent", err))?;
-    AsyncWrite07::write_all(session, b"\r\nAccept: application/json\r\nConnection: ")
-        .await
-        .map_err(|err| map_logged_session_error(path, "write connection header", err))?;
-    AsyncWrite07::write_all(
-        session,
-        if connection_close {
-            b"close\r\n"
-        } else {
-            b"keep-alive\r\n"
-        },
+    await_body_io_timeout(
+        path,
+        "write method",
+        AsyncWrite07::write_all(session, method.as_bytes()),
     )
-    .await
-    .map_err(|err| map_logged_session_error(path, "write connection value", err))?;
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write separator",
+        AsyncWrite07::write_all(session, b" "),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write path",
+        AsyncWrite07::write_all(session, path.as_bytes()),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write request line",
+        AsyncWrite07::write_all(session, b" HTTP/1.1\r\nHost: "),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write host",
+        AsyncWrite07::write_all(session, BACKEND_HOST.as_bytes()),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write user agent header",
+        AsyncWrite07::write_all(session, b"\r\nUser-Agent: "),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write user agent",
+        AsyncWrite07::write_all(session, USER_AGENT.as_bytes()),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write connection header",
+        AsyncWrite07::write_all(session, b"\r\nAccept: application/json\r\nConnection: "),
+    )
+    .await?;
+    await_body_io_timeout(
+        path,
+        "write connection value",
+        AsyncWrite07::write_all(
+            session,
+            if connection_close {
+                b"close\r\n"
+            } else {
+                b"keep-alive\r\n"
+            },
+        ),
+    )
+    .await?;
 
     if let Some(token) = bearer_token {
-        AsyncWrite07::write_all(session, b"Authorization: Bearer ")
-            .await
-            .map_err(|err| map_logged_session_error(path, "write auth header", err))?;
-        AsyncWrite07::write_all(session, token.as_bytes())
-            .await
-            .map_err(|err| map_logged_session_error(path, "write auth token", err))?;
-        AsyncWrite07::write_all(session, b"\r\n")
-            .await
-            .map_err(|err| map_logged_session_error(path, "write auth line ending", err))?;
+        await_body_io_timeout(
+            path,
+            "write auth header",
+            AsyncWrite07::write_all(session, b"Authorization: Bearer "),
+        )
+        .await?;
+        await_body_io_timeout(
+            path,
+            "write auth token",
+            AsyncWrite07::write_all(session, token.as_bytes()),
+        )
+        .await?;
+        await_body_io_timeout(
+            path,
+            "write auth line ending",
+            AsyncWrite07::write_all(session, b"\r\n"),
+        )
+        .await?;
     }
 
     if !body.is_empty() {
         if let Some(content_type) = content_type {
-            AsyncWrite07::write_all(session, b"Content-Type: ")
-                .await
-                .map_err(|err| map_logged_session_error(path, "write content type header", err))?;
-            AsyncWrite07::write_all(session, content_type.as_bytes())
-                .await
-                .map_err(|err| map_logged_session_error(path, "write content type", err))?;
-            AsyncWrite07::write_all(session, b"\r\n")
-                .await
-                .map_err(|err| {
-                    map_logged_session_error(path, "write content type line ending", err)
-                })?;
+            await_body_io_timeout(
+                path,
+                "write content type header",
+                AsyncWrite07::write_all(session, b"Content-Type: "),
+            )
+            .await?;
+            await_body_io_timeout(
+                path,
+                "write content type",
+                AsyncWrite07::write_all(session, content_type.as_bytes()),
+            )
+            .await?;
+            await_body_io_timeout(
+                path,
+                "write content type line ending",
+                AsyncWrite07::write_all(session, b"\r\n"),
+            )
+            .await?;
         }
 
         let mut content_length = heapless::String::<16>::new();
         write!(&mut content_length, "{}", body.len()).map_err(|_| BackendError::InvalidResponse)?;
-        AsyncWrite07::write_all(session, b"Content-Length: ")
-            .await
-            .map_err(|err| map_logged_session_error(path, "write content length header", err))?;
-        AsyncWrite07::write_all(session, content_length.as_bytes())
-            .await
-            .map_err(|err| map_logged_session_error(path, "write content length", err))?;
-        AsyncWrite07::write_all(session, b"\r\n")
-            .await
-            .map_err(|err| {
-                map_logged_session_error(path, "write content length line ending", err)
-            })?;
+        await_body_io_timeout(
+            path,
+            "write content length header",
+            AsyncWrite07::write_all(session, b"Content-Length: "),
+        )
+        .await?;
+        await_body_io_timeout(
+            path,
+            "write content length",
+            AsyncWrite07::write_all(session, content_length.as_bytes()),
+        )
+        .await?;
+        await_body_io_timeout(
+            path,
+            "write content length line ending",
+            AsyncWrite07::write_all(session, b"\r\n"),
+        )
+        .await?;
     }
 
-    AsyncWrite07::write_all(session, b"\r\n")
-        .await
-        .map_err(|err| map_logged_session_error(path, "write header terminator", err))?;
+    await_body_io_timeout(
+        path,
+        "write header terminator",
+        AsyncWrite07::write_all(session, b"\r\n"),
+    )
+    .await?;
 
     if !body.is_empty() {
-        AsyncWrite07::write_all(session, body)
-            .await
-            .map_err(|err| map_logged_session_error(path, "write body", err))?;
+        await_body_io_timeout(path, "write body", AsyncWrite07::write_all(session, body)).await?;
     }
 
-    AsyncWrite07::flush(session)
-        .await
-        .map_err(|err| map_logged_session_error(path, "flush", err))?;
+    await_body_io_timeout(path, "flush", AsyncWrite07::flush(session)).await?;
     Ok(())
 }
 
@@ -1462,17 +1643,22 @@ where
             return Err(BackendError::ResponseTooLarge);
         }
 
-        let read = match AsyncRead07::read(session, &mut response_buffer[total..]).await {
+        let read = match await_body_io_timeout(
+            path,
+            "response read",
+            AsyncRead07::read(session, &mut response_buffer[total..]),
+        )
+        .await
+        {
             Ok(read) => read,
-            Err(err) if total > 0 => {
-                let backend_error = map_logged_session_error(path, "response read", err);
+            Err(backend_error) if total > 0 => {
                 info!(
                     "backend request response read interrupted path={} received_bytes={} mapped={:?}",
                     path, total, backend_error
                 );
                 break;
             }
-            Err(err) => return Err(map_logged_session_error(path, "response read", err)),
+            Err(err) => return Err(err),
         };
         if read == 0 {
             if let Some(expected_total) = expected_total
@@ -1730,53 +1916,72 @@ async fn fetch_and_stage_package(
     request: PrepareContentRequest,
 ) -> Result<CollectionManifestState, PackagePrepareError> {
     let path = build_detail_path(request).map_err(PackagePrepareError::Other)?;
-    content_storage::begin_package_stage(request.content_id, request.remote_revision)
-        .await
-        .map_err(map_storage_prepare_error)?;
+    let mut attempt = 0usize;
 
-    let status = match stream_https_response_body_to_storage(
-        stack,
-        tls,
-        ca_chain,
-        tcp_state,
-        HttpRequest {
-            method: "GET",
-            path: path.as_str(),
-            content_type: Some("application/json"),
-            bearer_token: Some(access_token),
-            body: b"",
-            connection_close: true,
-        },
-    )
-    .await
-    {
-        Ok(status) => status,
-        Err(err) => {
-            let _ = content_storage::abort_package_stage().await;
-            return Err(PackagePrepareError::Other(err));
-        }
-    };
-
-    if (400..500).contains(&status) {
-        let _ = content_storage::abort_package_stage().await;
-        return Err(PackagePrepareError::Rejected(status));
-    }
-    if status != 200 {
-        let _ = content_storage::abort_package_stage().await;
-        return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
-    }
-
-    let snapshot =
-        content_storage::commit_package_stage(request.collection, request.remote_item_id)
+    loop {
+        content_storage::begin_package_stage(request.content_id, request.remote_revision)
             .await
             .map_err(map_storage_prepare_error)?;
 
-    if manifest_item_state(&snapshot, &request.remote_item_id) == Some(PackageState::PendingRemote)
-    {
-        return Err(PackagePrepareError::PendingRemote);
-    }
+        let status = match stream_https_response_body_to_storage(
+            stack,
+            tls,
+            ca_chain,
+            tcp_state,
+            HttpRequest {
+                method: "GET",
+                path: path.as_str(),
+                content_type: Some("application/json"),
+                bearer_token: Some(access_token),
+                body: b"",
+                connection_close: true,
+            },
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err(err)
+                if is_transient_transport_error(err) && attempt + 1 < TRANSPORT_RETRY_ATTEMPTS =>
+            {
+                let _ = content_storage::abort_package_stage().await;
+                attempt += 1;
+                info!(
+                    "backend package retry content_id={} attempt={} err={:?}",
+                    request.content_id.as_str(),
+                    attempt,
+                    err
+                );
+                Timer::after(Duration::from_millis(TRANSPORT_RETRY_BACKOFF_MS)).await;
+                continue;
+            }
+            Err(err) => {
+                let _ = content_storage::abort_package_stage().await;
+                return Err(PackagePrepareError::Other(err));
+            }
+        };
 
-    Ok(snapshot)
+        if (400..500).contains(&status) {
+            let _ = content_storage::abort_package_stage().await;
+            return Err(PackagePrepareError::Rejected(status));
+        }
+        if status != 200 {
+            let _ = content_storage::abort_package_stage().await;
+            return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
+        }
+
+        let snapshot =
+            content_storage::commit_package_stage(request.collection, request.remote_item_id)
+                .await
+                .map_err(map_storage_prepare_error)?;
+
+        if manifest_item_state(&snapshot, &request.remote_item_id)
+            == Some(PackageState::PendingRemote)
+        {
+            return Err(PackagePrepareError::PendingRemote);
+        }
+
+        return Ok(snapshot);
+    }
 }
 
 async fn fetch_and_stage_package_over_session<T>(
@@ -1889,7 +2094,7 @@ async fn stream_https_response_body_to_storage(
 ) -> Result<u16, BackendError> {
     let mut metrics = RequestMetrics::new(false, true);
     let mut tcp_client = TcpClient::new(stack, tcp_state);
-    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
+    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
 
     let dns = DnsSocket::new(stack);
     let dns_started_ms = now_ms();
@@ -1911,14 +2116,21 @@ async fn stream_https_response_body_to_storage(
         }
     };
     let connect_started_ms = now_ms();
-    let connection = tcp_client
-        .connect(SocketAddr::new(IpAddr::V4(remote_addr), BACKEND_PORT))
-        .await
-        .map_err(|_| {
-            info!("backend request connect failed path={}", request.path);
-            log_request_heap(request.path, "stream connect failed");
-            BackendError::Connect
-        })?;
+    let connection = with_timeout(
+        Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        tcp_client.connect(SocketAddr::new(IpAddr::V4(remote_addr), BACKEND_PORT)),
+    )
+    .await
+    .map_err(|_| {
+        info!("backend request connect timed out path={}", request.path);
+        log_request_heap(request.path, "stream connect timeout");
+        BackendError::Connect
+    })?
+    .map_err(|_| {
+        info!("backend request connect failed path={}", request.path);
+        log_request_heap(request.path, "stream connect failed");
+        BackendError::Connect
+    })?;
     metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
@@ -1926,10 +2138,7 @@ async fn stream_https_response_body_to_storage(
             log_request_heap(request.path, "stream tls setup failed");
         })?;
     let tls_started_ms = now_ms();
-    session
-        .connect()
-        .await
-        .map_err(|err| map_logged_session_error(request.path, "handshake", err))?;
+    await_tls_handshake(&mut session, request.path).await?;
     metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
@@ -2045,9 +2254,12 @@ where
             return Err(BackendError::ResponseTooLarge);
         }
 
-        let read = AsyncRead07::read(session, &mut header[header_len..])
-            .await
-            .map_err(|err| map_logged_session_error(path, "stream response header read", err))?;
+        let read = await_body_io_timeout(
+            path,
+            "stream response header read",
+            AsyncRead07::read(session, &mut header[header_len..]),
+        )
+        .await?;
         if read == 0 {
             return Err(BackendError::InvalidResponse);
         }
@@ -2078,11 +2290,12 @@ where
                 let mut remaining = content_length - initial_body_len;
                 while remaining > 0 {
                     let read_len = remaining.min(chunk.len());
-                    let read = AsyncRead07::read(session, &mut chunk[..read_len])
-                        .await
-                        .map_err(|err| {
-                            map_logged_session_error(path, "stream response body read", err)
-                        })?;
+                    let read = await_body_io_timeout(
+                        path,
+                        "stream response body read",
+                        AsyncRead07::read(session, &mut chunk[..read_len]),
+                    )
+                    .await?;
                     if read == 0 {
                         return Err(BackendError::InvalidResponse);
                     }
@@ -2106,9 +2319,12 @@ where
     }
 
     loop {
-        let read = AsyncRead07::read(session, &mut chunk)
-            .await
-            .map_err(|err| map_logged_session_error(path, "stream response body read", err))?;
+        let read = await_body_io_timeout(
+            path,
+            "stream response body read",
+            AsyncRead07::read(session, &mut chunk),
+        )
+        .await?;
         if read == 0 {
             break;
         }
@@ -3067,6 +3283,13 @@ fn log_request_timing(request: HttpRequest<'_>, status: u16, metrics: &RequestMe
         metrics.first_byte_ms.unwrap_or(metrics.total_ms),
         metrics.total_ms,
     );
+}
+
+const fn is_transient_transport_error(error: BackendError) -> bool {
+    matches!(
+        error,
+        BackendError::Dns | BackendError::Connect | BackendError::Tls | BackendError::Io
+    )
 }
 
 const fn is_auth_status(status: u16) -> bool {
