@@ -6,10 +6,10 @@ use crate::{
         PrepareContentRequest, REMOTE_ITEM_ID_MAX_BYTES,
     },
     device::DeviceState,
-    formatter::ReadingDocument,
     input::InputGesture,
     network::NetworkState,
     network::NetworkStatus,
+    reader::{ReaderParagraphInfo, ReaderWindow, ReaderWindowLoadRequest},
     settings::PersistedSettings,
     storage::StorageHealth,
     sync::SyncStatus,
@@ -73,8 +73,11 @@ pub enum Event {
     CollectionContentUpdated(CollectionKind, Box<CollectionManifestState>),
     ReaderContentOpened {
         collection: CollectionKind,
+        content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
         title: InlineText<CONTENT_TITLE_MAX_BYTES>,
-        document: Box<ReadingDocument>,
+        total_units: u32,
+        paragraphs: Box<[ReaderParagraphInfo]>,
+        window: Box<ReaderWindow>,
     },
     ContentPackageStateChanged {
         collection: CollectionKind,
@@ -96,8 +99,8 @@ pub enum Effect {
         reason: CollectionConfirmIgnoredReason,
     },
     OpenCachedContent(PrepareContentRequest),
+    LoadReaderWindow(ReaderWindowLoadRequest),
     PrepareContent(PrepareContentRequest),
-    OpenRemoteContent(PrepareContentRequest),
     PersistSettings(PersistedSettings),
 }
 

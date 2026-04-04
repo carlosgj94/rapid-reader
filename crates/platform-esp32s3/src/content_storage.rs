@@ -12,8 +12,10 @@ use domain::{
         RemoteContentStatus,
     },
     formatter::{
-        MAX_READING_PARAGRAPHS, MAX_READING_TOKEN_BYTES, MAX_READING_UNITS, ReadingDocument,
+        MAX_PARAGRAPH_PREVIEW_BYTES, MAX_READING_PARAGRAPHS, MAX_READING_TOKEN_BYTES,
+        ReadingDocument, StageFont, UnitFlags,
     },
+    reader::{READER_WINDOW_MAX_UNITS, ReaderParagraphInfo, ReaderWindow},
     storage::StorageRecoveryStatus,
     text::InlineText,
 };
@@ -38,26 +40,35 @@ const STORAGE_CMD_QUEUE_CAPACITY: usize = 4;
 const MANIFEST_MAGIC: u32 = 0x4D43_4F4C;
 const CACHE_INDEX_MAGIC: u32 = 0x4D43_4944;
 const PACKAGE_META_MAGIC: u32 = 0x4D43_504D;
+const READER_PACKAGE_MAGIC: u32 = u32::from_le_bytes(*b"MTRP");
+const READER_PACKAGE_FORMAT_VERSION: u16 = 1;
 const FORMAT_VERSION: u16 = 1;
 const MAX_MANIFEST_SNAPSHOT_LEN: usize = 4096;
 const MAX_CACHE_INDEX_LEN: usize = 4096;
 const MAX_PACKAGE_META_LEN: usize = 128;
+const READER_PACKAGE_HEADER_LEN: usize = 32;
+const READER_PACKAGE_PARAGRAPH_ENTRY_LEN: usize = 72;
+const READER_PACKAGE_UNIT_ENTRY_LEN: usize = 40;
 const PACKAGE_COPY_BUFFER_LEN: usize = 512;
 // Keep this aligned with the backend download chunk. Moving from 512 B to 1 KiB
 // adds roughly 2 KiB to the 4-slot storage command queue plus a 512 B sender
 // scratch increase, which is a safer tradeoff than jumping straight to 2 KiB.
 const STAGE_WRITE_CHUNK_LEN: usize = 1024;
+const STAGE_PROGRESS_LOG_INTERVAL_BYTES: u32 = 16 * 1024;
 const CACHE_ENTRY_CAPACITY: usize = 48;
 const CACHE_SIZE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 const PACKAGE_READ_BUFFER_LEN: usize = 512;
 const MAX_JSON_KEY_BYTES: usize = 16;
 const MAX_PARSED_TITLE_BYTES: usize = CONTENT_TITLE_MAX_BYTES * 4;
-const MAX_PARSED_BLOCK_TEXT_BYTES: usize = MAX_READING_UNITS * (MAX_READING_TOKEN_BYTES + 1);
+// Keep per-block scratch bounded independently from the whole-document capacity.
+// We want much larger articles overall without allowing a single paragraph parse
+// to balloon peak heap usage in lockstep with MAX_READING_UNITS.
+const MAX_PARSED_BLOCK_TEXT_BYTES: usize = 8 * 1024;
 const MAX_PARSED_LIST_ITEMS: usize = MAX_READING_PARAGRAPHS;
-const MAX_PARSED_LIST_TOTAL_BYTES: usize = MAX_PARSED_BLOCK_TEXT_BYTES;
+const MAX_PARSED_LIST_TOTAL_BYTES: usize = 16 * 1024;
 
 // Dev-time content storage reset. Use a fresh top-level root while storage evolves.
-const ROOT_DIR_NAME: &str = "MTDV0002";
+const ROOT_DIR_NAME: &str = "MTDV0003";
 const VERSION_DIR_NAME: &str = "V1";
 const MANIFEST_DIR_NAME: &str = "MANIF";
 const PACKAGE_DIR_NAME: &str = "PKG";
@@ -98,7 +109,7 @@ pub struct ContentStorageMount<'d> {
 pub struct SdContentStorage<'d> {
     volume_mgr: SdVolumeManager<'d>,
     total_bytes: u64,
-    snapshots: [CollectionManifestState; 3],
+    snapshots: [Option<Box<CollectionManifestState>>; 3],
     cache_index: CacheIndex,
     pending_stage: Option<PendingStage>,
 }
@@ -110,6 +121,23 @@ pub struct OpenedReaderContent {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OpenedReaderPackage {
+    pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub total_units: u32,
+    pub paragraphs: Box<[ReaderParagraphInfo]>,
+    pub window: Box<ReaderWindow>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ReaderPackageHeader {
+    title_len: u16,
+    paragraph_count: u16,
+    unit_count: u32,
+    paragraph_table_offset: u32,
+    unit_table_offset: u32,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct PendingStage {
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
@@ -117,6 +145,7 @@ struct PendingStage {
     slot_id: u8,
     bytes_written: u32,
     crc32: u32,
+    started_at_ms: u64,
     overwritten_entry: Option<CacheEntry>,
     superseded_entry: Option<CacheEntry>,
 }
@@ -313,6 +342,13 @@ enum StorageCommand {
         remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
         package_state: PackageState,
     },
+    OpenCachedReaderPackage {
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    },
+    LoadReaderWindow {
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        window_start_unit_index: u32,
+    },
     OpenCachedReaderContent {
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     },
@@ -321,7 +357,9 @@ enum StorageCommand {
 #[derive(Debug)]
 enum StorageResponse {
     Snapshot(Result<Box<CollectionManifestState>, StorageError>),
+    OpenedPackage(Result<Box<OpenedReaderPackage>, StorageError>),
     Opened(Result<Box<OpenedReaderContent>, StorageError>),
+    LoadedWindow(Result<Box<ReaderWindow>, StorageError>),
     Unit(Result<(), StorageError>),
 }
 
@@ -366,7 +404,7 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
     unsafe {
         addr_of_mut!((*storage_ptr).volume_mgr).write(volume_mgr);
         addr_of_mut!((*storage_ptr).total_bytes).write(total_bytes);
-        addr_of_mut!((*storage_ptr).snapshots).write([CollectionManifestState::empty(); 3]);
+        addr_of_mut!((*storage_ptr).snapshots).write([None, None, None]);
         addr_of_mut!((*storage_ptr).cache_index).write(CacheIndex::empty());
         addr_of_mut!((*storage_ptr).pending_stage).write(None);
     }
@@ -429,7 +467,7 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
                 }
             }
         } else {
-            storage.snapshots = [CollectionManifestState::empty(); 3];
+            storage.snapshots = [None, None, None];
             storage.cache_index = CacheIndex::empty();
             let _ = storage.cleanup_active_stage_file();
         };
@@ -472,7 +510,10 @@ pub async fn persist_snapshot(
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
-        StorageResponse::Opened(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+        StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
     }
 }
 
@@ -492,7 +533,10 @@ pub async fn begin_package_stage(
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Unit(result) => result,
-        StorageResponse::Opened(_) | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
+        StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
     }
 }
 
@@ -515,7 +559,10 @@ pub async fn write_package_chunk(chunk: &[u8]) -> Result<(), StorageError> {
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Unit(result) => result,
-        StorageResponse::Opened(_) | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
+        StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
     }
 }
 
@@ -535,7 +582,10 @@ pub async fn commit_package_stage(
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
-        StorageResponse::Opened(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+        StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
     }
 }
 
@@ -547,7 +597,10 @@ pub async fn abort_package_stage() -> Result<(), StorageError> {
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Unit(result) => result,
-        StorageResponse::Opened(_) | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
+        StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
     }
 }
 
@@ -569,8 +622,82 @@ pub async fn update_package_state(
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
-        StorageResponse::Opened(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+        StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
     }
+}
+
+pub async fn open_cached_reader_package(
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+) -> Result<Box<OpenedReaderPackage>, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    let started_at = Instant::now();
+    STORAGE_CMD_CH
+        .send(StorageCommand::OpenCachedReaderPackage { content_id })
+        .await;
+
+    let result = match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::OpenedPackage(result) => result,
+        StorageResponse::Snapshot(_)
+        | StorageResponse::Opened(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    };
+
+    let total_ms = Instant::now().duration_since(started_at).as_millis();
+    match &result {
+        Ok(opened) => info!(
+            "content storage cached open timing content_id={} total_ms={} total_units={} total_paragraphs={} window_units={}",
+            content_id.as_str(),
+            total_ms,
+            opened.total_units,
+            opened.paragraphs.len(),
+            opened.window.unit_count,
+        ),
+        Err(err) => info!(
+            "content storage cached open timing failed content_id={} total_ms={} err={:?}",
+            content_id.as_str(),
+            total_ms,
+            err,
+        ),
+    }
+
+    result
+}
+
+pub async fn load_reader_window(
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    window_start_unit_index: u32,
+) -> Result<Box<ReaderWindow>, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    STORAGE_CMD_CH
+        .send(StorageCommand::LoadReaderWindow {
+            content_id,
+            window_start_unit_index,
+        })
+        .await;
+
+    match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::LoadedWindow(result) => result,
+        StorageResponse::Snapshot(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::Opened(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    }
+}
+
+fn storage_now_ms() -> u64 {
+    Instant::now().as_millis()
+}
+
+fn storage_elapsed_since_ms(started_at_ms: u64) -> u64 {
+    storage_now_ms().saturating_sub(started_at_ms)
 }
 
 pub async fn open_cached_reader_content(
@@ -586,15 +713,20 @@ pub async fn open_cached_reader_content(
 
     let result = match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Opened(result) => result,
-        StorageResponse::Snapshot(_) | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+        StorageResponse::Snapshot(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
     };
 
     let total_ms = Instant::now().duration_since(started_at).as_millis();
     match &result {
         Ok(opened) => info!(
-            "content storage cached open timing content_id={} total_ms={} truncated={}",
+            "content storage cached open timing content_id={} total_ms={} unit_count={} paragraph_count={} truncated={}",
             content_id.as_str(),
             total_ms,
+            opened.document.unit_count,
+            opened.document.paragraph_count,
             opened.truncated,
         ),
         Err(err) => info!(
@@ -650,6 +782,19 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
                     .update_manifest_item_state(collection, remote_item_id, package_state)
                     .map(Box::new),
             ),
+            StorageCommand::OpenCachedReaderPackage { content_id } => {
+                StorageResponse::OpenedPackage(
+                    storage.open_cached_reader_package(content_id).map(Box::new),
+                )
+            }
+            StorageCommand::LoadReaderWindow {
+                content_id,
+                window_start_unit_index,
+            } => StorageResponse::LoadedWindow(
+                storage
+                    .load_reader_window(content_id, window_start_unit_index)
+                    .map(Box::new),
+            ),
             StorageCommand::OpenCachedReaderContent { content_id } => StorageResponse::Opened(
                 storage.open_cached_reader_content(content_id).map(Box::new),
             ),
@@ -662,6 +807,23 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
 impl<'d> SdContentStorage<'d> {
     fn snapshot(&self, kind: CollectionKind) -> CollectionManifestState {
         self.snapshots[collection_index(kind)]
+            .as_deref()
+            .copied()
+            .unwrap_or_else(CollectionManifestState::empty)
+    }
+
+    fn snapshot_mut(&mut self, kind: CollectionKind) -> &mut CollectionManifestState {
+        self.snapshots[collection_index(kind)]
+            .get_or_insert_with(|| Box::new(CollectionManifestState::empty()))
+            .as_mut()
+    }
+
+    fn set_snapshot(&mut self, kind: CollectionKind, snapshot: CollectionManifestState) {
+        self.snapshots[collection_index(kind)] = if snapshot.is_empty() {
+            None
+        } else {
+            Some(Box::new(snapshot))
+        };
     }
 
     fn initialize_layout(&mut self) -> Result<(), StorageError> {
@@ -693,9 +855,9 @@ impl<'d> SdContentStorage<'d> {
             .read_manifest_snapshot(CollectionKind::Recommendations)?
             .unwrap_or(CollectionManifestState::empty());
 
-        self.snapshots[collection_index(CollectionKind::Saved)] = saved;
-        self.snapshots[collection_index(CollectionKind::Inbox)] = inbox;
-        self.snapshots[collection_index(CollectionKind::Recommendations)] = recommendations;
+        self.set_snapshot(CollectionKind::Saved, saved);
+        self.set_snapshot(CollectionKind::Inbox, inbox);
+        self.set_snapshot(CollectionKind::Recommendations, recommendations);
 
         self.reconcile_all_snapshots();
         self.refresh_collection_flags();
@@ -717,7 +879,7 @@ impl<'d> SdContentStorage<'d> {
         clear_or_recreate_dir(&v1, STAGING_DIR_NAME)?;
         clear_or_recreate_dir(&v1, PACKAGE_DIR_NAME)?;
 
-        self.snapshots = [CollectionManifestState::empty(); 3];
+        self.snapshots = [None, None, None];
         self.cache_index = CacheIndex::empty();
         self.pending_stage = None;
         Ok(())
@@ -728,12 +890,12 @@ impl<'d> SdContentStorage<'d> {
         kind: CollectionKind,
         snapshot: CollectionManifestState,
     ) -> Result<CollectionManifestState, StorageError> {
-        self.snapshots[collection_index(kind)] = snapshot;
+        self.set_snapshot(kind, snapshot);
         self.reconcile_snapshot(kind);
         self.refresh_collection_flags();
         self.write_manifest_snapshot(kind)?;
         self.evict_if_needed()?;
-        Ok(self.snapshots[collection_index(kind)])
+        Ok(self.snapshot(kind))
     }
 
     fn begin_stage(
@@ -757,12 +919,23 @@ impl<'d> SdContentStorage<'d> {
 
         self.delete_stage_file()?;
         self.write_stage_file(&[])?;
+        info!(
+            "content storage stage begin content_id={} revision={} slot={} superseded_slot={:?} overwritten_slot={:?} cache_entries={} cache_bytes={}",
+            content_id.as_str(),
+            remote_revision,
+            slot_id,
+            superseded_entry.map(|entry| entry.slot_id),
+            overwritten_entry.map(|entry| entry.slot_id),
+            self.cache_index.len(),
+            self.cache_index.total_bytes(),
+        );
         self.pending_stage = Some(PendingStage {
             content_id,
             remote_revision,
             slot_id,
             bytes_written: 0,
             crc32: 0xFFFF_FFFF,
+            started_at_ms: storage_now_ms(),
             overwritten_entry,
             superseded_entry,
         });
@@ -777,6 +950,23 @@ impl<'d> SdContentStorage<'d> {
         self.append_stage_file(chunk)?;
         stage.bytes_written = stage.bytes_written.saturating_add(chunk.len() as u32);
         stage.crc32 = crc32_continue(stage.crc32, chunk);
+        let crossed_progress_boundary = if stage.bytes_written == chunk.len() as u32 {
+            true
+        } else {
+            stage.bytes_written / STAGE_PROGRESS_LOG_INTERVAL_BYTES
+                != (stage.bytes_written.saturating_sub(chunk.len() as u32))
+                    / STAGE_PROGRESS_LOG_INTERVAL_BYTES
+        };
+        if crossed_progress_boundary {
+            info!(
+                "content storage stage progress content_id={} slot={} bytes_written={} chunk_len={} elapsed_ms={}",
+                stage.content_id.as_str(),
+                stage.slot_id,
+                stage.bytes_written,
+                chunk.len(),
+                storage_elapsed_since_ms(stage.started_at_ms),
+            );
+        }
         self.pending_stage = Some(stage);
         Ok(())
     }
@@ -790,20 +980,7 @@ impl<'d> SdContentStorage<'d> {
             return Err(StorageError::Unavailable);
         };
 
-        if !self.stage_file_has_compact_body()? {
-            info!(
-                "content storage package missing compact body collection={:?} remote_item_id={} content_id={}",
-                collection,
-                remote_item_id.as_str(),
-                stage.content_id.as_str(),
-            );
-            self.delete_stage_file()?;
-            return self.update_manifest_item_state(
-                collection,
-                remote_item_id,
-                PackageState::PendingRemote,
-            );
-        }
+        let header = self.validate_staged_reader_package(stage.bytes_written)?;
 
         self.copy_stage_to_package_slot(stage.slot_id)?;
         self.write_package_meta(
@@ -843,10 +1020,33 @@ impl<'d> SdContentStorage<'d> {
         let snapshot =
             self.update_manifest_item_state(collection, remote_item_id, PackageState::Cached)?;
         self.evict_if_needed()?;
+        info!(
+            "content storage stage commit content_id={} slot={} bytes_written={} crc32=0x{:08x} collection={:?} remote_item_id={} overwritten_slot={:?} superseded_slot={:?} total_units={} paragraphs={} elapsed_ms={}",
+            stage.content_id.as_str(),
+            stage.slot_id,
+            stage.bytes_written,
+            !stage.crc32,
+            collection,
+            remote_item_id.as_str(),
+            stage.overwritten_entry.map(|entry| entry.slot_id),
+            stage.superseded_entry.map(|entry| entry.slot_id),
+            header.unit_count,
+            header.paragraph_count,
+            storage_elapsed_since_ms(stage.started_at_ms),
+        );
         Ok(snapshot)
     }
 
     fn abort_stage(&mut self) -> Result<(), StorageError> {
+        if let Some(stage) = self.pending_stage {
+            info!(
+                "content storage stage abort content_id={} slot={} bytes_written={} elapsed_ms={}",
+                stage.content_id.as_str(),
+                stage.slot_id,
+                stage.bytes_written,
+                storage_elapsed_since_ms(stage.started_at_ms),
+            );
+        }
         self.pending_stage = None;
         self.delete_stage_file()
     }
@@ -858,11 +1058,11 @@ impl<'d> SdContentStorage<'d> {
         package_state: PackageState,
     ) -> Result<CollectionManifestState, StorageError> {
         {
-            let snapshot = &mut self.snapshots[collection_index(collection)];
+            let snapshot = self.snapshot_mut(collection);
             let _ = snapshot.update_package_state(&remote_item_id, package_state);
         }
         self.write_manifest_snapshot(collection)?;
-        Ok(self.snapshots[collection_index(collection)])
+        Ok(self.snapshot(collection))
     }
 
     fn open_cached_reader_content(
@@ -943,12 +1143,14 @@ impl<'d> SdContentStorage<'d> {
             }
             let total_ms = Instant::now().duration_since(started_at).as_millis();
             info!(
-                "content storage cached parse timing content_id={} slot={} bytes_read={} parse_ms={} total_ms={} truncated={}",
+                "content storage cached parse timing content_id={} slot={} bytes_read={} parse_ms={} total_ms={} unit_count={} paragraph_count={} truncated={}",
                 content_id.as_str(),
                 entry.slot_id,
                 source.bytes_read(),
                 parse_ms,
                 total_ms,
+                opened.document.unit_count,
+                opened.document.paragraph_count,
                 opened.truncated,
             );
             opened
@@ -962,6 +1164,115 @@ impl<'d> SdContentStorage<'d> {
         Ok(opened)
     }
 
+    fn open_cached_reader_package(
+        &mut self,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> Result<OpenedReaderPackage, StorageError> {
+        let entry = self
+            .cache_index
+            .find_by_content_id(&content_id)
+            .ok_or(StorageError::Unavailable)?;
+        let meta = self.read_package_meta(entry.slot_id)?;
+        if meta.remote_revision != entry.remote_revision {
+            return Err(StorageError::CorruptData);
+        }
+
+        let opened = {
+            let volume = self
+                .volume_mgr
+                .open_volume(VolumeIdx(0))
+                .map_err(map_sd_error)?;
+            let root = volume.open_root_dir().map_err(map_sd_error)?;
+            let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+            let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+            let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+            let mut file = pkg_dir
+                .open_file_in_dir(
+                    package_payload_file_name(entry.slot_id).as_str(),
+                    Mode::ReadOnly,
+                )
+                .map_err(map_sd_error)?;
+            if file.length() != meta.size_bytes {
+                return Err(StorageError::CorruptData);
+            }
+
+            let header = read_reader_package_header(&mut file)?;
+            let title = read_reader_package_title(&mut file, header)?;
+            let paragraphs = read_reader_package_paragraphs(&mut file, header)?;
+            let window = Box::new(read_reader_package_window(&mut file, header, 0)?);
+            info!(
+                "content storage package open content_id={} slot={} size_bytes={} total_units={} paragraphs={} initial_window_start={} initial_window_units={}",
+                content_id.as_str(),
+                entry.slot_id,
+                meta.size_bytes,
+                header.unit_count,
+                header.paragraph_count,
+                window.start_unit_index,
+                window.unit_count,
+            );
+            OpenedReaderPackage {
+                title,
+                total_units: header.unit_count,
+                paragraphs: paragraphs.into_boxed_slice(),
+                window,
+            }
+        };
+
+        if let Some(index) = self.cache_index.find_index_by_content_id(&content_id) {
+            self.cache_index.entries[index].last_touch_seq = self.cache_index.bump_touch_seq();
+            self.write_cache_index()?;
+        }
+
+        Ok(opened)
+    }
+
+    fn load_reader_window(
+        &mut self,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        window_start_unit_index: u32,
+    ) -> Result<ReaderWindow, StorageError> {
+        let entry = self
+            .cache_index
+            .find_by_content_id(&content_id)
+            .ok_or(StorageError::Unavailable)?;
+        let meta = self.read_package_meta(entry.slot_id)?;
+        if meta.remote_revision != entry.remote_revision {
+            return Err(StorageError::CorruptData);
+        }
+
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+        let mut file = pkg_dir
+            .open_file_in_dir(
+                package_payload_file_name(entry.slot_id).as_str(),
+                Mode::ReadOnly,
+            )
+            .map_err(map_sd_error)?;
+        if file.length() != meta.size_bytes {
+            return Err(StorageError::CorruptData);
+        }
+
+        let header = read_reader_package_header(&mut file)?;
+        let window = read_reader_package_window(&mut file, header, window_start_unit_index)?;
+        info!(
+            "content storage window load content_id={} slot={} requested_start={} loaded_start={} unit_count={} total_units={} total_paragraphs={}",
+            content_id.as_str(),
+            entry.slot_id,
+            window_start_unit_index,
+            window.start_unit_index,
+            window.unit_count,
+            header.unit_count,
+            header.paragraph_count,
+        );
+        Ok(window)
+    }
+
     fn reconcile_all_snapshots(&mut self) {
         let mut index = 0;
         while index < CollectionKind::ALL.len() {
@@ -971,7 +1282,9 @@ impl<'d> SdContentStorage<'d> {
     }
 
     fn reconcile_snapshot(&mut self, kind: CollectionKind) {
-        let snapshot = &mut self.snapshots[collection_index(kind)];
+        let Some(snapshot) = self.snapshots[collection_index(kind)].as_mut() else {
+            return;
+        };
         let len = snapshot.len();
         let mut index = 0;
         while index < len {
@@ -1003,7 +1316,10 @@ impl<'d> SdContentStorage<'d> {
             let mut collection_index_value = 0;
             while collection_index_value < CollectionKind::ALL.len() {
                 let kind = CollectionKind::ALL[collection_index_value];
-                let snapshot = &self.snapshots[collection_index(kind)];
+                let Some(snapshot) = self.snapshots[collection_index(kind)].as_ref() else {
+                    collection_index_value += 1;
+                    continue;
+                };
                 let mut item_index = 0;
                 while item_index < snapshot.len() {
                     if snapshot.items[item_index].content_id == content_id {
@@ -1065,7 +1381,7 @@ impl<'d> SdContentStorage<'d> {
     }
 
     fn write_manifest_snapshot(&mut self, kind: CollectionKind) -> Result<(), StorageError> {
-        let snapshot = self.snapshots[collection_index(kind)];
+        let snapshot = self.snapshot(kind);
         let mut bytes = Box::new([0u8; MAX_MANIFEST_SNAPSHOT_LEN]);
         let encoded_len = encode_manifest_snapshot(kind, &snapshot, &mut bytes[..])?;
         self.write_named_file_in_manif_dir(manifest_file_name(kind), &bytes[..encoded_len])
@@ -1128,7 +1444,10 @@ impl<'d> SdContentStorage<'d> {
         self.delete_stage_file()
     }
 
-    fn stage_file_has_compact_body(&mut self) -> Result<bool, StorageError> {
+    fn validate_staged_reader_package(
+        &mut self,
+        expected_size: u32,
+    ) -> Result<ReaderPackageHeader, StorageError> {
         let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
@@ -1137,46 +1456,23 @@ impl<'d> SdContentStorage<'d> {
         let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
         let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
         let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
-        let file = stage_dir
+        let mut file = stage_dir
             .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadOnly)
             .map_err(map_sd_error)?;
-
-        let mut buffer = [0u8; PACKAGE_COPY_BUFFER_LEN];
-        let mut saw_body_key = false;
-        let mut saw_body_object = false;
-        let mut carry = [0u8; 16];
-        let mut carry_len = 0usize;
-
-        loop {
-            let read = file.read(&mut buffer).map_err(map_sd_error)?;
-            if read == 0 {
-                break;
-            }
-
-            let mut combined = [0u8; PACKAGE_COPY_BUFFER_LEN + 16];
-            combined[..carry_len].copy_from_slice(&carry[..carry_len]);
-            combined[carry_len..carry_len + read].copy_from_slice(&buffer[..read]);
-            let combined_len = carry_len + read;
-            let haystack = &combined[..combined_len];
-
-            if find_bytes(haystack, br#""body":{"#).is_some() {
-                saw_body_key = true;
-                saw_body_object = true;
-                break;
-            }
-            if find_bytes(haystack, br#""body":null"#).is_some() {
-                saw_body_key = true;
-                break;
-            }
-            if find_bytes(haystack, br#""body""#).is_some() {
-                saw_body_key = true;
-            }
-
-            carry_len = haystack.len().min(carry.len());
-            carry[..carry_len].copy_from_slice(&haystack[haystack.len() - carry_len..]);
+        if file.length() != expected_size {
+            return Err(StorageError::CorruptData);
         }
-
-        Ok(saw_body_key && saw_body_object)
+        let header = read_reader_package_header(&mut file)?;
+        info!(
+            "content storage stage validate size_bytes={} title_len={} total_units={} paragraphs={} paragraph_table_offset={} unit_table_offset={}",
+            expected_size,
+            header.title_len,
+            header.unit_count,
+            header.paragraph_count,
+            header.paragraph_table_offset,
+            header.unit_table_offset,
+        );
+        Ok(header)
     }
 
     fn delete_stage_file(&mut self) -> Result<(), StorageError> {
@@ -1500,7 +1796,7 @@ fn manifest_file_name(kind: CollectionKind) -> &'static str {
 
 fn package_payload_file_name(slot_id: u8) -> heapless::String<12> {
     let mut name = heapless::String::<12>::new();
-    let _ = core::fmt::write(&mut name, format_args!("P{:07}.JSN", slot_id));
+    let _ = core::fmt::write(&mut name, format_args!("P{:07}.PKG", slot_id));
     name
 }
 
@@ -1877,6 +2173,245 @@ fn read_u64(buffer: &[u8], offset: usize) -> u64 {
         buffer[offset + 6],
         buffer[offset + 7],
     ])
+}
+
+fn read_exact_file(file: &mut SdFile<'_, '_>, out: &mut [u8]) -> Result<(), StorageError> {
+    let mut offset = 0usize;
+    while offset < out.len() {
+        let read = file.read(&mut out[offset..]).map_err(map_sd_error)?;
+        if read == 0 {
+            return Err(StorageError::CorruptData);
+        }
+        offset += read;
+    }
+    Ok(())
+}
+
+fn decode_reader_package_header(
+    bytes: &[u8],
+    file_len: u32,
+) -> Result<ReaderPackageHeader, StorageError> {
+    if bytes.len() < READER_PACKAGE_HEADER_LEN {
+        return Err(StorageError::CorruptData);
+    }
+    if read_u32(bytes, 0) != READER_PACKAGE_MAGIC
+        || read_u16(bytes, 4) != READER_PACKAGE_FORMAT_VERSION
+    {
+        return Err(StorageError::CorruptData);
+    }
+
+    let title_len = read_u16(bytes, 8);
+    let paragraph_count = read_u16(bytes, 10);
+    let unit_count = read_u32(bytes, 12);
+    let paragraph_table_offset = read_u32(bytes, 16);
+    let unit_table_offset = read_u32(bytes, 20);
+    let expected_paragraph_offset = (READER_PACKAGE_HEADER_LEN as u32)
+        .checked_add(title_len as u32)
+        .ok_or(StorageError::CorruptData)?;
+    let expected_unit_offset = expected_paragraph_offset
+        .checked_add(
+            (paragraph_count as u32)
+                .checked_mul(READER_PACKAGE_PARAGRAPH_ENTRY_LEN as u32)
+                .ok_or(StorageError::CorruptData)?,
+        )
+        .ok_or(StorageError::CorruptData)?;
+    let expected_file_len = expected_unit_offset
+        .checked_add(
+            unit_count
+                .checked_mul(READER_PACKAGE_UNIT_ENTRY_LEN as u32)
+                .ok_or(StorageError::CorruptData)?,
+        )
+        .ok_or(StorageError::CorruptData)?;
+
+    if paragraph_count == 0
+        || unit_count == 0
+        || paragraph_table_offset != expected_paragraph_offset
+        || unit_table_offset != expected_unit_offset
+        || expected_file_len != file_len
+    {
+        return Err(StorageError::CorruptData);
+    }
+
+    Ok(ReaderPackageHeader {
+        title_len,
+        paragraph_count,
+        unit_count,
+        paragraph_table_offset,
+        unit_table_offset,
+    })
+}
+
+fn read_reader_package_header(
+    file: &mut SdFile<'_, '_>,
+) -> Result<ReaderPackageHeader, StorageError> {
+    file.seek_from_start(0).map_err(map_sd_error)?;
+    let mut bytes = [0u8; READER_PACKAGE_HEADER_LEN];
+    read_exact_file(file, &mut bytes)?;
+    decode_reader_package_header(&bytes, file.length())
+}
+
+fn read_reader_package_title(
+    file: &mut SdFile<'_, '_>,
+    header: ReaderPackageHeader,
+) -> Result<InlineText<CONTENT_TITLE_MAX_BYTES>, StorageError> {
+    let mut title = InlineText::new();
+    let title_len = header.title_len as usize;
+    if title_len == 0 {
+        title.set_truncated("UNTITLED ARTICLE");
+        return Ok(title);
+    }
+
+    let mut bytes = alloc::vec![0u8; title_len];
+    file.seek_from_start(READER_PACKAGE_HEADER_LEN as u32)
+        .map_err(map_sd_error)?;
+    read_exact_file(file, &mut bytes)?;
+    let value = str::from_utf8(&bytes).map_err(|_| StorageError::CorruptData)?;
+    title.set_truncated(value);
+    if title.is_empty() {
+        title.set_truncated("UNTITLED ARTICLE");
+    }
+    Ok(title)
+}
+
+fn decode_reader_package_paragraph_entry(
+    bytes: &[u8],
+) -> Result<ReaderParagraphInfo, StorageError> {
+    if bytes.len() < READER_PACKAGE_PARAGRAPH_ENTRY_LEN {
+        return Err(StorageError::CorruptData);
+    }
+
+    let preview_len = bytes[4] as usize;
+    if preview_len > MAX_PARAGRAPH_PREVIEW_BYTES || 8 + preview_len > bytes.len() {
+        return Err(StorageError::CorruptData);
+    }
+
+    let preview_text =
+        str::from_utf8(&bytes[8..8 + preview_len]).map_err(|_| StorageError::CorruptData)?;
+    let mut preview = InlineText::new();
+    preview.set_truncated(preview_text);
+    Ok(ReaderParagraphInfo {
+        start_unit_index: read_u32(bytes, 0),
+        preview,
+    })
+}
+
+fn read_reader_package_paragraphs(
+    file: &mut SdFile<'_, '_>,
+    header: ReaderPackageHeader,
+) -> Result<Vec<ReaderParagraphInfo>, StorageError> {
+    file.seek_from_start(header.paragraph_table_offset)
+        .map_err(map_sd_error)?;
+    let mut paragraphs = Vec::with_capacity(header.paragraph_count as usize);
+    let mut bytes = [0u8; READER_PACKAGE_PARAGRAPH_ENTRY_LEN];
+    let mut index = 0usize;
+    let mut previous_start = None;
+    while index < header.paragraph_count as usize {
+        read_exact_file(file, &mut bytes)?;
+        let paragraph = decode_reader_package_paragraph_entry(&bytes)?;
+        if paragraph.start_unit_index >= header.unit_count
+            || previous_start.is_some_and(|previous| paragraph.start_unit_index < previous)
+        {
+            return Err(StorageError::CorruptData);
+        }
+        previous_start = Some(paragraph.start_unit_index);
+        paragraphs.push(paragraph);
+        index += 1;
+    }
+    Ok(paragraphs)
+}
+
+fn font_from_byte(byte: u8) -> Result<StageFont, StorageError> {
+    match byte {
+        0 => Ok(StageFont::Large),
+        1 => Ok(StageFont::Medium),
+        2 => Ok(StageFont::Small),
+        _ => Err(StorageError::CorruptData),
+    }
+}
+
+fn flags_from_byte(byte: u8) -> UnitFlags {
+    UnitFlags {
+        clause_pause: (byte & 0b0001) != 0,
+        sentence_pause: (byte & 0b0010) != 0,
+        paragraph_start: (byte & 0b0100) != 0,
+        paragraph_end: (byte & 0b1000) != 0,
+    }
+}
+
+fn decode_reader_package_unit_entry(
+    bytes: &[u8],
+    paragraph_count: u16,
+) -> Result<domain::formatter::ReadingUnit, StorageError> {
+    if bytes.len() < READER_PACKAGE_UNIT_ENTRY_LEN {
+        return Err(StorageError::CorruptData);
+    }
+
+    let paragraph_index = read_u16(bytes, 0);
+    let display_len = bytes[6] as usize;
+    if paragraph_index == 0
+        || paragraph_index > paragraph_count
+        || display_len == 0
+        || display_len > MAX_READING_TOKEN_BYTES
+        || 8 + display_len > bytes.len()
+    {
+        return Err(StorageError::CorruptData);
+    }
+
+    let display_text =
+        str::from_utf8(&bytes[8..8 + display_len]).map_err(|_| StorageError::CorruptData)?;
+    let mut display = InlineText::new();
+    display.set_truncated(display_text);
+    if display.is_empty() {
+        return Err(StorageError::CorruptData);
+    }
+
+    let char_count = bytes[3];
+    if char_count == 0 {
+        return Err(StorageError::CorruptData);
+    }
+
+    Ok(domain::formatter::ReadingUnit {
+        display,
+        paragraph_index: paragraph_index.min(u8::MAX as u16) as u8,
+        anchor_index: bytes[2].min(char_count.saturating_sub(1)),
+        char_count,
+        font: font_from_byte(bytes[4])?,
+        flags: flags_from_byte(bytes[5]),
+    })
+}
+
+fn read_reader_package_window(
+    file: &mut SdFile<'_, '_>,
+    header: ReaderPackageHeader,
+    window_start_unit_index: u32,
+) -> Result<ReaderWindow, StorageError> {
+    if window_start_unit_index >= header.unit_count {
+        return Err(StorageError::CorruptData);
+    }
+
+    let mut window = ReaderWindow::empty();
+    let remaining = header.unit_count.saturating_sub(window_start_unit_index);
+    let unit_count = remaining.min(READER_WINDOW_MAX_UNITS as u32) as usize;
+    let start_offset = header
+        .unit_table_offset
+        .checked_add(
+            window_start_unit_index
+                .checked_mul(READER_PACKAGE_UNIT_ENTRY_LEN as u32)
+                .ok_or(StorageError::CorruptData)?,
+        )
+        .ok_or(StorageError::CorruptData)?;
+    file.seek_from_start(start_offset).map_err(map_sd_error)?;
+
+    let mut bytes = [0u8; READER_PACKAGE_UNIT_ENTRY_LEN];
+    let mut index = 0usize;
+    while index < unit_count {
+        read_exact_file(file, &mut bytes)?;
+        window.units[index] = decode_reader_package_unit_entry(&bytes, header.paragraph_count)?;
+        index += 1;
+    }
+    window.start_unit_index = window_start_unit_index;
+    window.unit_count = unit_count as u16;
+    Ok(window)
 }
 
 fn detail_locator_to_byte(locator: DetailLocator) -> u8 {

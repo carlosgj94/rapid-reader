@@ -137,14 +137,26 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                 request.collection,
                 request.content_id.as_str(),
             );
-            match content_storage::open_cached_reader_content(request.content_id).await {
+            match content_storage::open_cached_reader_package(request.content_id).await {
                 Ok(opened) => {
-                    store.open_cached_content(request.collection, opened.title, opened.document);
+                    let total_units = opened.total_units;
+                    let paragraph_count = opened.paragraphs.len();
+                    let window_units = opened.window.unit_count;
+                    store.open_cached_content(
+                        request.collection,
+                        request.content_id,
+                        opened.title,
+                        total_units,
+                        opened.paragraphs,
+                        opened.window,
+                    );
                     info!(
-                        "content storage opened cached content collection={:?} content_id={} truncated={}",
+                        "content storage opened cached package collection={:?} content_id={} total_units={} paragraph_count={} window_units={}",
                         request.collection,
                         request.content_id.as_str(),
-                        opened.truncated,
+                        total_units,
+                        paragraph_count,
+                        window_units,
                     );
                 }
                 Err(err) => {
@@ -205,6 +217,33 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                 }
             }
         }
+        Effect::LoadReaderWindow(request) => {
+            match content_storage::load_reader_window(
+                request.content_id,
+                request.window_start_unit_index,
+            )
+            .await
+            {
+                Ok(window) => {
+                    info!(
+                        "content storage loaded reader window content_id={} start_unit={} unit_count={}",
+                        request.content_id.as_str(),
+                        window.start_unit_index,
+                        window.unit_count,
+                    );
+                    store.load_reader_window(window);
+                }
+                Err(err) => {
+                    info!(
+                        "content storage reader window load failed content_id={} start_unit={} err={:?}",
+                        request.content_id.as_str(),
+                        request.window_start_unit_index,
+                        err,
+                    );
+                    store.reader.clear_pending_window_request();
+                }
+            }
+        }
         Effect::PrepareContent(request) => {
             info!(
                 "collection confirm prepare content collection={:?} content_id={} remote_item_id={}",
@@ -213,15 +252,6 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                 request.remote_item_id.as_str(),
             );
             backend::request_prepare_content(request).await;
-        }
-        Effect::OpenRemoteContent(request) => {
-            info!(
-                "collection confirm open remote collection={:?} content_id={} remote_item_id={}",
-                request.collection,
-                request.content_id.as_str(),
-                request.remote_item_id.as_str(),
-            );
-            backend::request_open_remote_content(request).await;
         }
         Effect::PersistSettings(settings) => {
             PLATFORM_CMD_CH

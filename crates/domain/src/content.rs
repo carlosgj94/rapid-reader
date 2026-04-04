@@ -1,4 +1,3 @@
-use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 use alloc::boxed::Box;
 
 use crate::{source::SourceKind, text::InlineText};
@@ -273,27 +272,26 @@ impl Default for CollectionManifestState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+const EMPTY_COLLECTION_STATE: CollectionManifestState = CollectionManifestState::empty();
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ContentState {
-    pub saved: CollectionManifestState,
-    pub inbox: CollectionManifestState,
-    pub recommendations: CollectionManifestState,
+    pub saved: Option<Box<CollectionManifestState>>,
+    pub inbox: Option<Box<CollectionManifestState>>,
+    pub recommendations: Option<Box<CollectionManifestState>>,
 }
 
 impl ContentState {
     pub const fn empty() -> Self {
         Self {
-            saved: CollectionManifestState::empty(),
-            inbox: CollectionManifestState::empty(),
-            recommendations: CollectionManifestState::empty(),
+            saved: None,
+            inbox: None,
+            recommendations: None,
         }
     }
 
     pub fn boxed_empty() -> Box<Self> {
-        let layout = Layout::new::<Self>();
-        let ptr = unsafe { alloc_zeroed(layout) };
-        let ptr = core::ptr::NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
-        unsafe { Box::from_raw(ptr.as_ptr().cast::<Self>()) }
+        Box::new(Self::empty())
     }
 
     pub const fn collection_len(&self, kind: CollectionKind) -> usize {
@@ -302,17 +300,35 @@ impl ContentState {
 
     pub const fn collection_state(&self, kind: CollectionKind) -> &CollectionManifestState {
         match kind {
-            CollectionKind::Saved => &self.saved,
-            CollectionKind::Inbox => &self.inbox,
-            CollectionKind::Recommendations => &self.recommendations,
+            CollectionKind::Saved => match &self.saved {
+                Some(collection) => collection,
+                None => &EMPTY_COLLECTION_STATE,
+            },
+            CollectionKind::Inbox => match &self.inbox {
+                Some(collection) => collection,
+                None => &EMPTY_COLLECTION_STATE,
+            },
+            CollectionKind::Recommendations => match &self.recommendations {
+                Some(collection) => collection,
+                None => &EMPTY_COLLECTION_STATE,
+            },
         }
     }
 
     pub fn collection_state_mut(&mut self, kind: CollectionKind) -> &mut CollectionManifestState {
         match kind {
-            CollectionKind::Saved => &mut self.saved,
-            CollectionKind::Inbox => &mut self.inbox,
-            CollectionKind::Recommendations => &mut self.recommendations,
+            CollectionKind::Saved => self
+                .saved
+                .get_or_insert_with(|| Box::new(CollectionManifestState::empty()))
+                .as_mut(),
+            CollectionKind::Inbox => self
+                .inbox
+                .get_or_insert_with(|| Box::new(CollectionManifestState::empty()))
+                .as_mut(),
+            CollectionKind::Recommendations => self
+                .recommendations
+                .get_or_insert_with(|| Box::new(CollectionManifestState::empty()))
+                .as_mut(),
         }
     }
 
@@ -325,7 +341,24 @@ impl ContentState {
     }
 
     pub fn update_collection(&mut self, kind: CollectionKind, collection: CollectionManifestState) {
-        *self.collection_state_mut(kind) = collection;
+        if collection.is_empty() {
+            self.clear_collection(kind);
+        } else {
+            *self.collection_state_mut(kind) = collection;
+        }
+    }
+
+    pub fn update_boxed_collection(
+        &mut self,
+        kind: CollectionKind,
+        collection: Box<CollectionManifestState>,
+    ) {
+        let slot = self.collection_slot_mut(kind);
+        if collection.is_empty() {
+            *slot = None;
+        } else {
+            *slot = Some(collection);
+        }
     }
 
     pub fn update_package_state(
@@ -364,6 +397,21 @@ impl ContentState {
         }
 
         collection[0]
+    }
+
+    fn clear_collection(&mut self, kind: CollectionKind) {
+        *self.collection_slot_mut(kind) = None;
+    }
+
+    fn collection_slot_mut(
+        &mut self,
+        kind: CollectionKind,
+    ) -> &mut Option<Box<CollectionManifestState>> {
+        match kind {
+            CollectionKind::Saved => &mut self.saved,
+            CollectionKind::Inbox => &mut self.inbox,
+            CollectionKind::Recommendations => &mut self.recommendations,
+        }
     }
 }
 

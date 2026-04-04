@@ -6,8 +6,12 @@ use crate::{
     text::InlineText,
 };
 
-pub const MAX_READING_UNITS: usize = 384;
-pub const MAX_READING_PARAGRAPHS: usize = 24;
+// One reading unit is roughly one word-sized chunk on screen, so the previous
+// 384/24 limits were too small for real longform articles. Keep a materially
+// larger ceiling, but stay comfortably below the heap spike caused by a ~45 KiB
+// boxed document on device.
+pub const MAX_READING_UNITS: usize = 640;
+pub const MAX_READING_PARAGRAPHS: usize = 40;
 pub const MAX_READING_TOKEN_BYTES: usize = 32;
 pub const MAX_STAGE_SEGMENT_BYTES: usize = 32;
 pub const MAX_PARAGRAPH_PREVIEW_BYTES: usize = 64;

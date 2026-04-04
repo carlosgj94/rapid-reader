@@ -5,6 +5,7 @@ use core::net::IpAddr;
 use core::{ffi::CStr, fmt::Write as _, future::Future, net::SocketAddr, ptr::addr_of_mut, str};
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::{
     Stack,
     dns::DnsSocket,
@@ -63,8 +64,10 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
 const HTTP_BODY_TIMEOUT_SECS: u64 = 15;
 const KEEPALIVE_IDLE_TIMEOUT_SECS: u64 = 10;
+const KEEPALIVE_PING_INTERVAL_SECS: u64 = 5;
+const MBEDTLS_DEBUG_LEVEL: u32 = 1;
+const STREAM_PROGRESS_LOG_INTERVAL_BYTES: usize = 16 * 1024;
 const HTTP_RESPONSE_MAX_LEN: usize = 8 * 1024;
-const DIRECT_OPEN_RESPONSE_MAX_LEN: usize = 64 * 1024;
 const HTTP_STREAM_HEADER_MAX_LEN: usize = 2048;
 const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
@@ -73,7 +76,10 @@ const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
 // backend streaming scratch buffer. A 2 KiB jump would cost noticeably more
 // RAM once the storage queue and sender-side scratch buffer are included.
 const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 1024;
-const STARTUP_SAVED_PREFETCH_LIMIT: usize = 4;
+// Package prefetch materially increases boot-time latency and was timing out on
+// real device/package responses. Keep startup focused on refresh + manifest sync.
+const STARTUP_SAVED_PREFETCH_ENABLED: bool = false;
+const STARTUP_SAVED_PREFETCH_LIMIT: usize = 1;
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const BACKEND_CA_CHAIN_PEM: &str =
     concat!(include_str!("../certs/letsencrypt_isrg_root_x1.pem"), "\0");
@@ -89,8 +95,6 @@ static BACKEND_CMD_CH: Channel<
     BACKEND_CMD_QUEUE_CAPACITY,
 > = Channel::new();
 static mut HTTP_RESPONSE_BUFFER: [u8; HTTP_RESPONSE_MAX_LEN] = [0; HTTP_RESPONSE_MAX_LEN];
-static mut DIRECT_OPEN_RESPONSE_BUFFER: [u8; DIRECT_OPEN_RESPONSE_MAX_LEN] =
-    [0; DIRECT_OPEN_RESPONSE_MAX_LEN];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CredentialSource {
@@ -166,9 +170,10 @@ struct CollectionFetchResult {
     collection: CollectionManifestState,
 }
 
-struct StartupSyncResult {
+struct StartupSyncResult<'a> {
     refresh_session: RefreshSession,
     saved_result: Result<CollectionFetchResult, CollectionQueryError>,
+    reusable_session: Option<ReusableBackendSession<'a>>,
 }
 
 struct ReusableBackendSession<'a> {
@@ -210,7 +215,6 @@ struct BackendRequestContext<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum BackendCommand {
     PrepareContent(PrepareContentRequest),
-    OpenRemoteContent(PrepareContentRequest),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -375,12 +379,6 @@ pub async fn request_prepare_content(request: PrepareContentRequest) {
         .await;
 }
 
-pub async fn request_open_remote_content(request: PrepareContentRequest) {
-    BACKEND_CMD_CH
-        .send(BackendCommand::OpenRemoteContent(request))
-        .await;
-}
-
 #[embassy_executor::task]
 async fn backend_task(
     stack: Stack<'static>,
@@ -398,7 +396,7 @@ async fn backend_task(
         }
     };
 
-    let tls = match Tls::new(&mut trng) {
+    let mut tls = match Tls::new(&mut trng) {
         Ok(tls) => tls,
         Err(err) => {
             log_status(SyncStatus::TransportFailed);
@@ -406,6 +404,13 @@ async fn backend_task(
             return;
         }
     };
+    tls.set_debug(MBEDTLS_DEBUG_LEVEL);
+    info!(
+        "backend tls config debug_level={} in_content_len={} out_content_len={}",
+        MBEDTLS_DEBUG_LEVEL,
+        mbedtls_rs::sys::MBEDTLS_SSL_IN_CONTENT_LEN,
+        mbedtls_rs::sys::MBEDTLS_SSL_OUT_CONTENT_LEN,
+    );
 
     let ca_chain = match backend_ca_chain() {
         Ok(ca_chain) => ca_chain,
@@ -482,6 +487,7 @@ async fn backend_task(
             &startup_sync.refresh_session,
             now_ms(),
         ));
+        let initial_reusable_session = startup_sync.reusable_session;
 
         sync_one_collection(
             CollectionKind::Saved,
@@ -490,6 +496,7 @@ async fn backend_task(
         )
         .await;
         log_status(SyncStatus::Ready);
+        log_heap("backend ready");
         run_backend_command_loop(
             stack,
             tls.reference(),
@@ -498,11 +505,13 @@ async fn backend_task(
             tcp_state.as_ref(),
             &mut current,
             &mut access_session,
+            initial_reusable_session,
         )
         .await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_backend_command_loop<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
@@ -511,8 +520,9 @@ async fn run_backend_command_loop<'a>(
     tcp_state: &'a BackendTcpClientState,
     current: &mut StartupCredential,
     access_session: &mut Option<ActiveAccessSession>,
+    initial_reusable_session: Option<ReusableBackendSession<'a>>,
 ) {
-    let mut reusable_session: Option<ReusableBackendSession<'a>> = None;
+    let mut reusable_session: Option<ReusableBackendSession<'a>> = initial_reusable_session;
     let context = BackendRequestContext {
         stack,
         tls,
@@ -522,20 +532,34 @@ async fn run_backend_command_loop<'a>(
     };
 
     loop {
-        match BACKEND_CMD_CH.receive().await {
+        let keepalive_ready = reusable_session.is_some()
+            && access_session
+                .as_ref()
+                .is_some_and(|session| session.is_valid_at(now_ms()));
+        let command = if keepalive_ready {
+            match select(
+                BACKEND_CMD_CH.receive(),
+                Timer::after(Duration::from_secs(KEEPALIVE_PING_INTERVAL_SECS)),
+            )
+            .await
+            {
+                Either::First(command) => Some(command),
+                Either::Second(()) => {
+                    keep_reusable_session_alive(access_session, &mut reusable_session).await;
+                    None
+                }
+            }
+        } else {
+            Some(BACKEND_CMD_CH.receive().await)
+        };
+
+        let Some(command) = command else {
+            continue;
+        };
+
+        match command {
             BackendCommand::PrepareContent(request) => {
                 handle_prepare_content_request(
-                    context,
-                    current,
-                    access_session,
-                    &mut reusable_session,
-                    request,
-                )
-                .await;
-                log_status(SyncStatus::Ready);
-            }
-            BackendCommand::OpenRemoteContent(request) => {
-                handle_open_remote_content_request(
                     context,
                     current,
                     access_session,
@@ -617,6 +641,74 @@ async fn perform_health_check(
     }
 
     Err(last_error.unwrap_or(BackendError::Io))
+}
+
+async fn keep_reusable_session_alive(
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'_>>,
+) {
+    let now_ms = now_ms();
+    let Some((valid_for_ms, access_token)) = access_session.as_ref().and_then(|session| {
+        session.is_valid_at(now_ms).then_some((
+            session.valid_until_ms.saturating_sub(now_ms),
+            session.access_token.as_str(),
+        ))
+    }) else {
+        return;
+    };
+    let session_age_ms = reusable_session
+        .as_ref()
+        .map(|session| now_ms.saturating_sub(session.last_used_ms))
+        .unwrap_or_default();
+    info!(
+        "backend reusable session keepalive path={} age_ms={} valid_for_ms={}",
+        ME_PATH, session_age_ms, valid_for_ms
+    );
+
+    let request = HttpRequest {
+        method: "GET",
+        path: ME_PATH,
+        content_type: Some("application/json"),
+        bearer_token: Some(access_token),
+        body: b"",
+        connection_close: false,
+    };
+    let response = match reusable_session {
+        Some(reusable) => {
+            let response_buffer = standard_response_buffer();
+            send_https_request_over_session_with_metrics(
+                &mut reusable.session,
+                request,
+                response_buffer,
+                RequestMetrics::new(true, false),
+            )
+            .await
+        }
+        None => return,
+    };
+
+    update_reusable_session_after_buffered_request(reusable_session, request, &response).await;
+    match response {
+        Ok(response) => {
+            info!(
+                "backend reusable session keepalive ok path={} status={} response_reusable={}",
+                ME_PATH, response.status, response.connection_reusable
+            );
+            if is_auth_status(response.status) {
+                info!(
+                    "backend reusable session keepalive auth rejected status={}",
+                    response.status
+                );
+                invalidate_access_state(access_session, reusable_session).await;
+            }
+        }
+        Err(err) => {
+            info!(
+                "backend reusable session keepalive failed path={} err={:?}",
+                ME_PATH, err
+            );
+        }
+    }
 }
 
 async fn perform_refresh(
@@ -744,7 +836,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     credential: &BackendCredential,
-) -> Result<StartupSyncResult, RefreshError> {
+) -> Result<StartupSyncResult<'a>, RefreshError> {
     let mut attempt = 0usize;
 
     loop {
@@ -771,7 +863,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     credential: &BackendCredential,
-) -> Result<StartupSyncResult, RefreshError> {
+) -> Result<StartupSyncResult<'a>, RefreshError> {
     let refresh_token = credential
         .refresh_token()
         .map_err(|_| RefreshError::Other(BackendError::InvalidResponse))?;
@@ -817,17 +909,21 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         RefreshError::Other(BackendError::Connect)
     })?;
     refresh_metrics.connect_ms = elapsed_since_ms(connect_started_ms);
+    log_request_heap(REFRESH_PATH, "tls setup start");
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
             info!("backend request tls setup failed path={}", REFRESH_PATH);
             log_request_heap(REFRESH_PATH, "tls setup failed");
         })
         .map_err(RefreshError::Other)?;
+    log_request_heap(REFRESH_PATH, "tls setup ok");
     let tls_started_ms = now_ms();
+    log_request_heap(REFRESH_PATH, "tls handshake start");
     await_tls_handshake(&mut session, REFRESH_PATH)
         .await
         .map_err(RefreshError::Other)?;
     refresh_metrics.tls_ms = elapsed_since_ms(tls_started_ms);
+    log_request_heap(REFRESH_PATH, "tls handshake ok");
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
         info!(
@@ -907,13 +1003,36 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
             .await;
     }
 
-    if let Err(err) = session.close().await {
-        info!("backend tls close failed: {:?}", err);
-    }
+    let reusable_session = if saved_result.is_ok() {
+        if let Some(network_address) = current_network_address(stack) {
+            info!(
+                "backend startup session retained for steady state network_ip={:?}",
+                network_address
+            );
+            Some(ReusableBackendSession {
+                session,
+                network_address,
+                last_used_ms: now_ms(),
+            })
+        } else {
+            info!("backend startup session closing before steady state reason=missing_network");
+            if let Err(err) = session.close().await {
+                info!("backend tls close failed reason=startup done err={:?}", err);
+            }
+            None
+        }
+    } else {
+        info!("backend startup session closing before steady state reason=sync_failed");
+        if let Err(err) = session.close().await {
+            info!("backend tls close failed reason=startup done err={:?}", err);
+        }
+        None
+    };
 
     Ok(StartupSyncResult {
         refresh_session,
         saved_result,
+        reusable_session,
     })
 }
 
@@ -924,6 +1043,10 @@ async fn prefetch_startup_saved_content<T>(
 ) where
     T: AsyncRead07 + AsyncWrite07,
 {
+    if !STARTUP_SAVED_PREFETCH_ENABLED {
+        return;
+    }
+
     let mut prefetched = 0usize;
     let mut index = 0usize;
     while index < result.collection.len() && prefetched < STARTUP_SAVED_PREFETCH_LIMIT {
@@ -987,12 +1110,25 @@ async fn ensure_access_session<'a>(
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
 ) -> Result<(), RefreshError> {
     let now_ms = now_ms();
-    if access_session
-        .as_ref()
-        .is_some_and(|session| session.is_valid_at(now_ms))
-    {
-        info!("backend access session reuse");
-        return Ok(());
+    match access_session.as_ref() {
+        Some(session) if session.is_valid_at(now_ms) => {
+            info!(
+                "backend access session reuse valid_for_ms={} token_len={}",
+                session.valid_until_ms.saturating_sub(now_ms),
+                session.access_token.len(),
+            );
+            return Ok(());
+        }
+        Some(session) => {
+            info!(
+                "backend access session refresh reason=expired expired_by_ms={} token_len={}",
+                now_ms.saturating_sub(session.valid_until_ms),
+                session.access_token.len(),
+            );
+        }
+        None => {
+            info!("backend access session refresh reason=missing");
+        }
     }
 
     close_reusable_session(reusable_session, "refresh").await;
@@ -1083,11 +1219,12 @@ async fn handle_prepare_content_request<'a>(
     }
 
     if !context.stack.is_link_up() {
+        *access_session = None;
         close_reusable_session(reusable_session, "link down").await;
         let _ = publish_package_state(
             request.collection,
             request.remote_item_id,
-            PackageState::Failed,
+            PackageState::Missing,
         )
         .await;
         info!(
@@ -1116,18 +1253,25 @@ async fn handle_prepare_content_request<'a>(
                     status,
                     current.source.label(),
                 );
+                let _ = publish_package_state(
+                    request.collection,
+                    request.remote_item_id,
+                    PackageState::Failed,
+                )
+                .await;
             }
             RefreshError::Other(err) => {
+                *access_session = None;
                 log_status(SyncStatus::TransportFailed);
                 info!("backend content prepare refresh failed: {:?}", err);
+                let _ = publish_package_state(
+                    request.collection,
+                    request.remote_item_id,
+                    prepare_error_package_state(err),
+                )
+                .await;
             }
         }
-        let _ = publish_package_state(
-            request.collection,
-            request.remote_item_id,
-            PackageState::Failed,
-        )
-        .await;
         return;
     }
 
@@ -1158,21 +1302,29 @@ async fn handle_prepare_content_request<'a>(
                 request.collection,
                 request.content_id.as_str(),
             );
-            match content_storage::open_cached_reader_content(request.content_id).await {
+            match content_storage::open_cached_reader_package(request.content_id).await {
                 Ok(opened) => {
+                    let total_units = opened.total_units;
+                    let paragraph_count = opened.paragraphs.len();
+                    let window_unit_count = opened.window.unit_count;
                     publish_event(
                         Event::ReaderContentOpened {
                             collection: request.collection,
+                            content_id: request.content_id,
                             title: opened.title,
-                            document: opened.document,
+                            total_units,
+                            paragraphs: opened.paragraphs,
+                            window: opened.window,
                         },
                         now_ms(),
                     );
                     info!(
-                        "backend content opened after prepare collection={:?} content_id={} truncated={}",
+                        "backend content opened after prepare collection={:?} content_id={} total_units={} paragraph_count={} window_units={}",
                         request.collection,
                         request.content_id.as_str(),
-                        opened.truncated,
+                        total_units,
+                        paragraph_count,
+                        window_unit_count,
                     );
                 }
                 Err(err) => {
@@ -1218,114 +1370,14 @@ async fn handle_prepare_content_request<'a>(
             info!("backend content fetch rejected status={}", status);
         }
         Err(PackagePrepareError::Other(err)) => {
+            *access_session = None;
             let _ = publish_package_state(
                 request.collection,
                 request.remote_item_id,
-                PackageState::Failed,
+                prepare_error_package_state(err),
             )
             .await;
             info!("backend content fetch failed: {:?}", err);
-        }
-    }
-}
-
-async fn handle_open_remote_content_request<'a>(
-    context: BackendRequestContext<'a>,
-    current: &mut StartupCredential,
-    access_session: &mut Option<ActiveAccessSession>,
-    reusable_session: &mut Option<ReusableBackendSession<'a>>,
-    request: PrepareContentRequest,
-) {
-    if request.remote_item_id.is_empty() || request.content_id.is_empty() {
-        return;
-    }
-
-    if !context.stack.is_link_up() {
-        close_reusable_session(reusable_session, "link down").await;
-        info!(
-            "backend content open skipped: network unavailable collection={:?}",
-            request.collection
-        );
-        return;
-    }
-
-    if let Err(err) = ensure_access_session(
-        context.stack,
-        context.tls,
-        context.ca_chain,
-        context.tcp_state,
-        current,
-        access_session,
-        reusable_session,
-    )
-    .await
-    {
-        match err {
-            RefreshError::Rejected(status) => {
-                log_status(SyncStatus::AuthFailed);
-                info!(
-                    "backend content open refresh rejected status={} source={}",
-                    status,
-                    current.source.label(),
-                );
-            }
-            RefreshError::Other(err) => {
-                log_status(SyncStatus::TransportFailed);
-                info!("backend content open refresh failed: {:?}", err);
-            }
-        }
-        return;
-    }
-
-    log_status(SyncStatus::SyncingContent);
-    let access_token = access_session
-        .as_ref()
-        .map(|session| session.access_token.as_str())
-        .unwrap_or("");
-
-    match fetch_opened_reader_content(
-        context.stack,
-        context.tls,
-        context.ca_chain,
-        context.tcp_client,
-        access_token,
-        reusable_session,
-        request,
-    )
-    .await
-    {
-        Ok(opened) => {
-            publish_event(
-                Event::ReaderContentOpened {
-                    collection: request.collection,
-                    title: opened.title,
-                    document: opened.document,
-                },
-                now_ms(),
-            );
-            info!(
-                "backend content opened remote collection={:?} content_id={} truncated={}",
-                request.collection,
-                request.content_id.as_str(),
-                opened.truncated,
-            );
-        }
-        Err(PackagePrepareError::PendingRemote) => {
-            info!(
-                "backend content open pending remote collection={:?} content_id={}",
-                request.collection,
-                request.content_id.as_str(),
-            );
-        }
-        Err(PackagePrepareError::Rejected(status)) => {
-            if is_auth_status(status) {
-                invalidate_access_state(access_session, reusable_session).await;
-                log_status(SyncStatus::AuthFailed);
-            }
-            info!("backend content open rejected status={}", status);
-        }
-        Err(PackagePrepareError::Other(err)) => {
-            info!("backend content open failed: {:?}", err);
         }
     }
 }
@@ -1572,6 +1624,10 @@ async fn open_backend_session<'a>(
         log_request_heap(path, "network unavailable");
         BackendError::Connect
     })?;
+    info!(
+        "backend request open path={} streaming={} network_ip={:?}",
+        path, streaming, network_address
+    );
     let mut metrics = RequestMetrics::new(false, streaming);
 
     let dns = DnsSocket::new(stack);
@@ -1593,6 +1649,10 @@ async fn open_backend_session<'a>(
             return Err(BackendError::Dns);
         }
     };
+    info!(
+        "backend request dns ok path={} remote_ip={} dns_ms={}",
+        path, remote, metrics.dns_ms
+    );
     let connect_started_ms = now_ms();
     let connection = with_timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
@@ -1610,15 +1670,27 @@ async fn open_backend_session<'a>(
         BackendError::Connect
     })?;
     metrics.connect_ms = elapsed_since_ms(connect_started_ms);
+    info!(
+        "backend request connect ok path={} remote_ip={} connect_ms={}",
+        path, remote, metrics.connect_ms
+    );
+    log_request_heap(path, "tls setup start");
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
             info!("backend request tls setup failed path={}", path);
             log_request_heap(path, "tls setup failed");
         })?;
+    log_request_heap(path, "tls setup ok");
     let tls_started_ms = now_ms();
+    log_request_heap(path, "tls handshake start");
     await_tls_handshake(&mut session, path).await?;
     metrics.tls_ms = elapsed_since_ms(tls_started_ms);
+    log_request_heap(path, "tls handshake ok");
     let verification_flags = session.tls_verification_details();
+    info!(
+        "backend request tls ok path={} tls_ms={} verification_flags=0x{:08x}",
+        path, metrics.tls_ms, verification_flags
+    );
     if verification_flags != 0 {
         info!(
             "backend request tls verification flags path={} flags=0x{:08x}",
@@ -1637,6 +1709,7 @@ async fn close_backend_tls_session<T>(session: &mut Session<'_, T>, reason: &str
 where
     T: AsyncRead07 + AsyncWrite07,
 {
+    info!("backend tls close start reason={}", reason);
     match with_timeout(Duration::from_millis(250), session.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => info!("backend tls close failed reason={} err={:?}", reason, err),
@@ -1650,6 +1723,15 @@ async fn close_reusable_session(
 ) {
     if let Some(mut reusable) = reusable_session.take() {
         close_backend_tls_session(&mut reusable.session, reason).await;
+    }
+}
+
+fn discard_reusable_session(
+    reusable_session: &mut Option<ReusableBackendSession<'_>>,
+    reason: &str,
+) {
+    if reusable_session.take().is_some() {
+        info!("backend reusable session discarded reason={}", reason);
     }
 }
 
@@ -1671,14 +1753,41 @@ async fn ensure_reusable_session<'a>(
     streaming: bool,
 ) -> Result<RequestMetrics, BackendError> {
     let now_ms = now_ms();
-    if reusable_session
-        .as_ref()
-        .is_some_and(|session| session.is_usable_on(stack, now_ms))
-    {
-        return Ok(RequestMetrics::new(true, streaming));
+    match reusable_session.as_ref() {
+        Some(session) if session.is_usable_on(stack, now_ms) => {
+            info!(
+                "backend reusable session reuse path={} streaming={} age_ms={} session_ip={:?}",
+                path,
+                streaming,
+                now_ms.saturating_sub(session.last_used_ms),
+                session.network_address,
+            );
+            return Ok(RequestMetrics::new(true, streaming));
+        }
+        Some(session) => {
+            let link_up = stack.is_link_up();
+            let current_network = current_network_address(stack);
+            info!(
+                "backend reusable session discard path={} streaming={} reason={} age_ms={} idle_limit_ms={} link_up={} current_network={:?} session_network={:?}",
+                path,
+                streaming,
+                reusable_session_discard_reason(stack, session, now_ms),
+                now_ms.saturating_sub(session.last_used_ms),
+                Duration::from_secs(KEEPALIVE_IDLE_TIMEOUT_SECS).as_millis(),
+                link_up,
+                current_network,
+                session.network_address,
+            );
+        }
+        None => {
+            info!(
+                "backend reusable session missing path={} streaming={}",
+                path, streaming
+            );
+        }
     }
 
-    close_reusable_session(reusable_session, "stale").await;
+    discard_reusable_session(reusable_session, "stale");
     let ConnectedBackendSession {
         session,
         network_address,
@@ -1701,13 +1810,33 @@ async fn update_reusable_session_after_buffered_request(
     request: HttpRequest<'_>,
     response: &Result<HttpResponse<'_>, BackendError>,
 ) {
-    let keep_alive = matches!(response, Ok(response) if should_keep_connection_alive(request, response.connection_reusable));
-    if keep_alive {
-        if let Some(reusable) = reusable_session.as_mut() {
-            reusable.mark_used(now_ms());
+    match response {
+        Ok(response) if should_keep_connection_alive(request, response.connection_reusable) => {
+            info!(
+                "backend reusable session keep path={} status={} response_reusable={}",
+                request.path, response.status, response.connection_reusable
+            );
+            if let Some(reusable) = reusable_session.as_mut() {
+                reusable.mark_used(now_ms());
+            }
         }
-    } else {
-        close_reusable_session(reusable_session, "buffered done").await;
+        Ok(response) => {
+            info!(
+                "backend reusable session close path={} status={} reason=response_not_reusable request_close={} response_reusable={}",
+                request.path,
+                response.status,
+                request.connection_close,
+                response.connection_reusable,
+            );
+            close_reusable_session(reusable_session, "buffered done").await;
+        }
+        Err(err) => {
+            info!(
+                "backend reusable session close path={} reason=request_failed err={:?}",
+                request.path, err
+            );
+            close_reusable_session(reusable_session, "buffered done").await;
+        }
     }
 }
 
@@ -1716,13 +1845,33 @@ async fn update_reusable_session_after_streaming_request(
     request: HttpRequest<'_>,
     response: &Result<StreamingHttpResponse, BackendError>,
 ) {
-    let keep_alive = matches!(response, Ok(response) if should_keep_connection_alive(request, response.connection_reusable));
-    if keep_alive {
-        if let Some(reusable) = reusable_session.as_mut() {
-            reusable.mark_used(now_ms());
+    match response {
+        Ok(response) if should_keep_connection_alive(request, response.connection_reusable) => {
+            info!(
+                "backend reusable session keep path={} status={} response_reusable={}",
+                request.path, response.status, response.connection_reusable
+            );
+            if let Some(reusable) = reusable_session.as_mut() {
+                reusable.mark_used(now_ms());
+            }
         }
-    } else {
-        close_reusable_session(reusable_session, "stream done").await;
+        Ok(response) => {
+            info!(
+                "backend reusable session close path={} status={} reason=response_not_reusable request_close={} response_reusable={}",
+                request.path,
+                response.status,
+                request.connection_close,
+                response.connection_reusable,
+            );
+            close_reusable_session(reusable_session, "stream done").await;
+        }
+        Err(err) => {
+            info!(
+                "backend reusable session close path={} reason=request_failed err={:?}",
+                request.path, err
+            );
+            close_reusable_session(reusable_session, "stream done").await;
+        }
     }
 }
 
@@ -2251,10 +2400,20 @@ async fn fetch_and_stage_package<'a>(
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
     request: PrepareContentRequest,
 ) -> Result<CollectionManifestState, PackagePrepareError> {
-    let path = build_detail_path(request).map_err(PackagePrepareError::Other)?;
+    let path = build_package_path(request).map_err(PackagePrepareError::Other)?;
     let mut attempt = 0usize;
 
     loop {
+        info!(
+            "backend package fetch begin content_id={} remote_item_id={} revision={} collection={:?} path={} outer_attempt={}/{}",
+            request.content_id.as_str(),
+            request.remote_item_id.as_str(),
+            request.remote_revision,
+            request.collection,
+            path.as_str(),
+            attempt + 1,
+            TRANSPORT_RETRY_ATTEMPTS,
+        );
         content_storage::begin_package_stage(request.content_id, request.remote_revision)
             .await
             .map_err(map_storage_prepare_error)?;
@@ -2298,6 +2457,10 @@ async fn fetch_and_stage_package<'a>(
             }
         };
 
+        if status == 409 {
+            let _ = content_storage::abort_package_stage().await;
+            return Err(PackagePrepareError::PendingRemote);
+        }
         if (400..500).contains(&status) {
             let _ = content_storage::abort_package_stage().await;
             return Err(PackagePrepareError::Rejected(status));
@@ -2330,7 +2493,7 @@ async fn fetch_and_stage_package_over_session<T>(
 where
     T: AsyncRead07 + AsyncWrite07,
 {
-    let path = build_detail_path(request).map_err(PackagePrepareError::Other)?;
+    let path = build_package_path(request).map_err(PackagePrepareError::Other)?;
     content_storage::begin_package_stage(request.content_id, request.remote_revision)
         .await
         .map_err(map_storage_prepare_error)?;
@@ -2355,6 +2518,10 @@ where
         }
     };
 
+    if status == 409 {
+        let _ = content_storage::abort_package_stage().await;
+        return Err(PackagePrepareError::PendingRemote);
+    }
     if (400..500).contains(&status) {
         let _ = content_storage::abort_package_stage().await;
         return Err(PackagePrepareError::Rejected(status));
@@ -2376,55 +2543,6 @@ where
 
     Ok(snapshot)
 }
-
-async fn fetch_opened_reader_content<'a>(
-    stack: Stack<'static>,
-    tls: TlsReference<'a>,
-    ca_chain: &Certificate<'static>,
-    tcp_client: &'a BackendTcpClient<'a>,
-    access_token: &str,
-    reusable_session: &mut Option<ReusableBackendSession<'a>>,
-    request: PrepareContentRequest,
-) -> Result<content_storage::OpenedReaderContent, PackagePrepareError> {
-    let path = build_detail_path(request).map_err(PackagePrepareError::Other)?;
-    // The backend task is single-consumer, so a shared fixed buffer avoids heap pressure
-    // when opening a remote article directly during development fallback.
-    let response_buffer = unsafe {
-        core::slice::from_raw_parts_mut(
-            addr_of_mut!(DIRECT_OPEN_RESPONSE_BUFFER).cast::<u8>(),
-            DIRECT_OPEN_RESPONSE_MAX_LEN,
-        )
-    };
-    let response = send_https_request_reusing_session(
-        stack,
-        tls,
-        ca_chain,
-        tcp_client,
-        reusable_session,
-        HttpRequest {
-            method: "GET",
-            path: path.as_str(),
-            content_type: Some("application/json"),
-            bearer_token: Some(access_token),
-            body: b"",
-            connection_close: false,
-        },
-        response_buffer,
-    )
-    .await
-    .map_err(PackagePrepareError::Other)?;
-
-    if (400..500).contains(&response.status) {
-        return Err(PackagePrepareError::Rejected(response.status));
-    }
-    if response.status != 200 {
-        return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
-    }
-
-    content_storage::parse_reader_content_bytes(response.body.as_bytes())
-        .map_err(map_storage_prepare_error)
-}
-
 async fn stream_https_response_body_to_storage(
     stack: Stack<'static>,
     tls: TlsReference<'_>,
@@ -2529,6 +2647,10 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
         true,
     )
     .await?;
+    info!(
+        "backend request stream attempt path={} reused={} request_close={}",
+        request.path, metrics.reused_session, request.connection_close
+    );
     let response = match reusable_session {
         Some(reusable) => {
             stream_https_response_body_to_storage_over_session_with_metrics(
@@ -2612,6 +2734,8 @@ where
     let mut header = [0u8; HTTP_STREAM_HEADER_MAX_LEN];
     let mut header_len = 0usize;
     let mut chunk = [0u8; PACKAGE_DOWNLOAD_CHUNK_LEN];
+    let mut streamed_body_bytes = 0usize;
+    let mut next_progress_log = STREAM_PROGRESS_LOG_INTERVAL_BYTES;
 
     loop {
         if header_len == header.len() {
@@ -2635,6 +2759,20 @@ where
         };
         let metadata = parse_http_response_metadata(&header[..header_len])?;
         let body_start = header_end + 4;
+        let initial_body_len = header_len.saturating_sub(body_start);
+        let response_reusable = is_response_connection_reusable(metadata);
+        info!(
+            "backend request stream headers path={} status={} header_bytes={} initial_body_bytes={} content_length={:?} chunked={} connection_close={} response_reusable={} elapsed_ms={}",
+            path,
+            metadata.status,
+            metadata.body_start,
+            initial_body_len,
+            metadata.content_length,
+            metadata.chunked,
+            metadata.connection_close,
+            response_reusable,
+            metrics.elapsed_ms(),
+        );
         if metadata.status != 200 {
             return Ok(StreamingHttpResponse {
                 status: metadata.status,
@@ -2642,7 +2780,6 @@ where
             });
         }
 
-        let initial_body_len = header_len.saturating_sub(body_start);
         match metadata.content_length {
             Some(content_length) => {
                 if initial_body_len > content_length {
@@ -2652,6 +2789,14 @@ where
                     content_storage::write_package_chunk(&header[body_start..header_len])
                         .await
                         .map_err(map_storage_backend_error)?;
+                    streamed_body_bytes = initial_body_len;
+                    log_stream_progress_if_needed(
+                        path,
+                        &mut next_progress_log,
+                        streamed_body_bytes,
+                        Some(content_length),
+                        metrics.elapsed_ms(),
+                    );
                 }
 
                 let mut remaining = content_length - initial_body_len;
@@ -2669,11 +2814,26 @@ where
                     content_storage::write_package_chunk(&chunk[..read])
                         .await
                         .map_err(map_storage_backend_error)?;
+                    streamed_body_bytes = streamed_body_bytes.saturating_add(read);
                     remaining -= read;
+                    log_stream_progress_if_needed(
+                        path,
+                        &mut next_progress_log,
+                        streamed_body_bytes,
+                        Some(content_length),
+                        metrics.elapsed_ms(),
+                    );
                 }
+                log_stream_complete(
+                    path,
+                    streamed_body_bytes,
+                    Some(content_length),
+                    response_reusable,
+                    metrics.elapsed_ms(),
+                );
                 return Ok(StreamingHttpResponse {
                     status: 200,
-                    connection_reusable: is_response_connection_reusable(metadata),
+                    connection_reusable: response_reusable,
                 });
             }
             None if connection_close => {
@@ -2681,6 +2841,14 @@ where
                     content_storage::write_package_chunk(&header[body_start..header_len])
                         .await
                         .map_err(map_storage_backend_error)?;
+                    streamed_body_bytes = initial_body_len;
+                    log_stream_progress_if_needed(
+                        path,
+                        &mut next_progress_log,
+                        streamed_body_bytes,
+                        None,
+                        metrics.elapsed_ms(),
+                    );
                 }
                 break;
             }
@@ -2701,8 +2869,17 @@ where
         content_storage::write_package_chunk(&chunk[..read])
             .await
             .map_err(map_storage_backend_error)?;
+        streamed_body_bytes = streamed_body_bytes.saturating_add(read);
+        log_stream_progress_if_needed(
+            path,
+            &mut next_progress_log,
+            streamed_body_bytes,
+            None,
+            metrics.elapsed_ms(),
+        );
     }
 
+    log_stream_complete(path, streamed_body_bytes, None, false, metrics.elapsed_ms());
     Ok(StreamingHttpResponse {
         status: 200,
         connection_reusable: false,
@@ -2791,7 +2968,15 @@ fn map_storage_backend_error(_error: StorageError) -> BackendError {
     BackendError::Io
 }
 
-fn build_detail_path(
+fn prepare_error_package_state(error: BackendError) -> PackageState {
+    if is_transient_transport_error(error) {
+        PackageState::Missing
+    } else {
+        PackageState::Failed
+    }
+}
+
+fn build_package_path(
     request: PrepareContentRequest,
 ) -> Result<heapless::String<128>, BackendError> {
     let mut path = heapless::String::<128>::new();
@@ -2815,6 +3000,8 @@ fn build_detail_path(
                 .map_err(|_| BackendError::ResponseTooLarge)?;
         }
     }
+    path.push_str("/package")
+        .map_err(|_| BackendError::ResponseTooLarge)?;
 
     Ok(path)
 }
@@ -3640,6 +3827,79 @@ fn now_ms() -> u64 {
 
 fn elapsed_since_ms(started_ms: u64) -> u64 {
     now_ms().saturating_sub(started_ms)
+}
+
+fn reusable_session_discard_reason(
+    stack: Stack<'static>,
+    session: &ReusableBackendSession<'_>,
+    now_ms: u64,
+) -> &'static str {
+    if !stack.is_link_up() {
+        return "link_down";
+    }
+
+    match current_network_address(stack) {
+        None => "missing_ip",
+        Some(current) if current != session.network_address => "network_changed",
+        Some(_) => {
+            if now_ms.saturating_sub(session.last_used_ms)
+                > Duration::from_secs(KEEPALIVE_IDLE_TIMEOUT_SECS).as_millis()
+            {
+                "idle_timeout"
+            } else {
+                "unknown"
+            }
+        }
+    }
+}
+
+fn log_stream_progress_if_needed(
+    path: &str,
+    next_progress_log: &mut usize,
+    received_bytes: usize,
+    total_bytes: Option<usize>,
+    elapsed_ms: u64,
+) {
+    if received_bytes < *next_progress_log {
+        return;
+    }
+
+    let stats = esp_alloc::HEAP.stats();
+    let remaining_bytes = total_bytes.map(|total| total.saturating_sub(received_bytes));
+    info!(
+        "backend request stream progress path={} received_bytes={} total_bytes={:?} remaining_bytes={:?} elapsed_ms={} heap_used={} heap_free={}",
+        path,
+        received_bytes,
+        total_bytes,
+        remaining_bytes,
+        elapsed_ms,
+        stats.current_usage,
+        stats.size.saturating_sub(stats.current_usage),
+    );
+
+    while received_bytes >= *next_progress_log {
+        *next_progress_log = next_progress_log.saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
+    }
+}
+
+fn log_stream_complete(
+    path: &str,
+    received_bytes: usize,
+    total_bytes: Option<usize>,
+    response_reusable: bool,
+    elapsed_ms: u64,
+) {
+    let stats = esp_alloc::HEAP.stats();
+    info!(
+        "backend request stream complete path={} received_bytes={} total_bytes={:?} response_reusable={} elapsed_ms={} heap_used={} heap_free={}",
+        path,
+        received_bytes,
+        total_bytes,
+        response_reusable,
+        elapsed_ms,
+        stats.current_usage,
+        stats.size.saturating_sub(stats.current_usage),
+    );
 }
 
 fn log_request_timing(request: HttpRequest<'_>, status: u16, metrics: &RequestMetrics) {

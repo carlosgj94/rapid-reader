@@ -88,8 +88,8 @@ pub struct ReaderScreenModel {
 pub struct ParagraphNavigationModel {
     pub appearance: AppearanceMode,
     pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
-    pub current_index: u8,
-    pub total: u8,
+    pub current_index: u16,
+    pub total: u16,
     pub previous_top: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
     pub selected_excerpt: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
     pub previous_bottom: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
@@ -217,7 +217,6 @@ pub fn select_reader(store: &Store) -> ReaderScreenModel {
     let stage_token = current_unit.stage_token();
     let preview = store
         .reader
-        .document()
         .preview_for_paragraph(store.reader.progress.paragraph_index);
 
     ReaderScreenModel {
@@ -253,20 +252,16 @@ pub fn select_paragraph_navigation(store: &Store) -> ParagraphNavigationModel {
     let current_zero_based = current_index.saturating_sub(1);
     let previous_top = store
         .reader
-        .document()
-        .preview_for_paragraph((current_zero_based.saturating_sub(1) + 1) as u8);
+        .preview_for_paragraph((current_zero_based.saturating_sub(1) + 1) as u16);
     let selected_excerpt = store
         .reader
-        .document()
-        .preview_for_paragraph((current_zero_based + 1) as u8);
-    let previous_bottom = store
-        .reader
-        .document()
-        .preview_for_paragraph(((current_zero_based + 1).min((total - 1) as usize) + 1) as u8);
-    let final_excerpt = store
-        .reader
-        .document()
-        .preview_for_paragraph(((current_zero_based + 2).min((total - 1) as usize) + 1) as u8);
+        .preview_for_paragraph((current_zero_based + 1) as u16);
+    let previous_bottom = store.reader.preview_for_paragraph(
+        ((current_zero_based + 1).min(total.saturating_sub(1) as usize) + 1) as u16,
+    );
+    let final_excerpt = store.reader.preview_for_paragraph(
+        ((current_zero_based + 2).min(total.saturating_sub(1) as usize) + 1) as u16,
+    );
     let tick_index = current_zero_based.min(6) as u8;
 
     ParagraphNavigationModel {
@@ -496,7 +491,7 @@ fn select_status(store: &Store) -> StatusClusterModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::{CollectionManifestItem, ContentState};
+    use crate::content::CollectionManifestItem;
     use crate::formatter::{article_document_from_script, format_article_document};
     use crate::network::NetworkStatus;
     use crate::store::Store;
@@ -587,7 +582,10 @@ mod tests {
         let mut item = CollectionManifestItem::empty();
         item.meta.set_truncated("EXAMPLE / SAVED");
         item.title.set_truncated("Example saved title");
-        let _ = store.content_mut().saved.try_push(item);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(item);
         store.ui.saved_index = 0;
 
         let model = select_collection(&store, CollectionKind::Saved);
@@ -603,7 +601,10 @@ mod tests {
         item.meta.set_truncated("EXAMPLE / SAVED");
         item.title.set_truncated("Example saved title");
         item.package_state = crate::content::PackageState::Fetching;
-        let _ = store.content_mut().saved.try_push(item);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(item);
         store.ui.saved_index = 0;
 
         let model = select_collection(&store, CollectionKind::Saved);
@@ -617,7 +618,10 @@ mod tests {
         let mut item = CollectionManifestItem::empty();
         item.meta.set_truncated("EXAMPLE / SAVED");
         item.title.set_truncated("Example saved title");
-        let _ = store.content_mut().saved.try_push(item);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(item);
 
         let model = select_collection(&store, CollectionKind::Saved);
 

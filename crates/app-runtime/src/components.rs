@@ -448,37 +448,28 @@ impl PreparedScreen {
     }
 }
 
-fn counter_label(current_index: u8, total: u8) -> domain::text::InlineText<16> {
+fn counter_label(current_index: u16, total: u16) -> domain::text::InlineText<16> {
     let mut label = domain::text::InlineText::new();
-    let tens = (current_index / 10) % 10;
-    let ones = current_index % 10;
-    let _ = label.try_push_char((b'0' + tens) as char);
-    let _ = label.try_push_char((b'0' + ones) as char);
+    push_decimal_2(&mut label, current_index);
     let _ = label.try_push_str(" / ");
-    if total >= 100 {
-        let _ = label.try_push_char((b'0' + ((total / 100) % 10)) as char);
-    }
-    if total >= 10 {
-        let _ = label.try_push_char((b'0' + ((total / 10) % 10)) as char);
-    } else {
-        let _ = label.try_push_char('0');
-    }
-    let _ = label.try_push_char((b'0' + (total % 10)) as char);
+    push_decimal_2(&mut label, total);
     label
 }
 
-fn paragraph_label(current_index: u8) -> domain::text::InlineText<16> {
+fn paragraph_label(current_index: u16) -> domain::text::InlineText<16> {
     let mut label = domain::text::InlineText::new();
     let _ = label.try_push_str("PARAGRAPH ");
-    if current_index < 10 {
-        let _ = label.try_push_char('0');
-    }
-    if current_index >= 100 {
-        let _ = label.try_push_char((b'0' + ((current_index / 100) % 10)) as char);
-    }
-    if current_index >= 10 {
-        let _ = label.try_push_char((b'0' + ((current_index / 10) % 10)) as char);
-    }
-    let _ = label.try_push_char((b'0' + (current_index % 10)) as char);
+    push_decimal_2(&mut label, current_index);
     label
+}
+
+fn push_decimal_2(target: &mut domain::text::InlineText<16>, value: u16) {
+    let clamped = value.min(999);
+    if clamped >= 100 {
+        let _ = target.try_push_char((b'0' + ((clamped / 100) % 10) as u8) as char);
+    } else {
+        let _ = target.try_push_char('0');
+    }
+    let _ = target.try_push_char((b'0' + ((clamped / 10) % 10) as u8) as char);
+    let _ = target.try_push_char((b'0' + (clamped % 10) as u8) as char);
 }

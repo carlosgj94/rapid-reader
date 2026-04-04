@@ -3,9 +3,8 @@ use alloc::boxed::Box;
 use crate::{
     content::{CollectionKind, ContentState, PackageState, PrepareContentRequest},
     device::{BootState, DeviceState},
-    formatter::ReadingDocument,
     input::InputState,
-    network::NetworkState,
+    network::{NetworkState, NetworkStatus},
     power::PowerStatus,
     reader::ReaderSession,
     runtime::{
@@ -18,7 +17,7 @@ use crate::{
     ui::{SettingsMode, SettingsRow, TopicRegion, UiRoute, UiState},
 };
 
-const EMPTY_CONTENT_STATE: ContentState = ContentState::empty();
+static EMPTY_CONTENT_STATE: ContentState = ContentState::empty();
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum DispatchError {
@@ -110,7 +109,7 @@ impl Store {
             }
             Event::CollectionContentUpdated(kind, collection) => {
                 if self.content.is_some() || !collection.is_empty() {
-                    self.content_mut().update_collection(kind, *collection);
+                    self.content_mut().update_boxed_collection(kind, collection);
                 }
                 match kind {
                     CollectionKind::Saved => self.ui.saved_index = 0,
@@ -120,10 +119,20 @@ impl Store {
             }
             Event::ReaderContentOpened {
                 collection,
+                content_id,
                 title,
-                document,
+                total_units,
+                paragraphs,
+                window,
             } => {
-                self.open_cached_content(collection, title, document);
+                self.open_cached_content(
+                    collection,
+                    content_id,
+                    title,
+                    total_units,
+                    paragraphs,
+                    window,
+                );
             }
             Event::ContentPackageStateChanged {
                 collection,
@@ -153,8 +162,12 @@ impl Store {
                     if self.reader.is_active_reading() {
                         self.sleep.note_activity(tick_ms);
                     }
-                    self.reader
+                    let outcome = self
+                        .reader
                         .advance_if_due(tick_ms, self.settings.reading_speed_wpm);
+                    if let Some(request) = outcome.load_request {
+                        return Ok(Effect::LoadReaderWindow(request));
+                    }
                 }
             }
             Event::WokeFromDeepSleep => {
@@ -171,17 +184,27 @@ impl Store {
     pub fn open_cached_content(
         &mut self,
         collection: CollectionKind,
+        content_id: crate::text::InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
         title: crate::text::InlineText<{ crate::content::CONTENT_TITLE_MAX_BYTES }>,
-        document: alloc::boxed::Box<ReadingDocument>,
+        total_units: u32,
+        paragraphs: Box<[crate::reader::ReaderParagraphInfo]>,
+        window: Box<crate::reader::ReaderWindow>,
     ) {
-        self.reader.open_article(
+        self.reader.open_cached_reader_content(
             collection,
             crate::content::ArticleId(0),
+            content_id,
             title,
-            document,
+            total_units,
+            paragraphs,
+            window,
             false,
         );
         self.ui.route = UiRoute::Reader;
+    }
+
+    pub fn load_reader_window(&mut self, window: Box<crate::reader::ReaderWindow>) {
+        self.reader.apply_loaded_window(window);
     }
 
     pub fn content(&self) -> &ContentState {
@@ -258,11 +281,6 @@ impl Store {
                 }
 
                 if !self.storage.sd_card_ready {
-                    if matches!(self.backend_sync.status, SyncStatus::Ready) && item.can_prepare() {
-                        return Effect::OpenRemoteContent(PrepareContentRequest::from_manifest(
-                            kind, item,
-                        ));
-                    }
                     return self.collection_confirm_ignored(
                         kind,
                         CollectionConfirmIgnoredReason::StorageUnavailable,
@@ -270,6 +288,12 @@ impl Store {
                 }
 
                 if !matches!(self.backend_sync.status, SyncStatus::Ready) {
+                    return self.collection_confirm_ignored(
+                        kind,
+                        CollectionConfirmIgnoredReason::BackendUnavailable,
+                    );
+                }
+                if self.network.status != NetworkStatus::Online {
                     return self.collection_confirm_ignored(
                         kind,
                         CollectionConfirmIgnoredReason::BackendUnavailable,
@@ -348,7 +372,11 @@ impl Store {
             crate::reader::ReaderMode::ParagraphNavigation => match command {
                 UiCommand::FocusPrevious => self.reader.move_paragraph(true),
                 UiCommand::FocusNext => self.reader.move_paragraph(false),
-                UiCommand::Confirm => self.reader.commit_paragraph_navigation(),
+                UiCommand::Confirm => {
+                    if let Some(request) = self.reader.commit_paragraph_navigation() {
+                        return Effect::LoadReaderWindow(request);
+                    }
+                }
                 UiCommand::Back => self.reader.close_paragraph_navigation(),
                 UiCommand::Noop => {}
             },
@@ -495,8 +523,8 @@ mod tests {
     use super::*;
     use crate::{
         content::{
-            CollectionManifestItem, CollectionManifestState, ContentState, DetailLocator,
-            PackageState, RemoteContentStatus,
+            CollectionManifestItem, CollectionManifestState, DetailLocator, PackageState,
+            RemoteContentStatus,
         },
         device::{BootState, DeviceState},
         formatter::{article_document_from_script, format_article_document},
@@ -661,7 +689,9 @@ mod tests {
         store.storage = make_storage_with_sd();
         let mut manifest = CollectionManifestState::empty();
         let _ = manifest.try_push(make_ready_saved_item(PackageState::Missing));
-        store.content_mut().saved = manifest;
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
 
         let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
@@ -680,12 +710,17 @@ mod tests {
         store.ui.route = UiRoute::Collection(CollectionKind::Saved);
         store.storage = make_storage_with_sd();
         store
+            .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+            .unwrap();
+        store
             .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
             .unwrap();
         let mut manifest = CollectionManifestState::empty();
         let item = make_ready_saved_item(PackageState::Missing);
         let _ = manifest.try_push(item);
-        store.content_mut().saved = manifest;
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
 
         let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
@@ -697,34 +732,49 @@ mod tests {
             ))
         );
         assert_eq!(
-            store.content().saved.item_at(0).unwrap().package_state,
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .item_at(0)
+                .unwrap()
+                .package_state,
             PackageState::Fetching
         );
     }
 
     #[test]
-    fn saved_confirm_opens_remote_when_storage_unavailable_but_backend_ready() {
+    fn saved_confirm_ignores_when_storage_unavailable_even_if_backend_ready() {
         let mut store = Store::new();
         store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        store
+            .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+            .unwrap();
         store
             .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
             .unwrap();
         let mut manifest = CollectionManifestState::empty();
         let item = make_ready_saved_item(PackageState::Missing);
         let _ = manifest.try_push(item);
-        store.content_mut().saved = manifest;
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
 
         let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
         assert_eq!(
             effect,
-            Effect::OpenRemoteContent(PrepareContentRequest::from_manifest(
-                CollectionKind::Saved,
-                item,
-            ))
+            Effect::CollectionConfirmIgnored {
+                collection: CollectionKind::Saved,
+                reason: CollectionConfirmIgnoredReason::StorageUnavailable,
+            }
         );
         assert_eq!(
-            store.content().saved.item_at(0).unwrap().package_state,
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .item_at(0)
+                .unwrap()
+                .package_state,
             PackageState::Missing
         );
     }
@@ -735,13 +785,18 @@ mod tests {
         store.ui.route = UiRoute::Collection(CollectionKind::Saved);
         store.storage = make_storage_with_sd();
         store
+            .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+            .unwrap();
+        store
             .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
             .unwrap();
         let mut manifest = CollectionManifestState::empty();
         let mut item = make_ready_saved_item(PackageState::PendingRemote);
         item.remote_status = RemoteContentStatus::Pending;
         let _ = manifest.try_push(item);
-        store.content_mut().saved = manifest;
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
 
         let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
@@ -788,7 +843,7 @@ mod tests {
         store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
 
         assert_eq!(store.ui.route, UiRoute::Collection(CollectionKind::Saved));
-        assert!(store.reader.document().is_empty());
+        assert!(store.reader.is_empty());
         assert_eq!(store.reader.progress.total_paragraphs, 1);
     }
 
@@ -936,7 +991,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.content().saved, saved_manifest);
+        assert_eq!(
+            store.content().collection_state(CollectionKind::Saved),
+            &saved_manifest
+        );
         assert_eq!(store.ui.saved_index, 0);
     }
 
@@ -955,7 +1013,12 @@ mod tests {
             .unwrap();
 
         assert!(store.content.is_none());
-        assert!(store.content().saved.is_empty());
+        assert!(
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .is_empty()
+        );
         assert_eq!(store.ui.saved_index, 0);
     }
 }
