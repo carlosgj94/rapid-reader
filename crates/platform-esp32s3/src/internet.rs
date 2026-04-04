@@ -216,14 +216,14 @@ async fn probe_task(stack: Stack<'static>) {
                     BACKEND_HOST, BACKEND_PORT
                 );
                 publish_status(NetworkStatus::Online);
+                probe_ready = true;
             }
             Err(err) => {
                 info!("internet probe failed: {:?}", err);
                 publish_status(NetworkStatus::ProbeFailed);
+                Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
             }
         }
-
-        probe_ready = true;
     }
 }
 
@@ -241,7 +241,7 @@ async fn perform_probe(stack: Stack<'static>) -> Result<(), ProbeError> {
 
     socket.set_timeout(Some(Duration::from_secs(10)));
     let remote = dns
-        .get_host_by_name(BACKEND_HOST, AddrType::Either)
+        .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
         .await
         .map_err(|_| ProbeError::Dns)?;
     let remote = match remote {

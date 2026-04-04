@@ -192,6 +192,47 @@ struct HttpResponseMetadata {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RequestMetrics {
+    started_ms: u64,
+    dns_ms: u64,
+    connect_ms: u64,
+    tls_ms: u64,
+    first_byte_ms: Option<u64>,
+    total_ms: u64,
+    reused_session: bool,
+    streaming: bool,
+}
+
+impl RequestMetrics {
+    fn new(reused_session: bool, streaming: bool) -> Self {
+        Self {
+            started_ms: now_ms(),
+            dns_ms: 0,
+            connect_ms: 0,
+            tls_ms: 0,
+            first_byte_ms: None,
+            total_ms: 0,
+            reused_session,
+            streaming,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        now_ms().saturating_sub(self.started_ms)
+    }
+
+    fn mark_first_byte(&mut self) {
+        if self.first_byte_ms.is_none() {
+            self.first_byte_ms = Some(self.elapsed_ms());
+        }
+    }
+
+    fn finish(&mut self) {
+        self.total_ms = self.elapsed_ms();
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum BackendError {
     Dns,
     Connect,
@@ -630,7 +671,9 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         refresh_token.len()
     );
 
+    let mut refresh_metrics = RequestMetrics::new(false, false);
     let dns = DnsSocket::new(stack);
+    let dns_started_ms = now_ms();
     let remote = dns
         .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
         .await
@@ -639,6 +682,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
             log_request_heap(REFRESH_PATH, "dns failed");
             RefreshError::Other(BackendError::Dns)
         })?;
+    refresh_metrics.dns_ms = elapsed_since_ms(dns_started_ms);
     let remote = match remote {
         IpAddr::V4(addr) => addr,
         IpAddr::V6(_) => {
@@ -652,6 +696,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         REFRESH_PATH, remote
     );
     info!("backend request connecting path={}", REFRESH_PATH);
+    let connect_started_ms = now_ms();
     let connection = tcp_client
         .connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT))
         .await
@@ -660,6 +705,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
             log_request_heap(REFRESH_PATH, "connect failed");
             RefreshError::Other(BackendError::Connect)
         })?;
+    refresh_metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     info!("backend request connected path={}", REFRESH_PATH);
 
     info!("backend request tls setup start path={}", REFRESH_PATH);
@@ -672,9 +718,11 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         .map_err(RefreshError::Other)?;
     info!("backend request tls setup ok path={}", REFRESH_PATH);
     info!("backend request tls handshake start path={}", REFRESH_PATH);
+    let tls_started_ms = now_ms();
     session.connect().await.map_err(|err| {
         RefreshError::Other(map_logged_session_error(REFRESH_PATH, "handshake", err))
     })?;
+    refresh_metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     info!("backend request tls handshake ok path={}", REFRESH_PATH);
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
@@ -691,7 +739,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
         );
         info!("backend refresh request ready body_len={}", body.len());
         let response_buffer = standard_response_buffer();
-        send_https_request_over_session(
+        send_https_request_over_session_with_metrics(
             &mut session,
             HttpRequest {
                 method: "POST",
@@ -702,6 +750,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
                 connection_close: false,
             },
             response_buffer,
+            refresh_metrics,
         )
         .await
         .map_err(RefreshError::Other)?
@@ -1140,10 +1189,12 @@ async fn send_https_request<'a>(
         response_buffer.len()
     );
     log_request_heap(request.path, "start");
+    let mut metrics = RequestMetrics::new(false, false);
     let mut tcp_client = TcpClient::new(stack, tcp_state);
     tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
 
     let dns = DnsSocket::new(stack);
+    let dns_started_ms = now_ms();
     let remote = dns
         .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
         .await
@@ -1152,6 +1203,7 @@ async fn send_https_request<'a>(
             log_request_heap(request.path, "dns failed");
             BackendError::Dns
         })?;
+    metrics.dns_ms = elapsed_since_ms(dns_started_ms);
     let remote = match remote {
         IpAddr::V4(addr) => addr,
         IpAddr::V6(_) => {
@@ -1165,6 +1217,7 @@ async fn send_https_request<'a>(
         request.path, remote
     );
     info!("backend request connecting path={}", request.path);
+    let connect_started_ms = now_ms();
     let connection = tcp_client
         .connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT))
         .await
@@ -1173,6 +1226,7 @@ async fn send_https_request<'a>(
             log_request_heap(request.path, "connect failed");
             BackendError::Connect
         })?;
+    metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     info!("backend request connected path={}", request.path);
 
     info!("backend request tls setup start path={}", request.path);
@@ -1184,10 +1238,12 @@ async fn send_https_request<'a>(
         })?;
     info!("backend request tls setup ok path={}", request.path);
     info!("backend request tls handshake start path={}", request.path);
+    let tls_started_ms = now_ms();
     session
         .connect()
         .await
         .map_err(|err| map_logged_session_error(request.path, "handshake", err))?;
+    metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     info!("backend request tls handshake ok path={}", request.path);
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
@@ -1196,7 +1252,13 @@ async fn send_https_request<'a>(
             request.path, verification_flags
         );
     }
-    let response = send_https_request_over_session(&mut session, request, response_buffer).await;
+    let response = send_https_request_over_session_with_metrics(
+        &mut session,
+        request,
+        response_buffer,
+        metrics,
+    )
+    .await;
     if let Err(err) = session.close().await {
         info!("backend tls close failed: {:?}", err);
     }
@@ -1208,6 +1270,24 @@ async fn send_https_request_over_session<'a, T>(
     session: &mut Session<'_, T>,
     request: HttpRequest<'_>,
     response_buffer: &'a mut [u8],
+) -> Result<HttpResponse<'a>, BackendError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    send_https_request_over_session_with_metrics(
+        session,
+        request,
+        response_buffer,
+        RequestMetrics::new(true, false),
+    )
+    .await
+}
+
+async fn send_https_request_over_session_with_metrics<'a, T>(
+    session: &mut Session<'_, T>,
+    request: HttpRequest<'_>,
+    response_buffer: &'a mut [u8],
+    mut metrics: RequestMetrics,
 ) -> Result<HttpResponse<'a>, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -1231,10 +1311,13 @@ where
         request.path,
         response_buffer,
         request.connection_close,
+        &mut metrics,
     )
     .await;
     match &response {
         Ok(parsed) => {
+            metrics.finish();
+            log_request_timing(request, parsed.status, &metrics);
             info!(
                 "backend request response read ok path={} status={}",
                 request.path, parsed.status
@@ -1407,6 +1490,7 @@ async fn read_http_response<'a, T>(
     path: &str,
     response_buffer: &'a mut [u8],
     connection_close: bool,
+    metrics: &mut RequestMetrics,
 ) -> Result<HttpResponse<'a>, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -1440,6 +1524,7 @@ where
             }
             break;
         }
+        metrics.mark_first_byte();
         total += read;
 
         if !saw_headers
@@ -1852,10 +1937,12 @@ async fn stream_https_response_body_to_storage(
         request.bearer_token.is_some(),
     );
     log_request_heap(request.path, "stream start");
+    let mut metrics = RequestMetrics::new(false, true);
     let mut tcp_client = TcpClient::new(stack, tcp_state);
     tcp_client.set_timeout(Some(Duration::from_secs(HTTP_TIMEOUT_SECS)));
 
     let dns = DnsSocket::new(stack);
+    let dns_started_ms = now_ms();
     let remote_addr = dns
         .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
         .await
@@ -1864,6 +1951,7 @@ async fn stream_https_response_body_to_storage(
             log_request_heap(request.path, "stream dns failed");
             BackendError::Dns
         })?;
+    metrics.dns_ms = elapsed_since_ms(dns_started_ms);
     let remote_addr = match remote_addr {
         IpAddr::V4(addr) => addr,
         IpAddr::V6(_) => {
@@ -1878,6 +1966,7 @@ async fn stream_https_response_body_to_storage(
     );
     info!("backend request connecting path={}", request.path);
 
+    let connect_started_ms = now_ms();
     let connection = tcp_client
         .connect(SocketAddr::new(IpAddr::V4(remote_addr), BACKEND_PORT))
         .await
@@ -1886,6 +1975,7 @@ async fn stream_https_response_body_to_storage(
             log_request_heap(request.path, "stream connect failed");
             BackendError::Connect
         })?;
+    metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     info!("backend request connected path={}", request.path);
     info!("backend request tls setup start path={}", request.path);
     log_request_heap(request.path, "stream before tls");
@@ -1896,10 +1986,12 @@ async fn stream_https_response_body_to_storage(
         })?;
     info!("backend request tls setup ok path={}", request.path);
     info!("backend request tls handshake start path={}", request.path);
+    let tls_started_ms = now_ms();
     session
         .connect()
         .await
         .map_err(|err| map_logged_session_error(request.path, "handshake", err))?;
+    metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     info!("backend request tls handshake ok path={}", request.path);
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
@@ -1923,6 +2015,7 @@ async fn stream_https_response_body_to_storage(
         &mut session,
         request.path,
         request.connection_close,
+        &mut metrics,
     )
     .await;
     if let Err(err) = session.close().await {
@@ -1931,6 +2024,8 @@ async fn stream_https_response_body_to_storage(
 
     match response {
         Ok(status) => {
+            metrics.finish();
+            log_request_timing(request, status, &metrics);
             log_request_heap(request.path, "stream ok");
             Ok(status)
         }
@@ -1948,6 +2043,22 @@ async fn stream_https_response_body_to_storage_over_session<T>(
 where
     T: AsyncRead07 + AsyncWrite07,
 {
+    stream_https_response_body_to_storage_over_session_with_metrics(
+        session,
+        request,
+        RequestMetrics::new(true, true),
+    )
+    .await
+}
+
+async fn stream_https_response_body_to_storage_over_session_with_metrics<T>(
+    session: &mut Session<'_, T>,
+    request: HttpRequest<'_>,
+    mut metrics: RequestMetrics,
+) -> Result<u16, BackendError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
     info!("backend request write start path={}", request.path);
     write_http_request(
         session,
@@ -1960,11 +2071,17 @@ where
     )
     .await?;
 
-    let response =
-        read_streaming_http_response_to_storage(session, request.path, request.connection_close)
-            .await;
+    let response = read_streaming_http_response_to_storage(
+        session,
+        request.path,
+        request.connection_close,
+        &mut metrics,
+    )
+    .await;
     match response {
         Ok(status) => {
+            metrics.finish();
+            log_request_timing(request, status, &metrics);
             log_request_heap(request.path, "stream ok");
             Ok(status)
         }
@@ -1979,6 +2096,7 @@ async fn read_streaming_http_response_to_storage<T>(
     session: &mut Session<'_, T>,
     path: &str,
     connection_close: bool,
+    metrics: &mut RequestMetrics,
 ) -> Result<u16, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -1997,6 +2115,7 @@ where
         if read == 0 {
             return Err(BackendError::InvalidResponse);
         }
+        metrics.mark_first_byte();
         header_len += read;
 
         let Some(header_end) = find_subslice(&header[..header_len], b"\r\n\r\n") else {
@@ -2994,6 +3113,26 @@ fn log_request_heap(path: &str, stage: &str) {
 
 fn now_ms() -> u64 {
     Instant::now().as_millis()
+}
+
+fn elapsed_since_ms(started_ms: u64) -> u64 {
+    now_ms().saturating_sub(started_ms)
+}
+
+fn log_request_timing(request: HttpRequest<'_>, status: u16, metrics: &RequestMetrics) {
+    info!(
+        "backend request timing method={} path={} status={} reused={} streaming={} dns_ms={} connect_ms={} tls_ms={} first_byte_ms={} total_ms={}",
+        request.method,
+        request.path,
+        status,
+        metrics.reused_session,
+        metrics.streaming,
+        metrics.dns_ms,
+        metrics.connect_ms,
+        metrics.tls_ms,
+        metrics.first_byte_ms.unwrap_or(metrics.total_ms),
+        metrics.total_ms,
+    );
 }
 
 const fn is_auth_status(status: u16) -> bool {
