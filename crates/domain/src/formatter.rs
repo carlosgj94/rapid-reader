@@ -15,6 +15,12 @@ pub const MAX_READING_PARAGRAPHS: usize = 40;
 pub const MAX_READING_TOKEN_BYTES: usize = 32;
 pub const MAX_STAGE_SEGMENT_BYTES: usize = 32;
 pub const MAX_PARAGRAPH_PREVIEW_BYTES: usize = 64;
+const CLAUSE_PAUSE_NUMERATOR: u32 = 3;
+const CLAUSE_PAUSE_DENOMINATOR: u32 = 4;
+const SENTENCE_PAUSE_NUMERATOR: u32 = 1;
+const SENTENCE_PAUSE_DENOMINATOR: u32 = 1;
+const PARAGRAPH_PAUSE_NUMERATOR: u32 = 3;
+const PARAGRAPH_PAUSE_DENOMINATOR: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum StageFont {
@@ -274,13 +280,21 @@ impl ReadingUnit {
             11..=14 => base / 2,
             _ => (base * 3) / 4,
         };
-        let clause_bonus = if self.flags.clause_pause { base / 2 } else { 0 };
-        let sentence_bonus = if self.flags.sentence_pause {
-            (base * 3) / 4
+        let clause_bonus = if self.flags.clause_pause {
+            scaled_bonus(base, CLAUSE_PAUSE_NUMERATOR, CLAUSE_PAUSE_DENOMINATOR)
         } else {
             0
         };
-        let paragraph_bonus = if self.flags.paragraph_end { base } else { 0 };
+        let sentence_bonus = if self.flags.sentence_pause {
+            scaled_bonus(base, SENTENCE_PAUSE_NUMERATOR, SENTENCE_PAUSE_DENOMINATOR)
+        } else {
+            0
+        };
+        let paragraph_bonus = if self.flags.paragraph_end {
+            scaled_bonus(base, PARAGRAPH_PAUSE_NUMERATOR, PARAGRAPH_PAUSE_DENOMINATOR)
+        } else {
+            0
+        };
 
         base + length_bonus + clause_bonus + sentence_bonus + paragraph_bonus
     }
@@ -503,6 +517,10 @@ fn preferred_anchor(core_chars: usize) -> usize {
     }
 }
 
+const fn scaled_bonus(base: u32, numerator: u32, denominator: u32) -> u32 {
+    (base * numerator) / denominator
+}
+
 fn font_for_token(char_count: usize) -> StageFont {
     match char_count {
         0..=11 => StageFont::Large,
@@ -601,6 +619,53 @@ mod tests {
         };
 
         assert!(long_sentence_end.dwell_ms(260) > short.dwell_ms(260));
+    }
+
+    #[test]
+    fn dwell_uses_larger_pause_weights_for_all_boundaries() {
+        let base_unit = ReadingUnit {
+            display: InlineText::from_slice("go"),
+            paragraph_index: 1,
+            anchor_index: 1,
+            char_count: 2,
+            font: StageFont::Large,
+            flags: UnitFlags::default(),
+        };
+        let clause_unit = ReadingUnit {
+            flags: UnitFlags {
+                clause_pause: true,
+                ..UnitFlags::default()
+            },
+            ..base_unit
+        };
+        let sentence_unit = ReadingUnit {
+            flags: UnitFlags {
+                sentence_pause: true,
+                ..UnitFlags::default()
+            },
+            ..base_unit
+        };
+        let paragraph_unit = ReadingUnit {
+            flags: UnitFlags {
+                paragraph_end: true,
+                ..UnitFlags::default()
+            },
+            ..base_unit
+        };
+        let stacked_unit = ReadingUnit {
+            flags: UnitFlags {
+                sentence_pause: true,
+                paragraph_end: true,
+                ..UnitFlags::default()
+            },
+            ..base_unit
+        };
+
+        assert_eq!(base_unit.dwell_ms(300), 200);
+        assert_eq!(clause_unit.dwell_ms(300), 350);
+        assert_eq!(sentence_unit.dwell_ms(300), 400);
+        assert_eq!(paragraph_unit.dwell_ms(300), 500);
+        assert_eq!(stacked_unit.dwell_ms(300), 700);
     }
 
     #[test]
