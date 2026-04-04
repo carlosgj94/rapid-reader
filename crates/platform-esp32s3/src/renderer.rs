@@ -1,3 +1,5 @@
+use core::convert::Infallible;
+
 use app_runtime::{
     AnimationDescriptor, MotionDirection, PreparedScreen, Screen, ScreenUpdate, TransitionPlan,
     components::{
@@ -11,20 +13,33 @@ use domain::ui::TopicRegion;
 use embedded_graphics::{
     mono_font::{
         MonoFont, MonoTextStyleBuilder,
-        ascii::{FONT_6X10, FONT_8X13, FONT_10X20},
+        iso_8859_1::{FONT_6X10, FONT_8X13, FONT_8X13_BOLD, FONT_10X20},
     },
     pixelcolor::BinaryColor,
     prelude::*,
     primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Baseline, Text, TextStyleBuilder},
 };
+use heapless::String as HeaplessString;
 use ls027b7dh01::FrameBuffer;
 
 pub const UI_TICK_MS: u64 = 160;
 pub const MAINTENANCE_REFRESH_TICKS: u8 = 6;
+const NORMALIZED_TEXT_MAX_BYTES: usize = 192;
 const RSVP_STAGE_CENTER_X: i32 = 170;
 const RSVP_STAGE_LEFT_ANCHOR_X: i32 = 169;
 const RSVP_STAGE_RIGHT_ANCHOR_X: i32 = 173;
+const RSVP_STAGE_SCALED_LEFT_ANCHOR_X: i32 = 168;
+const RSVP_STAGE_SCALED_RIGHT_ANCHOR_X: i32 = 172;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StageTextSpec {
+    font: &'static MonoFont<'static>,
+    y: i32,
+    scale: u32,
+    left_anchor_x: i32,
+    right_anchor_x: i32,
+}
 
 fn ui_font_small() -> &'static MonoFont<'static> {
     &FONT_6X10
@@ -38,10 +53,29 @@ fn ui_font_title() -> &'static MonoFont<'static> {
     &FONT_10X20
 }
 
-fn stage_font_spec(font: StageFont) -> (&'static MonoFont<'static>, i32) {
+fn stage_font_spec(font: StageFont) -> StageTextSpec {
     match font {
-        StageFont::Large | StageFont::Medium => (ui_font_title(), 88),
-        StageFont::Small => (ui_font_body(), 96),
+        StageFont::Large => StageTextSpec {
+            font: ui_font_title(),
+            y: 102,
+            scale: 2,
+            left_anchor_x: RSVP_STAGE_SCALED_LEFT_ANCHOR_X,
+            right_anchor_x: RSVP_STAGE_SCALED_RIGHT_ANCHOR_X,
+        },
+        StageFont::Medium => StageTextSpec {
+            font: &FONT_8X13_BOLD,
+            y: 108,
+            scale: 2,
+            left_anchor_x: RSVP_STAGE_SCALED_LEFT_ANCHOR_X,
+            right_anchor_x: RSVP_STAGE_SCALED_RIGHT_ANCHOR_X,
+        },
+        StageFont::Small => StageTextSpec {
+            font: ui_font_title(),
+            y: 112,
+            scale: 1,
+            left_anchor_x: RSVP_STAGE_LEFT_ANCHOR_X,
+            right_anchor_x: RSVP_STAGE_RIGHT_ANCHOR_X,
+        },
     }
 }
 
@@ -497,22 +531,43 @@ fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total
 }
 
 fn draw_stage_token(frame: &mut FrameBuffer, left: &str, right: &str, font: StageFont) {
-    let (font, y) = stage_font_spec(font);
-    draw_text_right(
-        frame,
-        left,
-        Point::new(RSVP_STAGE_LEFT_ANCHOR_X, y),
-        font,
-        BinaryColor::On,
-    );
-    draw_text(
-        frame,
-        right,
-        Point::new(RSVP_STAGE_RIGHT_ANCHOR_X, y),
-        font,
-        BinaryColor::On,
-        Alignment::Left,
-    );
+    let spec = stage_font_spec(font);
+
+    if spec.scale == 1 {
+        draw_text_right(
+            frame,
+            left,
+            Point::new(spec.left_anchor_x, spec.y),
+            spec.font,
+            BinaryColor::On,
+        );
+        draw_text(
+            frame,
+            right,
+            Point::new(spec.right_anchor_x, spec.y),
+            spec.font,
+            BinaryColor::On,
+            Alignment::Left,
+        );
+    } else {
+        draw_text_right_scaled(
+            frame,
+            left,
+            Point::new(spec.left_anchor_x, spec.y),
+            spec.font,
+            BinaryColor::On,
+            spec.scale,
+        );
+        draw_text_scaled(
+            frame,
+            right,
+            Point::new(spec.right_anchor_x, spec.y),
+            spec.font,
+            BinaryColor::On,
+            Alignment::Left,
+            spec.scale,
+        );
+    }
 }
 
 fn draw_paragraph_navigation(
@@ -1029,6 +1084,7 @@ fn draw_text(
     color: BinaryColor,
     alignment: Alignment,
 ) {
+    let normalized = normalized_text(text);
     let style = MonoTextStyleBuilder::new()
         .font(font)
         .text_color(color)
@@ -1038,8 +1094,34 @@ fn draw_text(
         .baseline(Baseline::Top)
         .build();
 
-    Text::with_text_style(text, position, style, text_style)
+    Text::with_text_style(normalized.as_str(), position, style, text_style)
         .draw(frame)
+        .ok();
+}
+
+fn draw_text_scaled(
+    frame: &mut FrameBuffer,
+    text: &str,
+    position: Point,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    color: BinaryColor,
+    alignment: Alignment,
+    scale: u32,
+) {
+    let normalized = normalized_text(text);
+    let style = MonoTextStyleBuilder::new()
+        .font(font)
+        .text_color(color)
+        .build();
+    let text_style = TextStyleBuilder::new()
+        .alignment(alignment)
+        .baseline(Baseline::Top)
+        .build();
+    let logical_position = logical_text_position(position, scale);
+    let mut scaled_frame = ScaledFrameBuffer::new(frame, scale);
+
+    Text::with_text_style(normalized.as_str(), logical_position, style, text_style)
+        .draw(&mut scaled_frame)
         .ok();
 }
 
@@ -1051,6 +1133,105 @@ fn draw_text_right(
     color: BinaryColor,
 ) {
     draw_text(frame, text, position, font, color, Alignment::Right);
+}
+
+fn draw_text_right_scaled(
+    frame: &mut FrameBuffer,
+    text: &str,
+    position: Point,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    color: BinaryColor,
+    scale: u32,
+) {
+    draw_text_scaled(frame, text, position, font, color, Alignment::Right, scale);
+}
+
+fn normalized_text(text: &str) -> HeaplessString<NORMALIZED_TEXT_MAX_BYTES> {
+    let mut normalized = HeaplessString::new();
+
+    for ch in text.chars() {
+        if normalized.push(normalize_display_char(ch)).is_err() {
+            break;
+        }
+    }
+
+    normalized
+}
+
+fn normalize_display_char(ch: char) -> char {
+    match ch {
+        '’' | '‘' => '\'',
+        '“' | '”' => '"',
+        '–' | '—' => '-',
+        '\u{00A0}' => ' ',
+        _ => ch,
+    }
+}
+
+fn logical_text_position(position: Point, scale: u32) -> Point {
+    let scale = scale as i32;
+    debug_assert_eq!(position.x % scale, 0);
+    debug_assert_eq!(position.y % scale, 0);
+
+    Point::new(position.x / scale, position.y / scale)
+}
+
+struct ScaledFrameBuffer<'a> {
+    frame: &'a mut FrameBuffer,
+    scale: u32,
+}
+
+impl<'a> ScaledFrameBuffer<'a> {
+    fn new(frame: &'a mut FrameBuffer, scale: u32) -> Self {
+        Self { frame, scale }
+    }
+}
+
+impl DrawTarget for ScaledFrameBuffer<'_> {
+    type Color = BinaryColor;
+    type Error = Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        let scale = self.scale as i32;
+
+        for Pixel(point, color) in pixels {
+            if point.x < 0 || point.y < 0 {
+                continue;
+            }
+
+            let physical_x = point.x * scale;
+            let physical_y = point.y * scale;
+
+            let mut dy = 0;
+            while dy < scale {
+                let mut dx = 0;
+                while dx < scale {
+                    let _ = self.frame.set_pixel(
+                        (physical_x + dx) as usize,
+                        (physical_y + dy) as usize,
+                        color.is_on(),
+                    );
+                    dx += 1;
+                }
+                dy += 1;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl OriginDimensions for ScaledFrameBuffer<'_> {
+    fn size(&self) -> Size {
+        let physical = self.frame.size();
+        Size::new(
+            physical.width / self.scale.max(1),
+            physical.height / self.scale.max(1),
+        )
+    }
 }
 
 fn battery_label(percent: u8) -> &'static str {

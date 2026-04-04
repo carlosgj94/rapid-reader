@@ -501,8 +501,8 @@ fn preferred_anchor(core_chars: usize) -> usize {
 
 fn font_for_token(char_count: usize) -> StageFont {
     match char_count {
-        0..=18 => StageFont::Large,
-        19..=24 => StageFont::Medium,
+        0..=11 => StageFont::Large,
+        12..=17 => StageFont::Medium,
         _ => StageFont::Small,
     }
 }
@@ -606,5 +606,13 @@ mod tests {
 
         assert_eq!(article.source, SourceKind::EditorialFeed);
         assert_eq!(article.script, ReaderScript::QuietCraft);
+    }
+
+    #[test]
+    fn stage_font_thresholds_match_stage_sizes() {
+        assert_eq!(font_for_token(11), StageFont::Large);
+        assert_eq!(font_for_token(12), StageFont::Medium);
+        assert_eq!(font_for_token(17), StageFont::Medium);
+        assert_eq!(font_for_token(18), StageFont::Small);
     }
 }
