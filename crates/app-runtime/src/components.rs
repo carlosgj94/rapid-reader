@@ -123,6 +123,8 @@ pub struct ParagraphMapRail {
 pub struct ParagraphNavigationShell {
     pub appearance: AppearanceMode,
     pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub current_index: u16,
+    pub total: u16,
     pub counter: domain::text::InlineText<16>,
     pub previous_top: domain::text::InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
     pub selected_label: domain::text::InlineText<16>,
@@ -323,6 +325,8 @@ fn compose_paragraph_navigation(model: ParagraphNavigationModel) -> ParagraphNav
     ParagraphNavigationShell {
         appearance: model.appearance,
         title: model.title,
+        current_index: model.current_index,
+        total: model.total,
         counter: counter_label(model.current_index, model.total),
         previous_top: model.previous_top,
         selected_label: paragraph_label(model.current_index),

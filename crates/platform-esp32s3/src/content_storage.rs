@@ -2304,9 +2304,13 @@ fn decode_reader_package_paragraph_entry(
         return Err(StorageError::CorruptData);
     }
 
-    let _ = str::from_utf8(&bytes[8..8 + preview_len]).map_err(|_| StorageError::CorruptData)?;
+    let preview_text =
+        str::from_utf8(&bytes[8..8 + preview_len]).map_err(|_| StorageError::CorruptData)?;
+    let mut preview = InlineText::new();
+    preview.set_truncated(preview_text);
     Ok(ReaderParagraphInfo {
         start_unit_index: read_u32(bytes, 0),
+        preview,
     })
 }
 

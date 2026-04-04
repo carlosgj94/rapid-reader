@@ -34,6 +34,7 @@ pub struct ReaderProgress {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub struct ReaderParagraphInfo {
     pub start_unit_index: u32,
+    pub preview: InlineText<MAX_PARAGRAPH_PREVIEW_BYTES>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -145,6 +146,7 @@ impl ReaderSession {
         while paragraph_index < paragraph_count {
             paragraphs.push(ReaderParagraphInfo {
                 start_unit_index: document.paragraphs[paragraph_index].start_unit_index as u32,
+                preview: document.paragraphs[paragraph_index].preview,
             });
             paragraph_index += 1;
         }
@@ -413,7 +415,20 @@ impl ReaderSession {
         &self,
         paragraph_index: u16,
     ) -> InlineText<MAX_PARAGRAPH_PREVIEW_BYTES> {
-        Self::preview_from_window(self.active_window(), paragraph_index)
+        self.paragraphs
+            .as_deref()
+            .and_then(|paragraphs| {
+                if paragraphs.is_empty() {
+                    return None;
+                }
+
+                let safe_index = paragraph_index
+                    .saturating_sub(1)
+                    .min(paragraphs.len().saturating_sub(1) as u16)
+                    as usize;
+                Some(paragraphs[safe_index].preview)
+            })
+            .or_else(|| Self::preview_from_window(self.active_window(), paragraph_index))
             .or_else(|| {
                 self.prefetched_window
                     .as_deref()
@@ -663,7 +678,10 @@ mod tests {
             paragraph_starts
                 .iter()
                 .copied()
-                .map(|start_unit_index| ReaderParagraphInfo { start_unit_index })
+                .map(|start_unit_index| ReaderParagraphInfo {
+                    start_unit_index,
+                    preview: InlineText::new(),
+                })
                 .collect::<alloc::vec::Vec<_>>()
                 .into_boxed_slice(),
         );
@@ -713,12 +731,15 @@ mod tests {
             alloc::vec![
                 ReaderParagraphInfo {
                     start_unit_index: 0,
+                    preview: InlineText::from_slice("first"),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 5,
+                    preview: InlineText::from_slice("second"),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 9,
+                    preview: InlineText::from_slice("third"),
                 },
             ]
             .into_boxed_slice(),
@@ -742,6 +763,30 @@ mod tests {
         assert_eq!(session.progress.unit_index, 5);
         assert_eq!(session.progress.paragraph_index, 2);
         assert_eq!(session.next_due_at_ms, None);
+    }
+
+    #[test]
+    fn paragraph_preview_uses_global_metadata_outside_loaded_window() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.paragraphs = Some(
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: InlineText::from_slice("first preview"),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: InlineText::from_slice("second preview"),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 128,
+                    preview: InlineText::from_slice("third preview"),
+                },
+            ]
+            .into_boxed_slice(),
+        );
+
+        assert_eq!(session.preview_for_paragraph(3).as_str(), "third preview");
     }
 
     #[test]
@@ -844,6 +889,7 @@ mod tests {
             alloc::vec![
                 ReaderParagraphInfo {
                     start_unit_index: 0,
+                    preview: InlineText::new(),
                 };
                 10
             ]

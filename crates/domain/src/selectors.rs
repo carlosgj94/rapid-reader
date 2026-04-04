@@ -256,19 +256,31 @@ pub fn select_paragraph_navigation(store: &Store) -> ParagraphNavigationModel {
     let current_index = store.reader.progress.paragraph_index as usize;
     let total = store.reader.progress.total_paragraphs;
     let current_zero_based = current_index.saturating_sub(1);
-    let previous_top = store
-        .reader
-        .preview_for_paragraph((current_zero_based.saturating_sub(1) + 1) as u16);
+    let previous_top = if current_zero_based > 0 {
+        store
+            .reader
+            .preview_for_paragraph(current_zero_based as u16)
+    } else {
+        InlineText::new()
+    };
     let selected_excerpt = store
         .reader
         .preview_for_paragraph((current_zero_based + 1) as u16);
-    let previous_bottom = store.reader.preview_for_paragraph(
-        ((current_zero_based + 1).min(total.saturating_sub(1) as usize) + 1) as u16,
-    );
-    let final_excerpt = store.reader.preview_for_paragraph(
-        ((current_zero_based + 2).min(total.saturating_sub(1) as usize) + 1) as u16,
-    );
-    let tick_index = current_zero_based.min(6) as u8;
+    let previous_bottom = if (current_zero_based + 1) < total as usize {
+        store
+            .reader
+            .preview_for_paragraph((current_zero_based + 2) as u16)
+    } else {
+        InlineText::new()
+    };
+    let final_excerpt = if (current_zero_based + 2) < total as usize {
+        store
+            .reader
+            .preview_for_paragraph((current_zero_based + 3) as u16)
+    } else {
+        InlineText::new()
+    };
+    let tick_index = paragraph_tick_index(store.reader.progress.paragraph_index, total);
 
     ParagraphNavigationModel {
         appearance: store.settings.appearance,
@@ -281,6 +293,17 @@ pub fn select_paragraph_navigation(store: &Store) -> ParagraphNavigationModel {
         final_excerpt,
         tick_index,
     }
+}
+
+fn paragraph_tick_index(current_index: u16, total: u16) -> u8 {
+    if total <= 1 {
+        return 0;
+    }
+
+    let current_zero_based = current_index.saturating_sub(1).min(total.saturating_sub(1)) as u32;
+    let total_zero_based = total.saturating_sub(1) as u32;
+
+    (((current_zero_based * 6) + (total_zero_based / 2)) / total_zero_based).min(6) as u8
 }
 
 pub fn select_settings(store: &Store) -> SettingsScreenModel {
@@ -589,10 +612,26 @@ mod tests {
 
         assert_eq!(model.current_index, 7);
         assert_eq!(model.total, 23);
+        assert_eq!(model.tick_index, 2);
         assert_eq!(
             model.selected_excerpt.as_str(),
             "Analog objects still teach us what speed tends to erase."
         );
+    }
+
+    #[test]
+    fn paragraph_navigation_uses_empty_edges_at_article_bounds() {
+        let mut store = Store::new();
+
+        store.reader.progress.paragraph_index = 1;
+        let first = select_paragraph_navigation(&store);
+        assert!(first.previous_top.is_empty());
+        assert!(!first.previous_bottom.is_empty());
+
+        store.reader.progress.paragraph_index = store.reader.progress.total_paragraphs;
+        let last = select_paragraph_navigation(&store);
+        assert!(last.previous_bottom.is_empty());
+        assert!(last.final_excerpt.is_empty());
     }
 
     #[test]

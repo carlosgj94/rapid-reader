@@ -984,12 +984,15 @@ mod tests {
             alloc::vec![
                 ReaderParagraphInfo {
                     start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 10,
+                    preview: crate::text::InlineText::new(),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 20,
+                    preview: crate::text::InlineText::new(),
                 },
             ]
             .into_boxed_slice(),
@@ -1021,9 +1024,11 @@ mod tests {
             alloc::vec![
                 ReaderParagraphInfo {
                     start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
                 },
                 ReaderParagraphInfo {
                     start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
                 },
             ]
             .into_boxed_slice(),

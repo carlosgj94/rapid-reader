@@ -38,7 +38,7 @@ use crate::{
     backend,
     board::BoardConfig,
     content_storage,
-    display::{DisplayPresentStats, HEARTBEAT_INTERVAL_MS, PlatformDisplay, diff_dirty_rows},
+    display::{HEARTBEAT_INTERVAL_MS, PlatformDisplay, diff_dirty_rows},
     input::PlatformInputService,
     internet,
     renderer::{self, AnimationPlayback},
@@ -54,10 +54,6 @@ const READER_TICK_MS: u64 = 20;
 const APP_EVENT_QUEUE_CAPACITY: usize = 8;
 const PLATFORM_COMMAND_QUEUE_CAPACITY: usize = 4;
 const DROP_LOG_SAMPLE_EVERY: u32 = 64;
-const DISPLAY_LOG_MIN_ROWS: u16 = 96;
-const DISPLAY_LOG_MIN_TOTAL_US: u64 = 25_000;
-const DISPLAY_LOG_TRANSITION_MIN_ROWS: u16 = 48;
-const DISPLAY_LOG_TRANSITION_MIN_TOTAL_US: u64 = 20_000;
 
 static APP_EVENT_CH: Channel<CriticalSectionRawMutex, TimedEvent, APP_EVENT_QUEUE_CAPACITY> =
     Channel::new();
@@ -541,7 +537,6 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                                 &mut working_frame,
                                 &mut delay,
                                 &next_frame,
-                                "animation",
                             );
                             next_heartbeat_deadline = schedule_heartbeat_deadline();
 
@@ -608,7 +603,6 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                                 &mut working_frame,
                                 &mut delay,
                                 &update.prepared,
-                                "screen",
                             );
                             next_heartbeat_deadline = schedule_heartbeat_deadline();
                         } else {
@@ -619,7 +613,6 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                                 &mut working_frame,
                                 &mut delay,
                                 &next_animation,
-                                "transition-start",
                             );
                             next_heartbeat_deadline = schedule_heartbeat_deadline();
 
@@ -647,7 +640,6 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                             &mut working_frame,
                             &mut delay,
                             &update.prepared,
-                            "initial",
                         );
                         next_heartbeat_deadline = schedule_heartbeat_deadline();
                     }
@@ -793,33 +785,12 @@ fn schedule_heartbeat_deadline() -> Instant {
     Instant::now() + Duration::from_millis(HEARTBEAT_INTERVAL_MS)
 }
 
-#[derive(Clone, Copy)]
-struct PresentTimings {
-    render_us: u64,
-    diff_us: u64,
-}
-
-fn should_log_display_present(kind: &str, stats: DisplayPresentStats, total_us: u64) -> bool {
-    if kind == "initial" || stats.full_refresh {
-        return true;
-    }
-
-    match kind {
-        "transition-start" => {
-            stats.dirty_rows >= DISPLAY_LOG_TRANSITION_MIN_ROWS
-                || total_us >= DISPLAY_LOG_TRANSITION_MIN_TOTAL_US
-        }
-        _ => stats.dirty_rows >= DISPLAY_LOG_MIN_ROWS || total_us >= DISPLAY_LOG_MIN_TOTAL_US,
-    }
-}
-
 fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
     display: &mut PlatformDisplay<SPI, DISP, EMD, CS>,
     committed: &mut FrameBuffer,
     working: &mut FrameBuffer,
     delay: &mut D,
     screen: &PreparedScreen,
-    kind: &str,
 ) where
     SPI: embedded_hal::spi::SpiBus<u8>,
     DISP: embedded_hal::digital::OutputPin,
@@ -827,23 +798,9 @@ fn present_prepared_screen<SPI, DISP, EMD, CS, D>(
     CS: embedded_hal::digital::OutputPin,
     D: DelayNs,
 {
-    let render_started = Instant::now();
     renderer::draw_prepared_screen(working, screen);
-    let render_us = Instant::now().duration_since(render_started).as_micros();
-
-    let diff_started = Instant::now();
     let dirty_rows = diff_dirty_rows(committed, working);
-    let diff_us = Instant::now().duration_since(diff_started).as_micros();
-
-    present_frame(
-        display,
-        committed,
-        working,
-        &dirty_rows,
-        delay,
-        kind,
-        PresentTimings { render_us, diff_us },
-    );
+    present_frame(display, committed, working, &dirty_rows, delay);
 }
 
 fn present_transition_frame<SPI, DISP, EMD, CS, D>(
@@ -852,7 +809,6 @@ fn present_transition_frame<SPI, DISP, EMD, CS, D>(
     working: &mut FrameBuffer,
     delay: &mut D,
     animation: &AnimationPlayback,
-    kind: &str,
 ) where
     SPI: embedded_hal::spi::SpiBus<u8>,
     DISP: embedded_hal::digital::OutputPin,
@@ -860,23 +816,9 @@ fn present_transition_frame<SPI, DISP, EMD, CS, D>(
     CS: embedded_hal::digital::OutputPin,
     D: DelayNs,
 {
-    let render_started = Instant::now();
     renderer::draw_transition_frame(working, animation);
-    let render_us = Instant::now().duration_since(render_started).as_micros();
-
-    let diff_started = Instant::now();
     let dirty_rows = diff_dirty_rows(committed, working);
-    let diff_us = Instant::now().duration_since(diff_started).as_micros();
-
-    present_frame(
-        display,
-        committed,
-        working,
-        &dirty_rows,
-        delay,
-        kind,
-        PresentTimings { render_us, diff_us },
-    );
+    present_frame(display, committed, working, &dirty_rows, delay);
 }
 
 fn present_frame<SPI, DISP, EMD, CS, D>(
@@ -885,8 +827,6 @@ fn present_frame<SPI, DISP, EMD, CS, D>(
     working: &FrameBuffer,
     dirty_rows: &ls027b7dh01::DirtyRows,
     delay: &mut D,
-    kind: &str,
-    timings: PresentTimings,
 ) where
     SPI: embedded_hal::spi::SpiBus<u8>,
     DISP: embedded_hal::digital::OutputPin,
@@ -894,30 +834,8 @@ fn present_frame<SPI, DISP, EMD, CS, D>(
     CS: embedded_hal::digital::OutputPin,
     D: DelayNs,
 {
-    let flush_started = Instant::now();
     match display.present(committed, working, dirty_rows, delay) {
-        Ok(stats) => {
-            if stats.dirty_rows > 0 {
-                let flush_us = Instant::now().duration_since(flush_started).as_micros();
-                let total_us = timings
-                    .render_us
-                    .saturating_add(timings.diff_us)
-                    .saturating_add(flush_us);
-                if should_log_display_present(kind, stats, total_us) {
-                    info!(
-                        "display present kind={} rows={} bytes={} full={} render_us={} diff_us={} flush_us={} total_us={}",
-                        kind,
-                        stats.dirty_rows,
-                        stats.bytes_sent,
-                        stats.full_refresh,
-                        timings.render_us,
-                        timings.diff_us,
-                        flush_us,
-                        total_us,
-                    );
-                }
-            }
-        }
+        Ok(_stats) => {}
         Err(err) => {
             info!("display flush failed: {:?}", err);
             let _ = display.disable_output();

@@ -58,6 +58,17 @@ const PARAGRAPH_SELECTED_SLOT_Y: i32 = 88;
 const PARAGRAPH_SELECTED_SLOT_HEIGHT: i32 = 82;
 const PARAGRAPH_BOTTOM_SLOT_Y: i32 = 184;
 const PARAGRAPH_BOTTOM_SLOT_HEIGHT: i32 = 44;
+const PARAGRAPH_CARD_X: i32 = 20;
+const PARAGRAPH_CARD_Y: i32 = 88;
+const PARAGRAPH_CARD_WIDTH: i32 = 304;
+const PARAGRAPH_CARD_HEIGHT: i32 = 82;
+const PARAGRAPH_CARD_LABEL_Y: i32 = 106;
+const PARAGRAPH_CARD_EXCERPT_Y: i32 = 126;
+const PARAGRAPH_CARD_HINT_X: i32 = 236;
+const PARAGRAPH_CARD_HINT_Y: i32 = 146;
+const PARAGRAPH_CARD_HINT_WIDTH: i32 = 72;
+const PARAGRAPH_CARD_HINT_HEIGHT: i32 = 16;
+const PARAGRAPH_FOOTER_Y: i32 = 231;
 const PAUSE_MODAL_CENTER_X: i32 = 200;
 const PAUSE_MODAL_CENTER_Y: i32 = 118;
 const PAUSE_MODAL_MIN_WIDTH: u32 = 112;
@@ -627,17 +638,6 @@ const fn paragraph_top_slot() -> CollectionRowSlot {
     )
 }
 
-const fn paragraph_selected_slot() -> CollectionRowSlot {
-    collection_slot(
-        34,
-        106,
-        126,
-        BinaryColor::Off,
-        PARAGRAPH_SELECTED_SLOT_Y,
-        PARAGRAPH_SELECTED_SLOT_HEIGHT,
-    )
-}
-
 const fn paragraph_bottom_slot() -> CollectionRowSlot {
     collection_slot(
         20,
@@ -654,14 +654,6 @@ fn paragraph_top_slot_spec() -> TextPairSlotSpec {
         slot: paragraph_top_slot(),
         font: ui_font_body(),
         max_width_px: 320,
-    }
-}
-
-fn paragraph_selected_slot_spec() -> TextPairSlotSpec {
-    TextPairSlotSpec {
-        slot: paragraph_selected_slot(),
-        font: ui_font_body(),
-        max_width_px: 290,
     }
 }
 
@@ -1272,33 +1264,30 @@ fn draw_paragraph_navigation_transition(
     }
 
     let offsets = slot_transition_offsets(direction, step, total_steps, PARAGRAPH_SLOT_TRAVEL_PX);
+    let from_top_line = paragraph_top_line(from);
+    let to_top_line = paragraph_top_line(to);
+    let from_bottom_primary = paragraph_bottom_primary_line(from);
+    let to_bottom_primary = paragraph_bottom_primary_line(to);
+    let from_bottom_secondary = paragraph_bottom_secondary_line(from);
+    let to_bottom_secondary = paragraph_bottom_secondary_line(to);
 
     draw_paragraph_navigation_chrome(frame, to);
     draw_text_pair_slot_transition(
         frame,
-        from.previous_top.as_str(),
+        from_top_line.as_str(),
         None,
-        to.previous_top.as_str(),
+        to_top_line.as_str(),
         None,
         paragraph_top_slot_spec(),
         offsets,
     );
-    fill_rect(frame, 20, 88, 304, 82, BinaryColor::On);
+    draw_paragraph_selected_card_transition(frame, from, to, offsets);
     draw_text_pair_slot_transition(
         frame,
-        from.selected_label.as_str(),
-        Some(from.selected_excerpt.as_str()),
-        to.selected_label.as_str(),
-        Some(to.selected_excerpt.as_str()),
-        paragraph_selected_slot_spec(),
-        offsets,
-    );
-    draw_text_pair_slot_transition(
-        frame,
-        from.previous_bottom.as_str(),
-        Some(from.final_excerpt.as_str()),
-        to.previous_bottom.as_str(),
-        Some(to.final_excerpt.as_str()),
+        from_bottom_primary.as_str(),
+        from_bottom_secondary.as_ref().map(|line| line.as_str()),
+        to_bottom_primary.as_str(),
+        to_bottom_secondary.as_ref().map(|line| line.as_str()),
         paragraph_bottom_slot_spec(),
         offsets,
     );
@@ -1328,28 +1317,241 @@ fn draw_paragraph_navigation_chrome(frame: &mut FrameBuffer, shell: &ParagraphNa
         ui_font_body(),
         BinaryColor::On,
     );
+    draw_text(
+        frame,
+        "TURN BROWSE",
+        Point::new(20, PARAGRAPH_FOOTER_Y),
+        ui_font_small(),
+        BinaryColor::On,
+        Alignment::Left,
+    );
+    draw_text_right(
+        frame,
+        "HOLD BACK",
+        Point::new(324, PARAGRAPH_FOOTER_Y),
+        ui_font_small(),
+        BinaryColor::On,
+    );
 }
 
 fn draw_paragraph_body(frame: &mut FrameBuffer, shell: &ParagraphNavigationShell) {
+    let top_line = paragraph_top_line(shell);
+    let bottom_primary = paragraph_bottom_primary_line(shell);
+    let bottom_secondary = paragraph_bottom_secondary_line(shell);
+
+    draw_text_pair_slot(frame, top_line.as_str(), None, paragraph_top_slot_spec());
+    draw_paragraph_selected_card(frame, shell);
     draw_text_pair_slot(
         frame,
-        shell.previous_top.as_str(),
-        None,
-        paragraph_top_slot_spec(),
-    );
-    fill_rect(frame, 20, 88, 304, 82, BinaryColor::On);
-    draw_text_pair_slot(
-        frame,
-        shell.selected_label.as_str(),
-        Some(shell.selected_excerpt.as_str()),
-        paragraph_selected_slot_spec(),
-    );
-    draw_text_pair_slot(
-        frame,
-        shell.previous_bottom.as_str(),
-        Some(shell.final_excerpt.as_str()),
+        bottom_primary.as_str(),
+        bottom_secondary.as_ref().map(|line| line.as_str()),
         paragraph_bottom_slot_spec(),
     );
+}
+
+fn draw_paragraph_selected_card(frame: &mut FrameBuffer, shell: &ParagraphNavigationShell) {
+    fill_rect(
+        frame,
+        PARAGRAPH_CARD_X,
+        PARAGRAPH_CARD_Y,
+        PARAGRAPH_CARD_WIDTH,
+        PARAGRAPH_CARD_HEIGHT,
+        BinaryColor::On,
+    );
+    stroke_rect(
+        frame,
+        PARAGRAPH_CARD_X,
+        PARAGRAPH_CARD_Y,
+        PARAGRAPH_CARD_WIDTH,
+        PARAGRAPH_CARD_HEIGHT,
+        BinaryColor::Off,
+    );
+    draw_text(
+        frame,
+        shell.selected_label.as_str(),
+        Point::new(34, PARAGRAPH_CARD_LABEL_Y),
+        ui_font_small(),
+        BinaryColor::Off,
+        Alignment::Left,
+    );
+    draw_text_ellipsized(
+        frame,
+        shell.selected_excerpt.as_str(),
+        Point::new(34, PARAGRAPH_CARD_EXCERPT_Y),
+        ui_font_body(),
+        BinaryColor::Off,
+        Alignment::Left,
+        276,
+    );
+    draw_paragraph_selected_hint(frame);
+}
+
+fn draw_paragraph_selected_card_transition(
+    frame: &mut FrameBuffer,
+    from: &ParagraphNavigationShell,
+    to: &ParagraphNavigationShell,
+    offsets: SlotTransitionOffsets,
+) {
+    let clip = ClipRect {
+        x: PARAGRAPH_CARD_X,
+        y: PARAGRAPH_CARD_Y,
+        width: PARAGRAPH_CARD_WIDTH,
+        height: PARAGRAPH_CARD_HEIGHT,
+    };
+
+    fill_rect(
+        frame,
+        PARAGRAPH_CARD_X,
+        PARAGRAPH_CARD_Y,
+        PARAGRAPH_CARD_WIDTH,
+        PARAGRAPH_CARD_HEIGHT,
+        BinaryColor::On,
+    );
+    stroke_rect(
+        frame,
+        PARAGRAPH_CARD_X,
+        PARAGRAPH_CARD_Y,
+        PARAGRAPH_CARD_WIDTH,
+        PARAGRAPH_CARD_HEIGHT,
+        BinaryColor::Off,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        from.selected_label.as_str(),
+        ui_font_small(),
+        ClippedTextSpec {
+            position: Point::new(34, PARAGRAPH_CARD_LABEL_Y + offsets.outgoing),
+            color: BinaryColor::Off,
+            alignment: Alignment::Left,
+            max_width_px: 180,
+        },
+        clip,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        to.selected_label.as_str(),
+        ui_font_small(),
+        ClippedTextSpec {
+            position: Point::new(34, PARAGRAPH_CARD_LABEL_Y + offsets.incoming),
+            color: BinaryColor::Off,
+            alignment: Alignment::Left,
+            max_width_px: 180,
+        },
+        clip,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        from.selected_excerpt.as_str(),
+        ui_font_body(),
+        ClippedTextSpec {
+            position: Point::new(34, PARAGRAPH_CARD_EXCERPT_Y + offsets.outgoing),
+            color: BinaryColor::Off,
+            alignment: Alignment::Left,
+            max_width_px: 276,
+        },
+        clip,
+    );
+    draw_text_ellipsized_clipped(
+        frame,
+        to.selected_excerpt.as_str(),
+        ui_font_body(),
+        ClippedTextSpec {
+            position: Point::new(34, PARAGRAPH_CARD_EXCERPT_Y + offsets.incoming),
+            color: BinaryColor::Off,
+            alignment: Alignment::Left,
+            max_width_px: 276,
+        },
+        clip,
+    );
+    draw_paragraph_selected_hint(frame);
+}
+
+fn draw_paragraph_selected_hint(frame: &mut FrameBuffer) {
+    stroke_rect(
+        frame,
+        PARAGRAPH_CARD_HINT_X,
+        PARAGRAPH_CARD_HINT_Y,
+        PARAGRAPH_CARD_HINT_WIDTH,
+        PARAGRAPH_CARD_HINT_HEIGHT,
+        BinaryColor::Off,
+    );
+    draw_text(
+        frame,
+        "CLICK JUMP",
+        Point::new(PARAGRAPH_CARD_HINT_X + 8, PARAGRAPH_CARD_HINT_Y + 4),
+        ui_font_small(),
+        BinaryColor::Off,
+        Alignment::Left,
+    );
+}
+
+fn paragraph_top_line(
+    shell: &ParagraphNavigationShell,
+) -> HeaplessString<NORMALIZED_TEXT_MAX_BYTES> {
+    if shell.current_index <= 1 || shell.previous_top.is_empty() {
+        let mut line = HeaplessString::new();
+        let _ = line.push_str("START OF ARTICLE");
+        return line;
+    }
+
+    paragraph_preview_line("PREV", shell.current_index - 1, shell.previous_top.as_str())
+}
+
+fn paragraph_bottom_primary_line(
+    shell: &ParagraphNavigationShell,
+) -> HeaplessString<NORMALIZED_TEXT_MAX_BYTES> {
+    if shell.current_index >= shell.total || shell.previous_bottom.is_empty() {
+        let mut line = HeaplessString::new();
+        let _ = line.push_str("END OF ARTICLE");
+        return line;
+    }
+
+    paragraph_preview_line(
+        "NEXT",
+        shell.current_index + 1,
+        shell.previous_bottom.as_str(),
+    )
+}
+
+fn paragraph_bottom_secondary_line(
+    shell: &ParagraphNavigationShell,
+) -> Option<HeaplessString<NORMALIZED_TEXT_MAX_BYTES>> {
+    if shell.current_index.saturating_add(1) >= shell.total || shell.final_excerpt.is_empty() {
+        return None;
+    }
+
+    Some(paragraph_preview_line(
+        "THEN",
+        shell.current_index + 2,
+        shell.final_excerpt.as_str(),
+    ))
+}
+
+fn paragraph_preview_line(
+    prefix: &str,
+    paragraph_index: u16,
+    preview: &str,
+) -> HeaplessString<NORMALIZED_TEXT_MAX_BYTES> {
+    let mut line = HeaplessString::new();
+    let _ = line.push_str(prefix);
+    let _ = line.push(' ');
+    push_padded_decimal(&mut line, paragraph_index);
+    if !preview.is_empty() {
+        let _ = line.push_str("  ");
+        let _ = line.push_str(preview);
+    }
+    line
+}
+
+fn push_padded_decimal<const N: usize>(target: &mut HeaplessString<N>, value: u16) {
+    let clamped = value.min(999);
+    if clamped >= 100 {
+        let _ = target.push((b'0' + ((clamped / 100) % 10) as u8) as char);
+    } else {
+        let _ = target.push('0');
+    }
+    let _ = target.push((b'0' + ((clamped / 10) % 10) as u8) as char);
+    let _ = target.push((b'0' + (clamped % 10) as u8) as char);
 }
 
 fn draw_settings(frame: &mut FrameBuffer, shell: &SettingsShell, step: u8, total_steps: u8) {
@@ -2332,6 +2534,8 @@ mod tests {
     }
 
     fn make_paragraph_shell(
+        current_index: u16,
+        total: u16,
         selected_index: u8,
         top: &'static str,
         label: &'static str,
@@ -2342,6 +2546,8 @@ mod tests {
         ParagraphNavigationShell {
             appearance: AppearanceMode::Light,
             title: InlineText::from_slice("PARAGRAPHS"),
+            current_index,
+            total,
             counter: InlineText::from_slice("4 / 12"),
             previous_top: InlineText::from_slice(top),
             selected_label: InlineText::from_slice(label),
@@ -2720,6 +2926,8 @@ mod tests {
     #[test]
     fn paragraph_transition_frames_stay_within_selector_rows() {
         let from = make_paragraph_shell(
+            4,
+            12,
             2,
             "A previous top preview",
             "P4",
@@ -2728,6 +2936,8 @@ mod tests {
             "Final excerpt for paragraph",
         );
         let to = make_paragraph_shell(
+            5,
+            12,
             3,
             "Selected paragraph excerpt",
             "P5",
@@ -2763,9 +2973,9 @@ mod tests {
             diff_dirty_rows(&frame_1, &frame_2),
             diff_dirty_rows(&frame_2, &frame_3),
         ] {
-            assert!(dirty.count() <= 191, "dirty rows={}", dirty.count());
+            assert!(dirty.count() <= 200, "dirty rows={}", dirty.count());
             for row in dirty.iter() {
-                assert!((40..231).contains(&row), "unexpected dirty row {row}");
+                assert!((40..240).contains(&row), "unexpected dirty row {row}");
             }
         }
     }
