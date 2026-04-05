@@ -69,6 +69,7 @@ const HTTP_BODY_TIMEOUT_SECS: u64 = 15;
 const HTTP_STREAM_BODY_TIMEOUT_SECS: u64 = 25;
 const REQUEST_NETWORK_READY_TIMEOUT_SECS: u64 = 6;
 const REQUEST_STREAMING_NETWORK_READY_TIMEOUT_SECS: u64 = 12;
+const PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS: u64 = 30;
 const REQUEST_NETWORK_READY_POLL_MS: u64 = 250;
 // Real device traces showed that an aggressive background `/device/v1/me`
 // keepalive could kill an otherwise healthy reusable TLS session between two
@@ -2222,8 +2223,18 @@ async fn wait_for_backend_request_path_ready(
     } else {
         REQUEST_NETWORK_READY_TIMEOUT_SECS
     };
+    let package_retry_wait = streaming && reason == "package_retry";
     let timeout_ms = Duration::from_secs(timeout_secs).as_millis();
+    let max_timeout_ms = if package_retry_wait {
+        Duration::from_secs(PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS).as_millis()
+    } else {
+        timeout_ms
+    };
     let mut logged_wait = false;
+    let mut last_progress_ms = started_ms;
+    let mut previous_link_up = stack.is_link_up();
+    let mut previous_has_ip = current_network_address(stack).is_some();
+    let mut previous_backend_path_ready = crate::internet::backend_path_ready();
 
     loop {
         let link_up = stack.is_link_up();
@@ -2241,7 +2252,39 @@ async fn wait_for_backend_request_path_ready(
         }
 
         let waited_ms = elapsed_since_ms(started_ms);
-        if waited_ms >= timeout_ms {
+        if package_retry_wait {
+            let has_ip = network_address.is_some();
+            let link_restored = !previous_link_up && link_up;
+            let ip_restored = !previous_has_ip && has_ip;
+            let path_restored = !previous_backend_path_ready && backend_path_ready;
+            if link_restored || ip_restored || path_restored {
+                last_progress_ms = now_ms();
+                info!(
+                    "backend request network progress path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
+                    path, reason, waited_ms, link_up, network_address, backend_path_ready,
+                );
+                log_request_phase(trace, path, "network_wait_progress", streaming, waited_ms);
+            }
+            previous_link_up = link_up;
+            previous_has_ip = has_ip;
+            previous_backend_path_ready = backend_path_ready;
+
+            let stalled_ms = elapsed_since_ms(last_progress_ms);
+            if waited_ms >= max_timeout_ms || stalled_ms >= timeout_ms {
+                info!(
+                    "backend request network wait timed out path={} reason={} wait_ms={} stalled_ms={} link_up={} network_ip={:?} backend_path_ready={}",
+                    path,
+                    reason,
+                    waited_ms,
+                    stalled_ms,
+                    link_up,
+                    network_address,
+                    backend_path_ready,
+                );
+                log_request_phase(trace, path, "network_wait_timeout", streaming, waited_ms);
+                return Err(BackendError::Connect);
+            }
+        } else if waited_ms >= timeout_ms {
             info!(
                 "backend request network wait timed out path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
                 path, reason, waited_ms, link_up, network_address, backend_path_ready,

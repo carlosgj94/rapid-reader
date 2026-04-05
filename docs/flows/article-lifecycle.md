@@ -1,164 +1,162 @@
 # Article Lifecycle
 
-This document traces one article through the target system from backend discovery to local reading
-and eventual progress sync.
+This document traces one article through the current Motif firmware and calls
+out where the implementation already matches the target architecture versus
+where it is still incomplete.
 
 ## Overview
 
-The product has two first-class upstream source classes:
+The product still has two first-class upstream source classes:
 
 - personal saved articles
 - editorial feed articles
 
-Both should flow through the same local pipeline after sync. Differences in source origin must not
-create separate reader implementations.
+The current firmware is much further along on the Saved path than on the full
+editorial-feed path, but the local package and reader pipeline is shared.
 
 ## Phase 1: Discovery
 
-The backend sync module refreshes source manifests when:
+Today discovery happens through backend sync after refresh-session success.
 
-- the device completes pairing
-- Wi-Fi becomes usable after being unavailable
-- the user requests manual refresh
-- a scheduled refresh window opens
+Current implemented behavior:
 
-The result of discovery is metadata and availability information, not yet a rendered article.
+- backend sync waits for backend-path readiness from the Wi-Fi module
+- it refreshes the access session
+- it fetches Saved content metadata in bounded pages
+- it publishes collection updates into the store
 
-At this stage the store should learn:
-
-- source membership
-- article identity and revision
-- ordering, recency, and source grouping
-- download status
-- whether a newer revision supersedes cached local content
+The important correctness change already landed: discovery is no longer blocked
+by one oversized buffered Saved response.
 
 ## Phase 2: Package Acquisition
 
-For articles that are missing or stale, backend sync requests a normalized article package from the
-backend.
+For articles that are missing locally, backend sync requests a normalized
+package from the backend.
 
-That package should be:
+Current implemented behavior:
 
-- source-agnostic
-- stable enough to cache locally
-- structured enough for the formatter to produce reading units without reparsing raw HTML
+- uncached opens trigger a streaming package request
+- the store can queue that open if the backend path is not yet usable
+- package bytes stream through the storage module instead of going directly to
+  the reader
+- retries coordinate with backend-path recovery rather than burning all attempts
+  blindly on a marginal link
 
-The package is written through the storage module, not directly by sync.
+This path is now materially faster than the original baseline, but it still
+fails sometimes when DNS, Wi-Fi, or TLS churn.
 
 ## Phase 3: Local Materialization
 
-Once an article package lands locally:
+The storage layer now performs real staging and commit work on SD.
 
-- storage records availability and revision information
-- the content slice reflects that the article can be opened offline
-- formatter work can run immediately or lazily, depending on policy
+Current implemented behavior:
 
-The system should separate package presence from formatter readiness. An article can be downloaded
-before it is fully prepared for reading.
+- package chunks are staged through the storage queue
+- the active stage file stays open during the download
+- free-slot downloads can write directly to the final package slot
+- successful uncached opens can commit and open immediately
+- failed prepares abort the stage instead of leaving partial packages live
 
-## Phase 4: Formatting
+This means package presence and reader open are now much closer together in the
+uncached-open path than they were originally.
 
-The formatter consumes the normalized article package and produces a reading-oriented representation.
+## Phase 4: Reader Materialization
 
-The output should include:
+Once the package is committed:
 
-- RSVP-ready reading units
-- stable anchors for resume and navigation
-- derived metadata needed by the reader UI
-- any formatter warnings or degradation markers
+- storage opens the cached reader package
+- paragraph metadata and the initial reader window are materialized
+- the store opens the reader session and transitions the UI to Reader
 
-Formatter output should be cacheable so active reading does not repeatedly redo the same work.
+Current reader/storage working sets now prefer PSRAM where safe, which reduces
+internal-memory pressure during open and paging.
 
 ## Phase 5: Queue Presentation
 
-The queue or library surface is derived from selectors over the store. It should combine:
+The Saved view is derived from store-backed collection state.
 
-- source grouping
-- freshness state
-- local availability
-- reading progress
-- pinning or saved-state metadata
+Current implemented behavior:
 
-The app should not separately query services to build the queue screen. It should read a prepared
-view model from selectors.
+- metadata can appear before the package is local
+- package state is surfaced per item
+- uncached taps while the backend is not usable are now queued instead of being
+  dropped
+- a queued item stays visibly `Fetching` across collection refreshes
+
+This is important because the device can spend several seconds recovering from
+network instability, and the queue now reflects that work instead of hiding it.
 
 ## Phase 6: Active Reading Session
 
 When the user opens an article:
 
 - the reader slice creates or restores a session
-- the app runtime renders the reader surface from a reader view model
-- the formatter output feeds the RSVP presentation logic
-- progress updates are persisted locally as the user advances
+- the app runtime renders the reader surface from the reader model
+- later paging can trigger additional reader-window loads from storage
 
-Reading must continue without Wi-Fi. Network state may affect badges or deferred sync, but should
-not stall the reading session.
+Reading remains offline-capable once the package is local.
 
-## Phase 7: Local Progress Persistence
+## Phase 7: Sleep And Long Operations
 
-Local persistence should happen before remote sync is attempted.
+The current firmware now suppresses inactivity sleep during active fetching so
+the device does not deep-sleep in the middle of an uncached package open.
 
-The local progress record should be sufficient to restore:
+That safeguard now depends on both:
 
-- current article identity
-- current position anchor
-- reader speed and session context where appropriate
-- last-read timestamps and completion markers
+- the fetching state being visible in the collection UI
+- the pending prepare staying selected across collection refreshes
 
-The device should always prefer local continuity over waiting for backend confirmation.
+This is now part of the real lifecycle for long-running uncached opens.
 
-## Phase 8: Progress And State Sync
+## Phase 8: Progress And Sync
 
-When network and backend state allow it, backend sync uploads:
+This area is still incomplete.
 
-- read progress
-- completion or dismissal state
-- source-level refresh acknowledgements if needed
-
-The system should tolerate delayed progress upload. Local truth should remain usable while remote
-reconciliation is pending.
-
-## Refresh And Revision Handling
-
-If a backend refresh provides a newer article revision:
-
-- the new package should be staged before it replaces the old one
-- existing local progress should be preserved where anchors remain valid
-- if anchors become incompatible, the reader should fall back to the closest safe restore point
-
-The user experience should favor predictable resume behavior over aggressive replacement.
+The current firmware can open and read backend-provided packages, but it still
+does not complete the full remote progress-upload story described in the target
+architecture.
 
 ## Failure Handling
 
-### No Wi-Fi
+### No Wi-Fi Or No Backend Path
 
-- queue and reader continue from local data
-- refresh jobs remain pending
-- progress stays queued for later upload
+- cached reading still works
+- Saved metadata can remain visible from prior sync
+- uncached opens may queue until the backend path becomes usable
+- if recovery fails for long enough, the open eventually fails cleanly
 
 ### Package Download Failure
 
-- manifest metadata may still appear in the queue
-- the article should be marked unavailable offline until package acquisition succeeds
+- the article remains listed in the queue
+- the stage is aborted rather than partially committed
+- package state leaves `Fetching` and the user can try again later
 
-### Formatter Failure
+### DNS / TLS / Transport Failure
 
-- the article remains present in storage
-- the UI should surface that the content could not be prepared for reading
-- failure state should not corrupt unrelated articles or queue state
+This is now the dominant remaining failure class.
+
+Current package opens can still fail because of:
+
+- DNS failure on device
+- TLS handshake timeout
+- request flush or body-read instability
+- Wi-Fi disconnect/reassociate churn
+
+This is the main reliability frontier now that storage throughput is no longer
+the first bottleneck.
 
 ### SD Unavailable
 
-- storage should mark content availability as degraded
-- queue selectors should reflect the missing local package state
-- settings and device state in internal storage should remain intact
+- content availability degrades
+- internal flash state remains intact
+- queue selectors should still reflect that local package access is degraded
 
 ## Architectural Consequence
 
-This lifecycle requires four boundaries to stay explicit:
+The same boundary rule still holds:
 
-- backend sync owns remote protocol
-- storage owns persistence
-- formatter owns reading preparation
-- app/UI runtime consumes selectors and never reconstructs the pipeline itself
-
+- Wi-Fi owns connectivity evidence
+- backend sync owns remote protocol and retry policy
+- storage owns staging, commit, and local package opening
+- the store coordinates user-visible state
+- app/UI consumes selectors and should not reconstruct the pipeline itself

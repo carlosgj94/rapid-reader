@@ -2,68 +2,93 @@
 
 ## Purpose
 
-The backend sync module is the device's bridge to remote product state.
+Backend sync is the device's bridge to remote product state.
 
-It will eventually own:
+It owns:
 
-- device pairing validation
-- source manifest refresh
-- article package acquisition
-- progress upload
-- sync scheduling and retry policy
+- refresh-token based session renewal
+- saved/recommendation collection refresh
+- normalized article package acquisition
+- transport retry policy above the Wi-Fi layer
+- publication of sync/content availability into the store
 
-It depends on Wi-Fi availability, but it is not the Wi-Fi module.
+It depends on Wi-Fi/backend-path readiness, but it is not the Wi-Fi module.
 
-## Current Status
+## Current Implemented State
 
-Backend sync is still a skeleton.
+Backend sync is no longer a skeleton.
 
-What exists today:
+The current firmware in `crates/platform-esp32s3/src/backend.rs` now implements:
 
-- architecture docs for the module boundary
-- a no-op backend sync service boundary in the services crate
+- refresh-session exchange against `/device/v1/auth/session/refresh`
+- paginated Saved collection refresh with bounded page size
+- streaming package fetch for uncached articles
+- reusable access sessions plus serialized TLS session resumption
+- package retry and recovery logic that coordinates with backend-path readiness
+- direct handoff into storage staging/commit/open flows
+- typed status publication back into the store
 
-What does not exist yet:
+On a blank card, Saved can now repopulate and uncached article opens can
+complete without relying on oversized buffered responses.
 
-- device pairing exchange
-- manifest refresh
-- content downloads
-- progress upload
-- retry and backoff orchestration
+## Current Runtime Shape
 
-## Pairing Model
+At a high level the current flow is:
 
-The target v1 identity model is a paired device token rather than a full login UI on-device.
+1. wait for backend-path readiness from the Wi-Fi layer
+2. refresh the access session
+3. fetch Saved metadata in bounded pages
+4. publish collection updates into the store
+5. on uncached open, stream the package through storage
+6. commit and open the package locally
 
-That implies:
+When the path is healthy, current package fetch timings are already
+substantially improved from the original baseline. Recent successful runs show:
 
-- the device is paired once through provisioning
-- the resulting credential is stored locally
-- later sync traffic uses that device identity
+- `54067` byte package in about `4476 ms`
+- `140395` byte package in about `10002 ms`
+- `219227` byte package in about `13702 ms`
 
-Provisioning owns the onboarding session that delivers pairing material. Backend sync takes over
-after the device has network connectivity and needs to validate or use that credential.
+That means backend sync is no longer dominated by the old SD/package pipeline.
 
-## Sync Responsibilities
+## Current Remaining Problems
 
-The sync module should eventually coordinate:
+The main remaining failures are network-side, not storage-side:
 
-1. refresh source manifests
-2. compare remote article revisions with local availability
-3. schedule package downloads through storage
-4. publish availability changes into the store
-5. upload progress and local state changes when possible
+- DNS failure on device
+- occasional TLS handshake timeout
+- occasional request flush / body-read instability
+- Wi-Fi disconnects that force package-recovery paths
 
-## Offline Behavior
+When these occur, backend sync can still fail an uncached article open even
+though the happy path is now fast.
 
-If the device is offline:
+## Pairing And Credential Model
 
-- the reader operates from local content
-- freshness becomes stale rather than invalid
-- pending sync work accumulates locally
-- work resumes when connectivity returns
+The current implementation still assumes a stored refresh token / device-side
+credential rather than a full login UI. Provisioning remains the source of that
+credential; backend sync owns using and refreshing it.
 
 ## Storage Boundary
 
-Backend sync should not write raw files or flash records directly. It should ask the storage module
-to stage and commit durable data so persistence policy stays in one place.
+Backend sync still must not write raw files directly. It asks storage to:
+
+- begin package staging
+- append package chunks
+- commit or abort staged content
+- open committed reader content
+
+That keeps persistence policy and recovery logic inside the storage boundary.
+
+## Still Missing
+
+The architecture still has important unfinished areas:
+
+- progress upload and remote reconciliation
+- explicit last-good-endpoint fallback when DNS fails
+- request-class specific timeout policy cleanly documented and tuned
+- compile-time TLS feature pruning
+- long-run soak metrics and service-level reliability reporting
+
+Those are now the next frontier for turning the current implementation from a
+working prototype into a more production-grade network client.

@@ -150,6 +150,30 @@ SD remains the place for heavier payloads:
 
 Internal flash must stay small, durable, and cheap to recover.
 
+## Current SD Package Pipeline
+
+The SD path is now much more concrete than the original architecture notes.
+
+Current implemented behavior includes:
+
+- bounded streaming package writes through the storage command path
+- open-handle staging so the active file is not reopened for every chunk
+- asynchronous queued package writes instead of an ACK-blocking round trip per
+  chunk
+- direct writes to a free final package slot where safe, with `copied_bytes=0`
+  on commit
+- immediate open-after-commit for uncached article prepares
+- runtime SD SPI that initializes conservatively at `400 kHz` and switches to
+  `8 MHz` after mount
+
+Current package/stage buffers are intentionally much larger than the original
+baseline:
+
+- package download chunk length: `8192` bytes
+- stage write chunk length: `8192` bytes
+
+That work removed SD throughput as the primary bottleneck on healthy runs.
+
 ## Guarantees and Non-Goals
 
 Current guarantees:
@@ -181,10 +205,15 @@ What exists now:
 - startup configuration now logs the effective hydrated settings after that record is applied
 - recovery, compaction, and queue semantics
 - storage health reporting during boot
+- persisted backend credential records used by refresh/session startup
+- a real SD-backed content/package pipeline with staging, commit, abort, and
+  cached package open flows
+- PSRAM-backed reader/storage working sets for initial package open and reader
+  materialization
 
 What does not exist yet:
 
-- a dedicated async storage task
 - Wi-Fi credential records
-- backend token records
-- integration with sync and broader app-level persistence beyond settings snapshots
+- broader app-level persistence beyond settings snapshots and current content
+  metadata
+- persisted local reading-progress records and remote progress upload

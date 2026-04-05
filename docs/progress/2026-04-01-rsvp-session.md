@@ -2,6 +2,10 @@
 
 This note summarizes the concrete implementation progress completed in the April 1, 2026 session.
 
+Some "still missing" items listed here were addressed in later sessions. See
+[Session Progress: Network Reliability And Throughput](2026-04-05-network-reliability-and-throughput.md)
+for the newer backend/content pipeline status.
+
 ## Implemented
 
 - Replaced the static RSVP placeholder with a real mock-backed reading engine driven from the

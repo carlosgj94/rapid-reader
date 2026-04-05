@@ -15,6 +15,10 @@ current firmware now includes:
 - a selector-driven app runtime with prepared screens and display-friendly transitions
 - a mock-script-backed RSVP reader with timed playback, pause, paragraph navigation, and chat mode
 - a theme-aware renderer with persisted appearance and reader-preference settings
+- real station-mode Wi-Fi with reconnect, DHCP/IP state, and backend-path probing
+- real backend refresh, paginated Saved sync, and streaming package acquisition
+- SD-backed package staging/commit/open flows with PSRAM-backed reader working sets
+- uncached article opens that can queue across startup/network wobble and resume automatically
 - skeletal provisioning interfaces for BLE-first onboarding
 
 The docs below call out when a section describes the current implementation versus the longer-term
@@ -50,6 +54,7 @@ The target product loop is:
 13. [Sleep](modules/sleep.md)
 14. [Power Placeholder](modules/power.md)
 15. [Session Progress: RSVP, Theme, And Persistence](progress/2026-04-01-rsvp-session.md)
+16. [Session Progress: Network Reliability And Throughput](progress/2026-04-05-network-reliability-and-throughput.md)
 
 ## System At A Glance
 
@@ -77,10 +82,16 @@ Today the codebase concretely implements:
 - persistence of user settings snapshots through the storage module and platform effect handling
 - selector-driven prepared screens and renderer transition planning
 - a formatter-backed mock RSVP reading flow with timed reader ticks and paragraph anchors
+- real Wi-Fi station connectivity with backend-path readiness probing
+- backend refresh-token exchange, paginated Saved sync, and streaming package fetch
+- SD-backed content staging, commit, cached package open, and reader-window loading
+- PSRAM-backed request buffers plus selected reader/storage working sets
+- measured throughput and retry improvements across the uncached-open path
 - skeletal provisioning interfaces and BLE-first onboarding documentation
 
-The codebase does not yet implement the full backend-driven content, sync, provisioning, or
-storage-backed reading-progress systems described elsewhere in these docs.
+The codebase still does not yet implement the full provisioning and
+progress-upload systems described elsewhere in these docs, and the networking
+stack still needs more reliability hardening around DNS, TLS, and Wi-Fi churn.
 
 ## Current Hardware References
 

@@ -2,10 +2,10 @@
 
 ## Purpose
 
-The store is the authoritative runtime state container for everything the user can observe or that
-other modules need to reason about coherently.
+The store is the authoritative runtime state container for everything the user
+can observe or that multiple modules need to reason about coherently.
 
-It exists to provide:
+It provides:
 
 - one place to derive UI read models from
 - one mutation path for domain state
@@ -13,9 +13,9 @@ It exists to provide:
 
 It does not exist to hold every object in the process.
 
-## What The Store Owns
+## Target Slice Layout
 
-The target slice layout is:
+The longer-term architecture still targets these slices:
 
 | Slice | Owns |
 | --- | --- |
@@ -32,47 +32,45 @@ The target slice layout is:
 | `sleep` | inactivity timeout, last activity, wake reason, sleep state |
 | `power` | placeholder for battery and charging state when hardware exists |
 
-## Current Implemented Subset
+## Current Implemented State
 
-The current `Store` implementation is intentionally much smaller than the target slice map.
-
-Today it concretely owns:
+The current `Store` in `crates/domain/src/store.rs` is no longer a tiny
+bootstrap shell. It now concretely owns:
 
 - `device`
-  boot origin and pairing state
+- `content`
 - `input`
-  last delivered gesture, delivered sequence, and reserved space for dropped-gesture diagnostics
+- `network`
+- `power`
 - `reader`
-  active article session, formatter output, playback mode, progress, and paragraph anchors
 - `settings`
-  live user preferences including timeout, reading speed, appearance, and topic preferences
 - `sleep`
-  inactivity timeout, last activity, wake reason, sleep state
 - `storage`
-  mount and free-space health mirror
+- `backend_sync`
+- `ui`
 
-The current mutation surface is still smaller than the target architecture, but no longer only a
-bootstrap skeleton:
+It also carries one important orchestration helper that is intentionally not a
+full slice: a `pending_prepare` request for uncached article opens.
 
-- `dispatch(Command::RequestDeepSleep)` requests deep sleep
-- `dispatch(Command::Ui(...))` routes encoder gestures through the current screen state
-- settings mutations emit typed persistence effects instead of writing to storage directly
-- `handle_event(Event::InputGestureReceived(...), now_ms)` records the gesture and mirrors
-  activity
-- `handle_event(Event::ReaderTick(...), now_ms)` advances timed RSVP playback
-- `Store::from_bootstrap(...)` hydrates device boot state, persisted settings, sleep, and storage
-  health before normal events begin
-- `handle_event(Event::WokeFromDeepSleep, now_ms)` updates wake state
+## Current Behavior
 
-At startup, the hydrated settings are also logged once so device logs show the effective live
-configuration after defaults and persisted values have been resolved.
+Today the store does real cross-module coordination, including:
 
-This is still not the finished application state model, but it now includes a real reader,
-settings persistence effects, and selector-driven UI state.
+- recording network-status changes and backend-sync status changes
+- queueing an uncached article open when the backend path is not yet usable
+- preserving the queued item's `Fetching` state across collection refreshes
+- auto-dispatching `PrepareContent(...)` once both network and backend sync are
+  in a usable state
+- restoring pending prepares if auth becomes invalid
+- opening committed reader content and loading later reader windows
+- keeping the fetching item selected so the UI reflects the active operation
+
+This means an impatient uncached tap during startup wobble is no longer just
+dropped on the floor.
 
 ## What The Store Must Not Own
 
-The following stay outside the store:
+The following still stay outside the store:
 
 - sockets and HTTP clients
 - Wi-Fi driver handles
@@ -86,7 +84,7 @@ Those belong to services, the platform layer, or the renderer.
 
 ## Mutation Model
 
-The recommended write path is:
+The current architecture still follows the same write path:
 
 1. a module or platform adapter dispatches a `Command`
 2. the store routes the command to the owning slice logic
@@ -96,72 +94,30 @@ The recommended write path is:
 6. services publish typed `Event` values back into the store
 7. selectors derive updated read models
 
-This model gives the benefits of a central store without introducing arbitrary cross-module writes.
-
-## Key Runtime Types
-
-- `Command`
-  A request to change domain state or trigger work.
-- `Event`
-  A fact that something already happened.
-- `Effect`
-  Work to be performed outside the store.
-- `Selector`
-  A read model builder that converts authoritative state into module- or UI-specific views.
-
-## Ownership Rules
-
-- Each slice owns its invariants.
-- A slice may read other slices when deriving behavior, but it should not directly mutate them.
-- Cross-slice coordination should happen through commands, events, and selectors.
-- Services never mutate state directly. They only feed the store through typed events.
-
-## Why This Is Better Than A Raw Singleton
-
-A raw singleton makes every module globally reachable and globally mutable. That becomes fragile
-quickly in Rust and becomes even harder to review when the code is heavily automated.
-
-This architecture keeps the user-visible advantages of a single source of truth while imposing:
-
-- explicit ownership
-- typed write paths
-- deterministic testing
-- narrow review surfaces
+That model is now exercising real network/content/storage behavior instead of
+only UI and settings.
 
 ## Local State Exceptions
 
-Some state should remain local and not be promoted into the store:
+These still should not be promoted into the store:
 
-- component-local ephemeral animation state
-- per-frame renderer bookkeeping
-- parser scratch state
-- transport retry internals that do not matter outside their service
+- transport retry internals that do not matter outside backend sync
+- parser and formatter scratch buffers
+- framebuffer or renderer frame-local bookkeeping
+- low-level Wi-Fi driver state
 
-The rule is simple: if other modules need to reason about it, persist it, or render it, it likely
-belongs in the store. If it is purely internal machinery, it likely does not.
+The rule remains: if multiple modules must reason about it, persist it, or
+render it, it probably belongs in the store. If it is just service machinery,
+it does not.
 
-## Selector Strategy
+## Current Missing Pieces
 
-Selectors should produce stable read models such as:
+The store is still not the final product model. Important gaps remain:
 
-- `QueueScreenModel`
-- `ReaderScreenModel`
-- `SettingsScreenModel`
-- `ConnectivityBadgeModel`
-- `SyncStatusModel`
-- `StorageHealthModel`
+- provisioning state is not yet first-class
+- remote progress upload/reconciliation is not represented end to end
+- some long-term content freshness and revision policy remains simplified
+- deeper battery/power state is still placeholder-only
 
-The app runtime should prefer consuming selectors instead of re-deriving UI state inside
-components.
-
-## Testing Consequences
-
-The store design should allow:
-
-- reducer tests for each slice
-- scenario tests that replay commands and events
-- deterministic selector tests
-- service contract tests with mocked effect execution
-
-The current store is already small enough to support deterministic tests around input delivery,
-sleep state transitions, and deep-sleep requests without requiring hardware.
+But the current store is already a real coordinator for network-aware article
+access, not just a UI state bag.
