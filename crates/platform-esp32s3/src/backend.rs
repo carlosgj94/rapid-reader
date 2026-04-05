@@ -64,7 +64,9 @@ const TRANSPORT_RETRY_BACKOFF_MS: u64 = 750;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
 const HTTP_BODY_TIMEOUT_SECS: u64 = 15;
+const HTTP_STREAM_BODY_TIMEOUT_SECS: u64 = 25;
 const REQUEST_NETWORK_READY_TIMEOUT_SECS: u64 = 6;
+const REQUEST_STREAMING_NETWORK_READY_TIMEOUT_SECS: u64 = 12;
 const REQUEST_NETWORK_READY_POLL_MS: u64 = 250;
 // Real device traces showed that an aggressive background `/device/v1/me`
 // keepalive could kill an otherwise healthy reusable TLS session between two
@@ -661,7 +663,7 @@ async fn backend_task(
             info!("backend network ready ip={:?}", network.address);
             log_heap("backend network ready");
             let mut tcp_client = BackendTcpClient::new(stack, tcp_state.as_ref());
-            tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
+            tcp_client.set_timeout(Some(Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS)));
 
             log_status(SyncStatus::RefreshingSession);
             crate::internet::set_probe_suspended(true);
@@ -2190,7 +2192,12 @@ async fn wait_for_backend_request_path_ready(
     }
 
     let started_ms = now_ms();
-    let timeout_ms = Duration::from_secs(REQUEST_NETWORK_READY_TIMEOUT_SECS).as_millis();
+    let timeout_secs = if streaming {
+        REQUEST_STREAMING_NETWORK_READY_TIMEOUT_SECS
+    } else {
+        REQUEST_NETWORK_READY_TIMEOUT_SECS
+    };
+    let timeout_ms = Duration::from_secs(timeout_secs).as_millis();
     let mut logged_wait = false;
 
     loop {
@@ -2702,7 +2709,25 @@ async fn await_body_io_timeout<T, F>(path: &str, stage: &str, future: F) -> Resu
 where
     F: Future<Output = Result<T, SessionError>>,
 {
-    with_timeout(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS), future)
+    await_body_io_timeout_for(
+        path,
+        stage,
+        Duration::from_secs(HTTP_BODY_TIMEOUT_SECS),
+        future,
+    )
+    .await
+}
+
+async fn await_body_io_timeout_for<T, F>(
+    path: &str,
+    stage: &str,
+    timeout: Duration,
+    future: F,
+) -> Result<T, BackendError>
+where
+    F: Future<Output = Result<T, SessionError>>,
+{
+    with_timeout(timeout, future)
         .await
         .map_err(|_| log_request_timeout(path, stage, BackendError::Io))?
         .map_err(|err| map_logged_session_error(path, stage, err))
@@ -3707,7 +3732,7 @@ async fn stream_https_response_body_to_storage(
     let mut header_buffer = allocate_stream_header_buffer(request.path)?;
     let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     let mut tcp_client = TcpClient::new(stack, tcp_state);
-    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
+    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS)));
     let ConnectedBackendSession {
         mut session,
         mut metrics,
@@ -4032,9 +4057,10 @@ where
                 let mut remaining = content_length - initial_body_len;
                 while remaining > 0 {
                     let read_len = remaining.min(chunk.len().saturating_sub(buffered_chunk_len));
-                    let read = await_body_io_timeout(
+                    let read = await_body_io_timeout_for(
                         path,
                         "stream response body read",
+                        Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS),
                         AsyncRead07::read(
                             session,
                             &mut chunk[buffered_chunk_len..buffered_chunk_len + read_len],
@@ -4104,9 +4130,10 @@ where
         if buffered_chunk_len == chunk.len() {
             flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
         }
-        let read = await_body_io_timeout(
+        let read = await_body_io_timeout_for(
             path,
             "stream response body read",
+            Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS),
             AsyncRead07::read(session, &mut chunk[buffered_chunk_len..]),
         )
         .await?;
@@ -4141,7 +4168,6 @@ where
         connection_reusable: false,
     })
 }
-
 async fn flush_buffered_package_chunk(
     trace: TraceContext,
     chunk: &mut [u8],
