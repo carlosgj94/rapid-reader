@@ -13,6 +13,7 @@ use ::services::storage::StorageError;
 use ::services::{input::InputService, sleep::SleepService};
 use alloc::boxed::Box;
 use app_runtime::{AppRuntime, PreparedScreen, Screen, ScreenUpdate, TransitionPlan};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either5, select, select5};
@@ -44,12 +45,16 @@ use crate::{
     renderer::{self, AnimationPlayback},
     sleep::enter_deep_sleep_with_button,
     storage::PlatformStorageService,
+    telemetry::{bool_flag, capture_heap},
 };
 
 const DISPLAY_SPI_HZ: u32 = 2_000_000;
-const SD_SPI_HZ: u32 = 400_000;
+const SD_SPI_INIT_HZ: u32 = 400_000;
+const SD_SPI_RUN_HZ: u32 = 8_000_000;
 const INPUT_POLL_MS: u64 = 2;
 const READER_TICK_MS: u64 = 20;
+const RECLAIMED_INTERNAL_HEAP_BYTES: usize = 64 * 1024;
+const PRIMARY_INTERNAL_HEAP_BYTES: usize = 96 * 1024;
 // TimedEvent can carry whole manifest snapshots, so this queue must stay small.
 const APP_EVENT_QUEUE_CAPACITY: usize = 8;
 const PLATFORM_COMMAND_QUEUE_CAPACITY: usize = 4;
@@ -295,7 +300,9 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
 
 pub async fn run_minimal(spawner: Spawner) -> ! {
     let board = BoardConfig::new();
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let config = esp_hal::Config::default()
+        .with_cpu_clock(CpuClock::max())
+        .with_psram(esp_hal::psram::PsramConfig::default());
     let peripherals = esp_hal::init(config);
 
     let boot_reset_reason = reset_reason(Cpu::ProCpu);
@@ -306,9 +313,53 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         boot_reset_reason, boot_wakeup_cause, woke_from_deep_sleep
     );
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 64 * 1024);
+    let (psram_start, psram_mapped_bytes) = esp_hal::psram::psram_raw_parts(&peripherals.PSRAM);
+    let psram_detected = psram_mapped_bytes > 0;
+
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: RECLAIMED_INTERNAL_HEAP_BYTES);
+    // Ticket 07 phase 2: reclaim part of the SRAM we freed from oversized
+    // embassy task pools by growing the primary internal allocator region.
+    esp_alloc::heap_allocator!(size: PRIMARY_INTERNAL_HEAP_BYTES);
+    if psram_detected {
+        unsafe {
+            esp_alloc::HEAP.add_region(esp_alloc::HeapRegion::new(
+                psram_start,
+                psram_mapped_bytes,
+                esp_alloc::MemoryCapability::External.into(),
+            ));
+        }
+    }
+    let heap = capture_heap();
+    if psram_detected {
+        info!(
+            "boot psram detected=true mapped_start=0x{:x} mapped_bytes={} external_regions={} external_heap_size={} external_heap_free={}",
+            psram_start as usize,
+            psram_mapped_bytes,
+            heap.external_regions,
+            heap.external_size,
+            heap.external_free,
+        );
+    } else {
+        info!(
+            "boot psram detected=false mapped_bytes=0 external_regions=0 external_heap_size=0 external_heap_free=0"
+        );
+    }
     log_heap("after heap init");
+    log_static_inventory();
+    crate::memory_policy::log_policy_inventory();
+    backend::log_static_inventory();
+    content_storage::log_static_inventory();
+    crate::memtrace!(
+        "boot_state",
+        "component" = "bootstrap",
+        "at_ms" = Instant::now().as_millis(),
+        "action" = "heap_initialized",
+        "woke_from_deep_sleep" = bool_flag(woke_from_deep_sleep),
+        "psram_detected" = bool_flag(psram_detected),
+        "psram_mapped_start" = psram_start as usize,
+        "psram_mapped_bytes" = psram_mapped_bytes,
+        "psram_heap_region_added" = bool_flag(psram_detected),
+    );
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
@@ -330,7 +381,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         }
     };
     let sd_spi_config = esp_hal::spi::master::Config::default()
-        .with_frequency(Rate::from_hz(SD_SPI_HZ))
+        .with_frequency(Rate::from_hz(SD_SPI_INIT_HZ))
         .with_mode(esp_hal::spi::Mode::_0);
     let sd_spi = Spi::new(peripherals.SPI3, sd_spi_config)
         .unwrap()
@@ -338,7 +389,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         .with_mosi(peripherals.GPIO40)
         .with_miso(peripherals.GPIO41);
     let sd_cs = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
-    let content_mount = content_storage::mount(sd_spi, sd_cs);
+    let content_mount = content_storage::mount(sd_spi, sd_cs, SD_SPI_RUN_HZ);
     let mut storage_health = storage.health_snapshot().with_sd_card(
         content_mount.sd_card_ready,
         content_mount.sd_total_bytes,
@@ -352,6 +403,16 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     }
     info!("storage health={:?}", storage_health);
     log_heap("after content mount");
+    crate::memtrace!(
+        "boot_state",
+        "component" = "bootstrap",
+        "at_ms" = Instant::now().as_millis(),
+        "action" = "content_mount",
+        "sd_card_ready" = bool_flag(content_mount.sd_card_ready),
+        "sd_total_bytes" = content_mount.sd_total_bytes,
+        "sd_free_bytes" = content_mount.sd_free_bytes,
+        "last_recovery" = storage_health.last_recovery as u8,
+    );
 
     let boot_ms = Instant::now().as_millis();
     let boot_state = if woke_from_deep_sleep {
@@ -439,70 +500,59 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     let mut input_tick = Ticker::every(Duration::from_millis(INPUT_POLL_MS));
     let mut ui_tick = Ticker::every(Duration::from_millis(renderer::UI_TICK_MS));
     let mut reader_tick = Ticker::every(Duration::from_millis(READER_TICK_MS));
+    let event_loop = crate::memory_policy::try_external_pinned_box(async move {
+        loop {
+            let suppress_sleep = current_prepared_screen(animation, committed_update)
+                .is_some_and(|screen| prepared_screen_suppresses_sleep(&screen));
+            let sleep_deadline = next_sleep_deadline(sleep.model(), suppress_sleep);
+            let display_deadline =
+                next_display_deadline(next_animation_deadline, next_heartbeat_deadline);
 
-    loop {
-        let suppress_sleep = current_prepared_screen(animation, committed_update)
-            .is_some_and(|screen| prepared_screen_suppresses_sleep(&screen));
-        let sleep_deadline = next_sleep_deadline(sleep.model(), suppress_sleep);
-        let display_deadline =
-            next_display_deadline(next_animation_deadline, next_heartbeat_deadline);
+            match select5(
+                input_tick.next(),
+                select(ui_tick.next(), reader_tick.next()),
+                Timer::at(sleep_deadline),
+                PLATFORM_CMD_CH.receive(),
+                select(Timer::at(display_deadline), SCREEN_SIGNAL.wait()),
+            )
+            .await
+            {
+                Either5::First(_) => {
+                    let now_ms = Instant::now().as_millis();
+                    input.sample(now_ms);
 
-        match select5(
-            input_tick.next(),
-            select(ui_tick.next(), reader_tick.next()),
-            Timer::at(sleep_deadline),
-            PLATFORM_CMD_CH.receive(),
-            select(Timer::at(display_deadline), SCREEN_SIGNAL.wait()),
-        )
-        .await
-        {
-            Either5::First(_) => {
-                let now_ms = Instant::now().as_millis();
-                input.sample(now_ms);
-
-                let dropped = input.take_dropped_gesture_count();
-                if dropped > 0 {
-                    info!("input dropped_gestures={}", dropped);
-                }
-
-                while let Some(gesture) = input.pop_gesture() {
-                    info!("input gesture={:?}", gesture);
-                    sleep.note_activity(now_ms);
-                    publish_event(Event::InputGestureReceived(gesture), now_ms);
-                }
-            }
-            Either5::Second(tick_kind) => {
-                let now_ms = Instant::now().as_millis();
-
-                match tick_kind {
-                    Either::First(_) => {
-                        if current_prepared_screen(animation, committed_update)
-                            .is_some_and(|screen| prepared_screen_drives_ui_ticks(&screen))
-                        {
-                            publish_event(Event::UiTick(now_ms), now_ms);
-                        }
+                    let dropped = input.take_dropped_gesture_count();
+                    if dropped > 0 {
+                        info!("input dropped_gestures={}", dropped);
                     }
-                    Either::Second(_) => {
-                        if current_prepared_screen(animation, committed_update)
-                            .is_some_and(|screen| prepared_screen_drives_reader_ticks(&screen))
-                        {
-                            publish_event(Event::ReaderTick(now_ms), now_ms);
-                        }
+
+                    while let Some(gesture) = input.pop_gesture() {
+                        info!("input gesture={:?}", gesture);
+                        sleep.note_activity(now_ms);
+                        publish_event(Event::InputGestureReceived(gesture), now_ms);
                     }
                 }
-            }
-            Either5::Third(_) => {
-                enter_low_power_sleep(
-                    &board,
-                    &mut display,
-                    &mut delay,
-                    &mut input,
-                    &mut sleep,
-                    &mut rtc,
-                );
-            }
-            Either5::Fourth(command) => match command {
-                PlatformCommand::RequestDeepSleep => {
+                Either5::Second(tick_kind) => {
+                    let now_ms = Instant::now().as_millis();
+
+                    match tick_kind {
+                        Either::First(_) => {
+                            if current_prepared_screen(animation, committed_update)
+                                .is_some_and(|screen| prepared_screen_drives_ui_ticks(&screen))
+                            {
+                                publish_event(Event::UiTick(now_ms), now_ms);
+                            }
+                        }
+                        Either::Second(_) => {
+                            if current_prepared_screen(animation, committed_update)
+                                .is_some_and(|screen| prepared_screen_drives_reader_ticks(&screen))
+                            {
+                                publish_event(Event::ReaderTick(now_ms), now_ms);
+                            }
+                        }
+                    }
+                }
+                Either5::Third(_) => {
                     enter_low_power_sleep(
                         &board,
                         &mut display,
@@ -512,88 +562,139 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                         &mut rtc,
                     );
                 }
-                PlatformCommand::PersistBackendCredential(credential) => {
-                    if let Err(err) = storage.write_backend_credential_sync(&credential) {
-                        info!("persist backend credential failed: {:?}", err);
+                Either5::Fourth(command) => match command {
+                    PlatformCommand::RequestDeepSleep => {
+                        enter_low_power_sleep(
+                            &board,
+                            &mut display,
+                            &mut delay,
+                            &mut input,
+                            &mut sleep,
+                            &mut rtc,
+                        );
                     }
-                }
-                PlatformCommand::PersistSettings(settings) => {
-                    sleep.configure_inactivity_timeout(settings.inactivity_timeout_ms);
-                    if let Err(err) = storage.write_persisted_settings_sync(&settings) {
-                        info!("persist settings failed: {:?}", err);
+                    PlatformCommand::PersistBackendCredential(credential) => {
+                        if let Err(err) = storage.write_backend_credential_sync(&credential) {
+                            info!("persist backend credential failed: {:?}", err);
+                        }
                     }
-                }
-            },
-            Either5::Fifth(display_event) => match display_event {
-                Either::First(_) => {
-                    let now = Instant::now();
+                    PlatformCommand::PersistSettings(settings) => {
+                        sleep.configure_inactivity_timeout(settings.inactivity_timeout_ms);
+                        if let Err(err) = storage.write_persisted_settings_sync(&settings) {
+                            info!("persist settings failed: {:?}", err);
+                        }
+                    }
+                },
+                Either5::Fifth(display_event) => match display_event {
+                    Either::First(_) => {
+                        let now = Instant::now();
 
-                    if next_animation_deadline.is_some_and(|deadline| deadline <= now) {
-                        if let Some(active_animation) = animation {
-                            let next_frame = active_animation.advance();
-                            present_transition_frame(
-                                &mut display,
-                                &mut committed_frame,
-                                &mut working_frame,
-                                &mut delay,
-                                &next_frame,
-                            );
-                            next_heartbeat_deadline = schedule_heartbeat_deadline();
+                        if next_animation_deadline.is_some_and(|deadline| deadline <= now) {
+                            if let Some(active_animation) = animation {
+                                let next_frame = active_animation.advance();
+                                present_transition_frame(
+                                    &mut display,
+                                    &mut committed_frame,
+                                    &mut working_frame,
+                                    &mut delay,
+                                    &next_frame,
+                                );
+                                next_heartbeat_deadline = schedule_heartbeat_deadline();
 
-                            if next_frame.is_complete() {
-                                committed_update = Some(ScreenUpdate {
-                                    screen: next_frame.screen,
-                                    prepared: next_frame.target_screen(),
-                                    transition: TransitionPlan::none(),
-                                });
+                                if next_frame.is_complete() {
+                                    committed_update = Some(ScreenUpdate {
+                                        screen: next_frame.screen,
+                                        prepared: next_frame.target_screen(),
+                                        transition: TransitionPlan::none(),
+                                    });
+                                    animation = None;
+                                    next_animation_deadline = None;
+                                } else {
+                                    animation = Some(next_frame);
+                                    next_animation_deadline =
+                                        Some(schedule_animation_deadline(next_frame.plan.frame_ms));
+                                }
+                            } else {
+                                next_animation_deadline = None;
+                            }
+                        } else if now >= next_heartbeat_deadline {
+                            if let Err(err) = display.heartbeat(&mut delay) {
+                                info!("display heartbeat failed: {:?}", err);
+                                let _ = display.disable_output();
+                            } else {
+                                next_heartbeat_deadline = schedule_heartbeat_deadline();
+                            }
+                        }
+                    }
+                    Either::Second(update) => {
+                        let previous_screen = animation
+                            .map(|active| active.screen)
+                            .or(committed_update.map(|committed| committed.screen));
+                        let previous_prepared = animation
+                            .map(|active| active.target_screen())
+                            .or(committed_update.map(|committed| committed.prepared));
+
+                        if previous_screen != Some(update.screen) {
+                            info!("app screen={:?}", update.screen);
+                        }
+
+                        if update.screen == Screen::Reader
+                            && previous_screen != Some(Screen::Reader)
+                        {
+                            let reset = input.reset_after_reader_open();
+                            if reset.cleared_gestures > 0
+                                || reset.cleared_dropped_gestures > 0
+                                || reset.button_was_pressed
+                            {
+                                info!(
+                                    "input reset for reader cleared_gestures={} cleared_dropped={} button_pressed={}",
+                                    reset.cleared_gestures,
+                                    reset.cleared_dropped_gestures,
+                                    reset.button_was_pressed,
+                                );
+                            }
+                        }
+
+                        if let Some(previous) = previous_prepared {
+                            if update.transition == TransitionPlan::none() {
                                 animation = None;
                                 next_animation_deadline = None;
+                                committed_update = Some(update);
+                                present_prepared_screen(
+                                    &mut display,
+                                    &mut committed_frame,
+                                    &mut working_frame,
+                                    &mut delay,
+                                    &update.prepared,
+                                );
+                                next_heartbeat_deadline = schedule_heartbeat_deadline();
                             } else {
-                                animation = Some(next_frame);
-                                next_animation_deadline =
-                                    Some(schedule_animation_deadline(next_frame.plan.frame_ms));
+                                let next_animation = AnimationPlayback::new(previous, update);
+                                present_transition_frame(
+                                    &mut display,
+                                    &mut committed_frame,
+                                    &mut working_frame,
+                                    &mut delay,
+                                    &next_animation,
+                                );
+                                next_heartbeat_deadline = schedule_heartbeat_deadline();
+
+                                if next_animation.is_complete() {
+                                    committed_update = Some(ScreenUpdate {
+                                        screen: next_animation.screen,
+                                        prepared: next_animation.target_screen(),
+                                        transition: TransitionPlan::none(),
+                                    });
+                                    animation = None;
+                                    next_animation_deadline = None;
+                                } else {
+                                    animation = Some(next_animation);
+                                    next_animation_deadline = Some(schedule_animation_deadline(
+                                        next_animation.plan.frame_ms,
+                                    ));
+                                }
                             }
                         } else {
-                            next_animation_deadline = None;
-                        }
-                    } else if now >= next_heartbeat_deadline {
-                        if let Err(err) = display.heartbeat(&mut delay) {
-                            info!("display heartbeat failed: {:?}", err);
-                            let _ = display.disable_output();
-                        } else {
-                            next_heartbeat_deadline = schedule_heartbeat_deadline();
-                        }
-                    }
-                }
-                Either::Second(update) => {
-                    let previous_screen = animation
-                        .map(|active| active.screen)
-                        .or(committed_update.map(|committed| committed.screen));
-                    let previous_prepared = animation
-                        .map(|active| active.target_screen())
-                        .or(committed_update.map(|committed| committed.prepared));
-
-                    if previous_screen != Some(update.screen) {
-                        info!("app screen={:?}", update.screen);
-                    }
-
-                    if update.screen == Screen::Reader && previous_screen != Some(Screen::Reader) {
-                        let reset = input.reset_after_reader_open();
-                        if reset.cleared_gestures > 0
-                            || reset.cleared_dropped_gestures > 0
-                            || reset.button_was_pressed
-                        {
-                            info!(
-                                "input reset for reader cleared_gestures={} cleared_dropped={} button_pressed={}",
-                                reset.cleared_gestures,
-                                reset.cleared_dropped_gestures,
-                                reset.button_was_pressed,
-                            );
-                        }
-                    }
-
-                    if let Some(previous) = previous_prepared {
-                        if update.transition == TransitionPlan::none() {
                             animation = None;
                             next_animation_deadline = None;
                             committed_update = Some(update);
@@ -605,48 +706,17 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                                 &update.prepared,
                             );
                             next_heartbeat_deadline = schedule_heartbeat_deadline();
-                        } else {
-                            let next_animation = AnimationPlayback::new(previous, update);
-                            present_transition_frame(
-                                &mut display,
-                                &mut committed_frame,
-                                &mut working_frame,
-                                &mut delay,
-                                &next_animation,
-                            );
-                            next_heartbeat_deadline = schedule_heartbeat_deadline();
-
-                            if next_animation.is_complete() {
-                                committed_update = Some(ScreenUpdate {
-                                    screen: next_animation.screen,
-                                    prepared: next_animation.target_screen(),
-                                    transition: TransitionPlan::none(),
-                                });
-                                animation = None;
-                                next_animation_deadline = None;
-                            } else {
-                                animation = Some(next_animation);
-                                next_animation_deadline =
-                                    Some(schedule_animation_deadline(next_animation.plan.frame_ms));
-                            }
                         }
-                    } else {
-                        animation = None;
-                        next_animation_deadline = None;
-                        committed_update = Some(update);
-                        present_prepared_screen(
-                            &mut display,
-                            &mut committed_frame,
-                            &mut working_frame,
-                            &mut delay,
-                            &update.prepared,
-                        );
-                        next_heartbeat_deadline = schedule_heartbeat_deadline();
                     }
-                }
-            },
+                },
+            }
         }
-    }
+    });
+    let event_loop = match event_loop {
+        Ok(event_loop) => event_loop,
+        Err(_) => panic!("bootstrap event loop alloc failed"),
+    };
+    event_loop.await
 }
 
 pub(crate) fn publish_event(event: Event, at_ms: u64) {
@@ -886,6 +956,7 @@ fn log_gpio_contract(board: &BoardConfig) {
         "sd gpio cs={} sck={} mosi={} miso={}",
         board.sd_cs_gpio, board.sd_sck_gpio, board.sd_mosi_gpio, board.sd_miso_gpio
     );
+    info!("sd spi hz init={} run={}", SD_SPI_INIT_HZ, SD_SPI_RUN_HZ);
     info!(
         "encoder gpio clk={} dt={} sw={}",
         board.encoder_clk_gpio, board.encoder_dt_gpio, board.encoder_sw_gpio
@@ -896,14 +967,64 @@ fn log_gpio_contract(board: &BoardConfig) {
     );
 }
 
+fn log_static_inventory() {
+    crate::memtrace!(
+        "static_inventory",
+        "component" = "bootstrap",
+        "at_ms" = Instant::now().as_millis(),
+        "main_loop_future_storage" = "external_pinned_box",
+        "timed_event_bytes" = size_of::<TimedEvent>(),
+        "platform_command_bytes" = size_of::<PlatformCommand>(),
+        "bootstrap_snapshot_bytes" = size_of::<BootstrapSnapshot>(),
+        "screen_update_bytes" = size_of::<ScreenUpdate>(),
+        "prepared_screen_bytes" = size_of::<PreparedScreen>(),
+        "animation_playback_bytes" = size_of::<AnimationPlayback>(),
+        "framebuffer_bytes" = size_of::<FrameBuffer>(),
+        "app_event_queue_capacity" = APP_EVENT_QUEUE_CAPACITY,
+        "app_event_queue_resident_bytes" = APP_EVENT_QUEUE_CAPACITY * size_of::<TimedEvent>(),
+        "platform_command_queue_capacity" = PLATFORM_COMMAND_QUEUE_CAPACITY,
+        "platform_command_queue_resident_bytes" =
+            PLATFORM_COMMAND_QUEUE_CAPACITY * size_of::<PlatformCommand>(),
+    );
+}
+
 fn log_heap(label: &str) {
-    let stats = esp_alloc::HEAP.stats();
+    let stats = capture_heap();
     info!(
-        "heap label={} size={} used={} free={}",
+        "heap label={} size={} used={} free={} internal_size={} internal_used={} internal_free={} internal_peak_used={} internal_min_free={} external_size={} external_used={} external_free={} external_peak_used={} external_min_free={}",
         label,
         stats.size,
-        stats.current_usage,
-        stats.size.saturating_sub(stats.current_usage),
+        stats.used,
+        stats.free,
+        stats.internal_size,
+        stats.internal_used,
+        stats.internal_free,
+        stats.internal_peak_used,
+        stats.internal_min_free,
+        stats.external_size,
+        stats.external_used,
+        stats.external_free,
+        stats.external_peak_used,
+        stats.external_min_free,
+    );
+    info!(
+        "heap regions label={} region0_kind={} region0_used={} region0_free={} region0_peak_used={} region0_min_free={} region1_kind={} region1_used={} region1_free={} region1_peak_used={} region1_min_free={} region2_kind={} region2_used={} region2_free={} region2_peak_used={} region2_min_free={}",
+        label,
+        stats.regions[0].kind,
+        stats.regions[0].used,
+        stats.regions[0].free,
+        stats.regions[0].peak_used,
+        stats.regions[0].min_free,
+        stats.regions[1].kind,
+        stats.regions[1].used,
+        stats.regions[1].free,
+        stats.regions[1].peak_used,
+        stats.regions[1].min_free,
+        stats.regions[2].kind,
+        stats.regions[2].used,
+        stats.regions[2].free,
+        stats.regions[2].peak_used,
+        stats.regions[2].min_free,
     );
 }
 

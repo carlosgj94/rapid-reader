@@ -1154,8 +1154,6 @@ dependencies = [
 [[package]]
 name = "esp-radio"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "684c4de2f8907b73c9b891fbda65286a86d34fced4b856f36a7896c211f2f265"
 dependencies = [
  "allocator-api2",
  "cfg-if",
@@ -1986,6 +1984,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 name = "platform-esp32s3"
 version = "0.1.0"
 dependencies = [
+ "allocator-api2",
  "app-runtime",
  "domain",
  "embassy-executor",

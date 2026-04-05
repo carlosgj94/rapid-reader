@@ -31,8 +31,9 @@ const RSVP_STAGE_RIGHT_ANCHOR_X: i32 = 173;
 const RSVP_STAGE_SCALED_LEFT_ANCHOR_X: i32 = 168;
 const RSVP_STAGE_SCALED_RIGHT_ANCHOR_X: i32 = 172;
 const LARGE_RAIL_SCALE: u32 = 2;
-const LARGE_RAIL_RIGHT_EDGE_X: i32 = 399;
-const LARGE_RAIL_Y: i32 = 18;
+const RAIL_RIGHT_EDGE_X: i32 = 400;
+const LARGE_RAIL_RIGHT_EDGE_X: i32 = RAIL_RIGHT_EDGE_X;
+const RAIL_BOTTOM_EDGE_Y: i32 = 240;
 const DASHBOARD_TEXT_RIGHT_EDGE_X: i32 = 296;
 const DASHBOARD_SLOT_TRAVEL_PX: i32 = 14;
 const DASHBOARD_TOP_SLOT_Y: i32 = 42;
@@ -456,7 +457,7 @@ fn draw_dashboard_chrome(frame: &mut FrameBuffer, shell: &DashboardShell) {
         frame,
         shell.rail.text,
         LARGE_RAIL_RIGHT_EDGE_X,
-        LARGE_RAIL_Y,
+        vertical_rail_bottom_start_y(shell.rail.text, LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
         LARGE_RAIL_SCALE,
     );
 
@@ -748,11 +749,11 @@ fn draw_collection_chrome(frame: &mut FrameBuffer, shell: &ContentListShell) {
             frame,
             shell.rail.text,
             LARGE_RAIL_RIGHT_EDGE_X,
-            LARGE_RAIL_Y,
+            vertical_rail_bottom_start_y(shell.rail.text, LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
             LARGE_RAIL_SCALE,
         );
     } else {
-        draw_vertical_rail(frame, shell.rail.text, 398, 26);
+        draw_vertical_rail(frame, shell.rail.text, RAIL_RIGHT_EDGE_X, 26);
     }
 }
 
@@ -1868,13 +1869,7 @@ fn draw_text_pair_slot_clipped(
 }
 
 fn draw_vertical_rail(frame: &mut FrameBuffer, text: &str, right_edge: i32, y: i32) {
-    draw_text_right(
-        frame,
-        text,
-        Point::new(right_edge, y),
-        ui_font_title(),
-        BinaryColor::On,
-    );
+    draw_vertical_rail_lines(frame, text, right_edge, y, 1);
 }
 
 fn draw_vertical_rail_scaled(
@@ -1884,14 +1879,67 @@ fn draw_vertical_rail_scaled(
     y: i32,
     scale: u32,
 ) {
-    draw_text_right_scaled(
-        frame,
-        text,
-        Point::new(right_edge, y),
-        ui_font_title(),
-        BinaryColor::On,
-        scale,
-    );
+    draw_vertical_rail_lines(frame, text, right_edge, y, scale.max(1));
+}
+
+fn draw_vertical_rail_lines(
+    frame: &mut FrameBuffer,
+    text: &str,
+    right_edge: i32,
+    start_y: i32,
+    scale: u32,
+) {
+    let scale = scale.max(1);
+    let mut y = start_y;
+    let line_step = vertical_rail_line_step(scale);
+
+    for line in text.lines() {
+        if !line.is_empty() {
+            if scale == 1 {
+                draw_text_right(
+                    frame,
+                    line,
+                    Point::new(right_edge, y),
+                    ui_font_title(),
+                    BinaryColor::On,
+                );
+            } else {
+                draw_text_right_scaled(
+                    frame,
+                    line,
+                    Point::new(right_edge, y),
+                    ui_font_title(),
+                    BinaryColor::On,
+                    scale,
+                );
+            }
+        }
+
+        y += line_step;
+    }
+}
+
+fn vertical_rail_line_step(scale: u32) -> i32 {
+    let scale = scale.max(1) as i32;
+    let base_height = ui_font_title().character_size.height as i32 * scale;
+    (base_height - (3 * scale)).max(scale)
+}
+
+fn vertical_rail_block_height(text: &str, scale: u32) -> i32 {
+    let line_count = text.lines().count() as i32;
+    if line_count <= 0 {
+        return 0;
+    }
+
+    let scale = scale.max(1);
+    let glyph_height = ui_font_title().character_size.height as i32 * scale as i32;
+    let line_step = vertical_rail_line_step(scale);
+
+    glyph_height + (line_count - 1) * line_step
+}
+
+fn vertical_rail_bottom_start_y(text: &str, scale: u32, bottom_edge: i32) -> i32 {
+    bottom_edge - vertical_rail_block_height(text, scale)
 }
 
 const fn paragraph_tick_offset(index: u8) -> i32 {
@@ -2579,7 +2627,9 @@ mod tests {
                 label: "SYNC",
                 spinner_phase,
             }),
-            rail: VerticalRail { text: "HOME" },
+            rail: VerticalRail {
+                text: "M\nO\nT\nI\nF",
+            },
             items: [
                 DashboardItem {
                     label: labels[0],
@@ -2615,7 +2665,9 @@ mod tests {
                 battery_percent: 64,
                 wifi_online: true,
             },
-            rail: VerticalRail { text: "SAVED" },
+            rail: VerticalRail {
+                text: "S\nA\nV\nE\nD",
+            },
             large_rail: true,
             rows: [
                 ContentRow {
@@ -2640,6 +2692,10 @@ mod tests {
             band: SelectionBand { y: 106, height: 68 },
             help: HelpHint { text: "BACK" },
         }
+    }
+
+    fn column_has_lit_pixel(frame: &FrameBuffer, x: usize) -> bool {
+        (0..240).any(|y| frame.pixel(x, y) == Some(true))
     }
 
     #[test]
@@ -2768,6 +2824,18 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_rail_reaches_right_edge() {
+        let mut frame = FrameBuffer::new();
+
+        draw_prepared_screen(
+            &mut frame,
+            &PreparedScreen::Dashboard(make_dashboard_shell(0)),
+        );
+
+        assert!(column_has_lit_pixel(&frame, 399));
+    }
+
+    #[test]
     fn dashboard_transition_frames_stay_within_visible_rows() {
         let from = make_dashboard_shell_with_labels(0, ["INBOX", "SAVED", "RECS"]);
         let to = make_dashboard_shell_with_labels(0, ["SAVED", "RECS", "SETTINGS"]);
@@ -2831,6 +2899,35 @@ mod tests {
         for row in dirty.iter() {
             assert!((122..136).contains(&row), "unexpected dirty row {row}");
         }
+    }
+
+    #[test]
+    fn saved_rail_reaches_right_edge() {
+        let mut frame = FrameBuffer::new();
+        let rows = [
+            ("SOURCE", "Previous item"),
+            ("SOURCE", "Current item"),
+            ("SOURCE", "Next item"),
+        ];
+
+        draw_prepared_screen(
+            &mut frame,
+            &PreparedScreen::Collection(make_collection_shell(rows)),
+        );
+
+        assert!(column_has_lit_pixel(&frame, 399));
+    }
+
+    #[test]
+    fn large_rails_are_bottom_aligned() {
+        assert_eq!(
+            vertical_rail_bottom_start_y("M\nO\nT\nI\nF", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
+            64
+        );
+        assert_eq!(
+            vertical_rail_bottom_start_y("S\nA\nV\nE\nD", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
+            64
+        );
     }
 
     #[test]

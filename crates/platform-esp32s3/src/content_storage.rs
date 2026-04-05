@@ -1,9 +1,9 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, string::String, vec::Vec};
-use core::{cmp::Ordering, ptr::addr_of_mut};
+use core::{cmp::Ordering, mem::size_of, ptr::addr_of_mut};
 
-use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use domain::{
     content::{
         CONTENT_ID_MAX_BYTES, CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
@@ -26,17 +26,22 @@ use embassy_sync::{
 use embassy_time::Instant;
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use embedded_sdmmc::{
-    Directory, Error as SdError, File, Mode, SdCard, ShortFileName, TimeSource, Timestamp,
-    VolumeIdx, VolumeManager,
+    Block, BlockDevice, BlockIdx, Directory, Error as SdError, File, Mode, RawFile, RawVolume,
+    SdCard, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
-use esp_hal::{Blocking, delay::Delay, gpio::Output, spi::master::Spi};
+use esp_hal::{Blocking, delay::Delay, gpio::Output, spi::master::Spi, time::Rate};
 use log::info;
 use services::storage::StorageError;
+
+use crate::telemetry::{TraceContext, bool_flag, collection_label};
 
 const MAX_DIRS: usize = 8;
 const MAX_FILES: usize = 4;
 const MAX_VOLUMES: usize = 1;
-const STORAGE_CMD_QUEUE_CAPACITY: usize = 4;
+// Chunk payloads now live in boxed buffers, so increasing the queue only adds a
+// small amount of fixed resident state while allowing the backend to stay a few
+// writes ahead of SD flush latency.
+const STORAGE_CMD_QUEUE_CAPACITY: usize = 8;
 const MANIFEST_MAGIC: u32 = 0x4D43_4F4C;
 const CACHE_INDEX_MAGIC: u32 = 0x4D43_4944;
 const PACKAGE_META_MAGIC: u32 = 0x4D43_504D;
@@ -49,11 +54,12 @@ const MAX_PACKAGE_META_LEN: usize = 128;
 const READER_PACKAGE_HEADER_LEN: usize = 32;
 const READER_PACKAGE_PARAGRAPH_ENTRY_LEN: usize = 72;
 const READER_PACKAGE_UNIT_ENTRY_LEN: usize = 40;
-const PACKAGE_COPY_BUFFER_LEN: usize = 512;
-// Keep this aligned with the backend download chunk. Moving from 512 B to 1 KiB
-// adds roughly 2 KiB to the 4-slot storage command queue plus a 512 B sender
-// scratch increase, which is a safer tradeoff than jumping straight to 2 KiB.
-const STAGE_WRITE_CHUNK_LEN: usize = 1024;
+const PACKAGE_COPY_BUFFER_LEN: usize = 4 * 1024;
+// Keep this aligned with the backend download chunk. The payload itself is now
+// boxed so we can raise the transfer size without exploding the storage
+// command queue's fixed internal residency.
+const STAGE_WRITE_CHUNK_LEN: usize = 4 * 1024;
+const STAGE_FLUSH_INTERVAL_BYTES: u32 = 16 * 1024;
 const STAGE_PROGRESS_LOG_INTERVAL_BYTES: u32 = 16 * 1024;
 const CACHE_ENTRY_CAPACITY: usize = 48;
 const CACHE_SIZE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
@@ -97,6 +103,10 @@ static STORAGE_CMD_CH: Channel<
 > = Channel::new();
 static STORAGE_RESP_SIG: Signal<CriticalSectionRawMutex, StorageResponse> = Signal::new();
 static STORAGE_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static STORAGE_CMD_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static STORAGE_CMD_DEPTH_PEAK: AtomicUsize = AtomicUsize::new(0);
+static STORAGE_CMD_PAYLOAD_BYTES: AtomicUsize = AtomicUsize::new(0);
+static STORAGE_CMD_PAYLOAD_BYTES_PEAK: AtomicUsize = AtomicUsize::new(0);
 
 pub struct ContentStorageMount<'d> {
     pub storage: Option<Box<SdContentStorage<'d>>>,
@@ -112,6 +122,7 @@ pub struct SdContentStorage<'d> {
     snapshots: [Option<Box<CollectionManifestState>>; 3],
     cache_index: CacheIndex,
     pending_stage: Option<PendingStage>,
+    pending_stage_error: Option<StorageError>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -129,6 +140,12 @@ pub struct OpenedReaderPackage {
     pub window: Box<ReaderWindow>,
 }
 
+#[derive(Debug)]
+pub struct CommitAndOpenPackageResult {
+    pub snapshot: Box<CollectionManifestState>,
+    pub opened: Result<Box<OpenedReaderPackage>, StorageError>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct ReaderPackageHeader {
     title_len: u16,
@@ -140,14 +157,34 @@ struct ReaderPackageHeader {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct PendingStage {
+    trace: TraceContext,
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     remote_revision: u64,
     slot_id: u8,
+    target_kind: PendingStageTargetKind,
+    stage_volume: RawVolume,
+    stage_file: RawFile,
     bytes_written: u32,
+    flushed_bytes: u32,
     crc32: u32,
     started_at_ms: u64,
     overwritten_entry: Option<CacheEntry>,
     superseded_entry: Option<CacheEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PendingStageTargetKind {
+    StagingFile,
+    PackageSlot,
+}
+
+impl PendingStageTargetKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::StagingFile => "staging_file",
+            Self::PackageSlot => "package_slot",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -257,6 +294,10 @@ impl CacheIndex {
         None
     }
 
+    fn contains_slot(&self, slot_id: u8) -> bool {
+        self.find_index_by_slot(slot_id).is_some()
+    }
+
     fn upsert(&mut self, mut entry: CacheEntry) {
         if let Some(index) = self.find_index_by_content_id(&entry.content_id) {
             entry.last_touch_seq = self.bump_touch_seq();
@@ -316,40 +357,86 @@ impl TimeSource for FixedTimeSource {
     }
 }
 
-// Keep chunk bytes inline so streaming package writes do not allocate per chunk.
-#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum StageChunkBytes<const N: usize> {
+    External(crate::memory_policy::ExternalBox<[u8; N]>),
+    Internal(crate::memory_policy::InternalBox<[u8; N]>),
+}
+
+impl<const N: usize> StageChunkBytes<N> {
+    fn allocate_zeroed() -> Result<Self, StorageError> {
+        match crate::memory_policy::try_external_zeroed_array_box::<N>() {
+            Ok(buffer) => Ok(Self::External(buffer)),
+            Err(_) => match crate::memory_policy::try_internal_zeroed_array_box::<N>() {
+                Ok(buffer) => Ok(Self::Internal(buffer)),
+                Err(_) => Err(StorageError::Unavailable),
+            },
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::External(buffer) => &mut buffer[..],
+            Self::Internal(buffer) => &mut buffer[..],
+        }
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        match self {
+            Self::External(buffer) => &buffer[..len],
+            Self::Internal(buffer) => &buffer[..len],
+        }
+    }
+}
+
 #[derive(Debug)]
 enum StorageCommand {
     PersistSnapshot {
+        trace: TraceContext,
         kind: CollectionKind,
         snapshot: Box<CollectionManifestState>,
     },
     BeginPackageStage {
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
         remote_revision: u64,
     },
     WritePackageChunk {
+        trace: TraceContext,
         len: usize,
-        bytes: [u8; STAGE_WRITE_CHUNK_LEN],
+        bytes: StageChunkBytes<STAGE_WRITE_CHUNK_LEN>,
     },
     CommitPackageStage {
+        trace: TraceContext,
         collection: CollectionKind,
         remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
     },
-    AbortPackageStage,
+    CommitAndOpenPackageStage {
+        trace: TraceContext,
+        collection: CollectionKind,
+        remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    },
+    AbortPackageStage {
+        trace: TraceContext,
+    },
     UpdatePackageState {
+        trace: TraceContext,
         collection: CollectionKind,
         remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
         package_state: PackageState,
     },
     OpenCachedReaderPackage {
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     },
     LoadReaderWindow {
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
         window_start_unit_index: u32,
     },
     OpenCachedReaderContent {
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     },
 }
@@ -358,13 +445,194 @@ enum StorageCommand {
 #[derive(Debug)]
 enum StorageResponse {
     Snapshot(Result<Box<CollectionManifestState>, StorageError>),
+    CommitAndOpenPackage(Result<Box<CommitAndOpenPackageResult>, StorageError>),
     OpenedPackage(Result<Box<OpenedReaderPackage>, StorageError>),
     Opened(Result<Box<OpenedReaderContent>, StorageError>),
     LoadedWindow(Result<ReaderWindow, StorageError>),
     Unit(Result<(), StorageError>),
 }
 
-pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DirUsage {
+    files: u32,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct StorageSpaceMetrics {
+    sd_total_bytes: u64,
+    sd_free_bytes: u64,
+    sd_free_known: bool,
+    sd_cluster_size_bytes: u32,
+    motif_total_bytes: u64,
+    manifest_bytes: u64,
+    cache_bytes: u64,
+    stage_bytes: u64,
+    package_bytes: u64,
+    package_files: u32,
+    cache_entry_count: usize,
+    cache_budget_remaining: u64,
+}
+
+pub(crate) fn log_static_inventory() {
+    crate::memtrace!(
+        "static_inventory",
+        "component" = "storage",
+        "at_ms" = storage_now_ms(),
+        "storage_command_bytes" = size_of::<StorageCommand>(),
+        "storage_response_bytes" = size_of::<StorageResponse>(),
+        "pending_stage_bytes" = size_of::<PendingStage>(),
+        "cache_entry_bytes" = size_of::<CacheEntry>(),
+        "cache_index_bytes" = size_of::<CacheIndex>(),
+        "opened_reader_package_bytes" = size_of::<OpenedReaderPackage>(),
+        "opened_reader_content_bytes" = size_of::<OpenedReaderContent>(),
+        "reader_window_bytes" = size_of::<ReaderWindow>(),
+        "reading_document_bytes" = size_of::<ReadingDocument>(),
+        "collection_manifest_state_bytes" = size_of::<CollectionManifestState>(),
+        "storage_queue_capacity" = STORAGE_CMD_QUEUE_CAPACITY,
+        "storage_queue_resident_bytes" = STORAGE_CMD_QUEUE_CAPACITY * size_of::<StorageCommand>(),
+        "stage_write_chunk_len" = STAGE_WRITE_CHUNK_LEN,
+        "stage_flush_interval_bytes" = STAGE_FLUSH_INTERVAL_BYTES,
+        "package_copy_buffer_len" = PACKAGE_COPY_BUFFER_LEN,
+        "package_read_buffer_len" = PACKAGE_READ_BUFFER_LEN,
+        "cache_entry_capacity" = CACHE_ENTRY_CAPACITY,
+        "cache_size_budget_bytes" = CACHE_SIZE_BUDGET_BYTES,
+        "max_parsed_block_text_bytes" = MAX_PARSED_BLOCK_TEXT_BYTES,
+        "max_parsed_list_total_bytes" = MAX_PARSED_LIST_TOTAL_BYTES,
+        "max_parsed_list_items" = MAX_PARSED_LIST_ITEMS,
+    );
+}
+
+fn storage_command_payload_len(command: &StorageCommand) -> usize {
+    match command {
+        StorageCommand::WritePackageChunk { len, .. } => *len,
+        _ => 0,
+    }
+}
+
+fn storage_command_label(command: &StorageCommand) -> &'static str {
+    match command {
+        StorageCommand::PersistSnapshot { .. } => "persist_snapshot",
+        StorageCommand::BeginPackageStage { .. } => "begin_stage",
+        StorageCommand::WritePackageChunk { .. } => "write_chunk",
+        StorageCommand::CommitPackageStage { .. } => "commit_stage",
+        StorageCommand::CommitAndOpenPackageStage { .. } => "commit_and_open_stage",
+        StorageCommand::AbortPackageStage { .. } => "abort_stage",
+        StorageCommand::UpdatePackageState { .. } => "update_package_state",
+        StorageCommand::OpenCachedReaderPackage { .. } => "open_cached_reader_package",
+        StorageCommand::LoadReaderWindow { .. } => "load_reader_window",
+        StorageCommand::OpenCachedReaderContent { .. } => "open_cached_reader_content",
+    }
+}
+
+fn storage_command_trace(command: &StorageCommand) -> TraceContext {
+    match command {
+        StorageCommand::PersistSnapshot { trace, .. }
+        | StorageCommand::BeginPackageStage { trace, .. }
+        | StorageCommand::WritePackageChunk { trace, .. }
+        | StorageCommand::CommitPackageStage { trace, .. }
+        | StorageCommand::CommitAndOpenPackageStage { trace, .. }
+        | StorageCommand::AbortPackageStage { trace }
+        | StorageCommand::UpdatePackageState { trace, .. }
+        | StorageCommand::OpenCachedReaderPackage { trace, .. }
+        | StorageCommand::LoadReaderWindow { trace, .. }
+        | StorageCommand::OpenCachedReaderContent { trace, .. } => *trace,
+    }
+}
+
+fn storage_queue_on_enqueue(trace: TraceContext, operation: &str, payload_bytes: usize) {
+    let depth = STORAGE_CMD_DEPTH.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    let payload_inflight =
+        STORAGE_CMD_PAYLOAD_BYTES.fetch_add(payload_bytes, AtomicOrdering::Relaxed) + payload_bytes;
+    let depth_peak = fetch_max(&STORAGE_CMD_DEPTH_PEAK, depth);
+    let payload_peak = fetch_max(&STORAGE_CMD_PAYLOAD_BYTES_PEAK, payload_inflight);
+
+    if depth == depth_peak
+        || payload_inflight == payload_peak
+        || depth == STORAGE_CMD_QUEUE_CAPACITY
+    {
+        emit_storage_queue_event(
+            "enqueue",
+            trace,
+            operation,
+            payload_bytes,
+            depth,
+            depth_peak,
+            payload_inflight,
+            payload_peak,
+        );
+    }
+}
+
+fn storage_queue_on_dequeue(command: &StorageCommand) {
+    let payload_bytes = storage_command_payload_len(command);
+    let depth = STORAGE_CMD_DEPTH
+        .fetch_sub(1, AtomicOrdering::Relaxed)
+        .saturating_sub(1);
+    let payload_inflight = STORAGE_CMD_PAYLOAD_BYTES
+        .fetch_sub(payload_bytes, AtomicOrdering::Relaxed)
+        .saturating_sub(payload_bytes);
+
+    if depth == 0 {
+        emit_storage_queue_event(
+            "drain",
+            storage_command_trace(command),
+            storage_command_label(command),
+            payload_bytes,
+            depth,
+            STORAGE_CMD_DEPTH_PEAK.load(AtomicOrdering::Relaxed),
+            payload_inflight,
+            STORAGE_CMD_PAYLOAD_BYTES_PEAK.load(AtomicOrdering::Relaxed),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_storage_queue_event(
+    action: &str,
+    trace: TraceContext,
+    operation: &str,
+    payload_bytes: usize,
+    depth: usize,
+    depth_peak: usize,
+    inflight_payload_bytes: usize,
+    inflight_payload_peak: usize,
+) {
+    crate::memtrace!(
+        "storage_queue",
+        "component" = "storage",
+        "at_ms" = storage_now_ms(),
+        "action" = action,
+        "op" = operation,
+        "sync_id" = trace.sync_id,
+        "req_id" = trace.req_id,
+        "payload_bytes" = payload_bytes,
+        "queue_depth" = depth,
+        "queue_depth_peak" = depth_peak,
+        "queue_payload_bytes" = inflight_payload_bytes,
+        "queue_payload_peak" = inflight_payload_peak,
+        "queue_capacity" = STORAGE_CMD_QUEUE_CAPACITY,
+        "queue_resident_bytes" = STORAGE_CMD_QUEUE_CAPACITY * size_of::<StorageCommand>(),
+    );
+}
+
+fn fetch_max(cell: &AtomicUsize, candidate: usize) -> usize {
+    let mut current = cell.load(AtomicOrdering::Relaxed);
+    while candidate > current {
+        match cell.compare_exchange(
+            current,
+            candidate,
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+        ) {
+            Ok(_) => return candidate,
+            Err(observed) => current = observed,
+        }
+    }
+    current
+}
+
+pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStorageMount<'d> {
     let device = match ExclusiveDevice::new_no_delay(spi, cs) {
         Ok(device) => device,
         Err(_) => {
@@ -394,6 +662,16 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
             };
         }
     };
+    let run_spi_config = esp_hal::spi::master::Config::default()
+        .with_frequency(Rate::from_hz(run_spi_hz))
+        .with_mode(esp_hal::spi::Mode::_0);
+    match card.spi(|device| device.bus_mut().apply_config(&run_spi_config)) {
+        Ok(()) => info!("content storage sd spi run hz={}", run_spi_hz),
+        Err(err) => info!(
+            "content storage sd spi speed switch failed hz={} err={:?}",
+            run_spi_hz, err
+        ),
+    }
 
     let volume_mgr = VolumeManager::<_, _, MAX_DIRS, MAX_FILES, MAX_VOLUMES>::new_with_limits(
         card,
@@ -408,6 +686,7 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
         addr_of_mut!((*storage_ptr).snapshots).write([None, None, None]);
         addr_of_mut!((*storage_ptr).cache_index).write(CacheIndex::empty());
         addr_of_mut!((*storage_ptr).pending_stage).write(None);
+        addr_of_mut!((*storage_ptr).pending_stage_error).write(None);
     }
     let mut storage = unsafe { storage.assume_init() };
     let mut last_recovery = StorageRecoveryStatus::Clean;
@@ -474,11 +753,16 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>) -> ContentStorageMount<'d> {
         };
     }
 
+    let sd_free_bytes = storage
+        .storage_space_metrics()
+        .map(|metrics| metrics.sd_free_bytes)
+        .unwrap_or(0);
+
     ContentStorageMount {
         storage: Some(storage),
         sd_card_ready: true,
         sd_total_bytes: total_bytes,
-        sd_free_bytes: 0,
+        sd_free_bytes,
         last_recovery,
     }
 }
@@ -519,42 +803,111 @@ pub async fn persist_snapshot(
     kind: CollectionKind,
     snapshot: CollectionManifestState,
 ) -> Result<CollectionManifestState, StorageError> {
+    persist_snapshot_traced(TraceContext::none(), kind, snapshot).await
+}
+
+pub async fn persist_snapshot_traced(
+    trace: TraceContext,
+    kind: CollectionKind,
+    snapshot: CollectionManifestState,
+) -> Result<CollectionManifestState, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
-    STORAGE_CMD_CH
-        .send(StorageCommand::PersistSnapshot {
-            kind,
-            snapshot: Box::new(snapshot),
-        })
-        .await;
+    let command = StorageCommand::PersistSnapshot {
+        trace,
+        kind,
+        snapshot: Box::new(snapshot),
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "persist_snapshot", 0);
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
-        StorageResponse::Opened(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Opened(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
     }
 }
 
+pub async fn commit_package_stage_and_open_cached_reader_package_traced(
+    trace: TraceContext,
+    collection: CollectionKind,
+    remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+) -> Result<CommitAndOpenPackageResult, StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+    let started_at = Instant::now();
+    let command = StorageCommand::CommitAndOpenPackageStage {
+        trace,
+        collection,
+        remote_item_id,
+        content_id,
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "commit_and_open_stage", 0);
+
+    let result = match STORAGE_RESP_SIG.wait().await {
+        StorageResponse::CommitAndOpenPackage(result) => result.map(|result| *result),
+        StorageResponse::Snapshot(_)
+        | StorageResponse::Opened(_)
+        | StorageResponse::OpenedPackage(_)
+        | StorageResponse::LoadedWindow(_)
+        | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
+    }?;
+
+    let total_ms = Instant::now().duration_since(started_at).as_millis();
+    match &result.opened {
+        Ok(opened) => info!(
+            "content storage commit+open timing content_id={} total_ms={} total_units={} total_paragraphs={} window_units={}",
+            content_id.as_str(),
+            total_ms,
+            opened.total_units,
+            opened.paragraphs.len(),
+            opened.window.unit_count,
+        ),
+        Err(err) => info!(
+            "content storage commit+open timing failed content_id={} total_ms={} err={:?}",
+            content_id.as_str(),
+            total_ms,
+            err,
+        ),
+    }
+
+    Ok(result)
+}
+
 pub async fn begin_package_stage(
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    remote_revision: u64,
+) -> Result<(), StorageError> {
+    begin_package_stage_traced(TraceContext::none(), content_id, remote_revision).await
+}
+
+pub async fn begin_package_stage_traced(
+    trace: TraceContext,
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     remote_revision: u64,
 ) -> Result<(), StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
-    STORAGE_CMD_CH
-        .send(StorageCommand::BeginPackageStage {
-            content_id,
-            remote_revision,
-        })
-        .await;
+    let command = StorageCommand::BeginPackageStage {
+        trace,
+        content_id,
+        remote_revision,
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "begin_stage", 0);
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Unit(result) => result,
-        StorageResponse::Opened(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Opened(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
@@ -562,6 +915,13 @@ pub async fn begin_package_stage(
 }
 
 pub async fn write_package_chunk(chunk: &[u8]) -> Result<(), StorageError> {
+    write_package_chunk_traced(TraceContext::none(), chunk).await
+}
+
+pub async fn write_package_chunk_traced(
+    trace: TraceContext,
+    chunk: &[u8],
+) -> Result<(), StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
@@ -569,41 +929,45 @@ pub async fn write_package_chunk(chunk: &[u8]) -> Result<(), StorageError> {
         return Err(StorageError::PayloadTooLarge);
     }
 
-    let mut bytes = [0u8; STAGE_WRITE_CHUNK_LEN];
-    bytes[..chunk.len()].copy_from_slice(chunk);
-    STORAGE_CMD_CH
-        .send(StorageCommand::WritePackageChunk {
-            len: chunk.len(),
-            bytes,
-        })
-        .await;
-
-    match STORAGE_RESP_SIG.wait().await {
-        StorageResponse::Unit(result) => result,
-        StorageResponse::Opened(_)
-        | StorageResponse::OpenedPackage(_)
-        | StorageResponse::LoadedWindow(_)
-        | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
-    }
+    let mut bytes = StageChunkBytes::<STAGE_WRITE_CHUNK_LEN>::allocate_zeroed()?;
+    bytes.as_mut_slice()[..chunk.len()].copy_from_slice(chunk);
+    let command = StorageCommand::WritePackageChunk {
+        trace,
+        len: chunk.len(),
+        bytes,
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "write_chunk", chunk.len());
+    Ok(())
 }
 
 pub async fn commit_package_stage(
     collection: CollectionKind,
     remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
 ) -> Result<CollectionManifestState, StorageError> {
+    commit_package_stage_traced(TraceContext::none(), collection, remote_item_id).await
+}
+
+pub async fn commit_package_stage_traced(
+    trace: TraceContext,
+    collection: CollectionKind,
+    remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+) -> Result<CollectionManifestState, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
-    STORAGE_CMD_CH
-        .send(StorageCommand::CommitPackageStage {
-            collection,
-            remote_item_id,
-        })
-        .await;
+    let command = StorageCommand::CommitPackageStage {
+        trace,
+        collection,
+        remote_item_id,
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "commit_stage", 0);
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
-        StorageResponse::Opened(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Opened(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
@@ -611,14 +975,21 @@ pub async fn commit_package_stage(
 }
 
 pub async fn abort_package_stage() -> Result<(), StorageError> {
+    abort_package_stage_traced(TraceContext::none()).await
+}
+
+pub async fn abort_package_stage_traced(trace: TraceContext) -> Result<(), StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
-    STORAGE_CMD_CH.send(StorageCommand::AbortPackageStage).await;
+    let command = StorageCommand::AbortPackageStage { trace };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "abort_stage", 0);
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Unit(result) => result,
-        StorageResponse::Opened(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Opened(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Snapshot(_) => Err(StorageError::Unavailable),
@@ -630,20 +1001,37 @@ pub async fn update_package_state(
     remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
     package_state: PackageState,
 ) -> Result<CollectionManifestState, StorageError> {
+    update_package_state_traced(
+        TraceContext::none(),
+        collection,
+        remote_item_id,
+        package_state,
+    )
+    .await
+}
+
+pub async fn update_package_state_traced(
+    trace: TraceContext,
+    collection: CollectionKind,
+    remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    package_state: PackageState,
+) -> Result<CollectionManifestState, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
-    STORAGE_CMD_CH
-        .send(StorageCommand::UpdatePackageState {
-            collection,
-            remote_item_id,
-            package_state,
-        })
-        .await;
+    let command = StorageCommand::UpdatePackageState {
+        trace,
+        collection,
+        remote_item_id,
+        package_state,
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "update_package_state", 0);
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Snapshot(result) => result.map(|snapshot| *snapshot),
-        StorageResponse::Opened(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Opened(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
@@ -653,17 +1041,25 @@ pub async fn update_package_state(
 pub async fn open_cached_reader_package(
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
 ) -> Result<Box<OpenedReaderPackage>, StorageError> {
+    open_cached_reader_package_traced(TraceContext::none(), content_id).await
+}
+
+pub async fn open_cached_reader_package_traced(
+    trace: TraceContext,
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+) -> Result<Box<OpenedReaderPackage>, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
     let started_at = Instant::now();
-    STORAGE_CMD_CH
-        .send(StorageCommand::OpenCachedReaderPackage { content_id })
-        .await;
+    let command = StorageCommand::OpenCachedReaderPackage { trace, content_id };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "open_cached_reader_package", 0);
 
     let result = match STORAGE_RESP_SIG.wait().await {
         StorageResponse::OpenedPackage(result) => result,
-        StorageResponse::Snapshot(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Snapshot(_)
         | StorageResponse::Opened(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
@@ -694,19 +1090,29 @@ pub async fn load_reader_window(
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     window_start_unit_index: u32,
 ) -> Result<ReaderWindow, StorageError> {
+    load_reader_window_traced(TraceContext::none(), content_id, window_start_unit_index).await
+}
+
+pub async fn load_reader_window_traced(
+    trace: TraceContext,
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    window_start_unit_index: u32,
+) -> Result<ReaderWindow, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
-    STORAGE_CMD_CH
-        .send(StorageCommand::LoadReaderWindow {
-            content_id,
-            window_start_unit_index,
-        })
-        .await;
+    let command = StorageCommand::LoadReaderWindow {
+        trace,
+        content_id,
+        window_start_unit_index,
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "load_reader_window", 0);
 
     match STORAGE_RESP_SIG.wait().await {
         StorageResponse::LoadedWindow(result) => result,
-        StorageResponse::Snapshot(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Snapshot(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::Opened(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
@@ -721,20 +1127,134 @@ fn storage_elapsed_since_ms(started_at_ms: u64) -> u64 {
     storage_now_ms().saturating_sub(started_at_ms)
 }
 
+fn read_dir_usage(dir: &SdDirectory<'_, '_>) -> Result<DirUsage, StorageError> {
+    let mut usage = DirUsage { files: 0, bytes: 0 };
+    dir.iterate_dir(|entry| {
+        if !entry.attributes.is_directory() {
+            usage.files = usage.files.saturating_add(1);
+            usage.bytes = usage.bytes.saturating_add(entry.size as u64);
+        }
+    })
+    .map_err(map_sd_error)?;
+    Ok(usage)
+}
+
+fn read_fat_volume_free_bytes<D>(device: &mut D) -> Result<(u64, bool, u32), StorageError>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+{
+    let mut block = [Block::new()];
+    device
+        .read(&mut block, BlockIdx(0))
+        .map_err(|_| StorageError::Unavailable)?;
+    let partition = &block[0].contents;
+    let lba_start = read_le_u32(partition, 446 + 8).ok_or(StorageError::CorruptData)?;
+
+    device
+        .read(&mut block, BlockIdx(lba_start))
+        .map_err(|_| StorageError::Unavailable)?;
+    let bpb = &block[0].contents;
+    let bytes_per_sector = read_le_u16(bpb, 11).ok_or(StorageError::CorruptData)? as u32;
+    let sectors_per_cluster = u32::from(*bpb.get(13).ok_or(StorageError::CorruptData)?);
+    let reserved_sector_count = read_le_u16(bpb, 14).ok_or(StorageError::CorruptData)? as u32;
+    let fat_count = u32::from(*bpb.get(16).ok_or(StorageError::CorruptData)?);
+    let root_entry_count = read_le_u16(bpb, 17).ok_or(StorageError::CorruptData)? as u32;
+    let total_sectors16 = read_le_u16(bpb, 19).ok_or(StorageError::CorruptData)? as u32;
+    let total_sectors = if total_sectors16 != 0 {
+        total_sectors16
+    } else {
+        read_le_u32(bpb, 32).ok_or(StorageError::CorruptData)?
+    };
+    let fat_size16 = read_le_u16(bpb, 22).ok_or(StorageError::CorruptData)? as u32;
+    let fat_size = if fat_size16 != 0 {
+        fat_size16
+    } else {
+        read_le_u32(bpb, 36).ok_or(StorageError::CorruptData)?
+    };
+    let root_dir_sectors = ((root_entry_count * 32)
+        .saturating_add(bytes_per_sector.saturating_sub(1)))
+        / bytes_per_sector;
+    let data_sectors = total_sectors
+        .checked_sub(
+            reserved_sector_count
+                .saturating_add(fat_count.saturating_mul(fat_size))
+                .saturating_add(root_dir_sectors),
+        )
+        .ok_or(StorageError::CorruptData)?;
+    if sectors_per_cluster == 0 {
+        return Err(StorageError::CorruptData);
+    }
+    let cluster_count = data_sectors / sectors_per_cluster;
+    let cluster_size_bytes = bytes_per_sector.saturating_mul(sectors_per_cluster);
+
+    if cluster_count < 65_525 {
+        return Ok((0, false, cluster_size_bytes));
+    }
+
+    let fs_info_sector = read_le_u16(bpb, 48).ok_or(StorageError::CorruptData)? as u32;
+    if fs_info_sector == 0 || fs_info_sector == 0xFFFF {
+        return Ok((0, false, cluster_size_bytes));
+    }
+
+    device
+        .read(
+            &mut block,
+            BlockIdx(lba_start.saturating_add(fs_info_sector)),
+        )
+        .map_err(|_| StorageError::Unavailable)?;
+    let info = &block[0].contents;
+    if read_le_u32(info, 0) != Some(0x4161_5252)
+        || read_le_u32(info, 484) != Some(0x6141_7272)
+        || read_le_u32(info, 508) != Some(0xAA55_0000)
+    {
+        return Ok((0, false, cluster_size_bytes));
+    }
+
+    let free_clusters = read_le_u32(info, 488).ok_or(StorageError::CorruptData)?;
+    if free_clusters == u32::MAX {
+        return Ok((0, false, cluster_size_bytes));
+    }
+
+    Ok((
+        (free_clusters as u64).saturating_mul(cluster_size_bytes as u64),
+        true,
+        cluster_size_bytes,
+    ))
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let slice = bytes.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([slice[0], slice[1]]))
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let slice = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
 pub async fn open_cached_reader_content(
+    content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+) -> Result<Box<OpenedReaderContent>, StorageError> {
+    open_cached_reader_content_traced(TraceContext::none(), content_id).await
+}
+
+pub async fn open_cached_reader_content_traced(
+    trace: TraceContext,
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
 ) -> Result<Box<OpenedReaderContent>, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
     let started_at = Instant::now();
-    STORAGE_CMD_CH
-        .send(StorageCommand::OpenCachedReaderContent { content_id })
-        .await;
+    let command = StorageCommand::OpenCachedReaderContent { trace, content_id };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "open_cached_reader_content", 0);
 
     let result = match STORAGE_RESP_SIG.wait().await {
         StorageResponse::Opened(result) => result,
-        StorageResponse::Snapshot(_)
+        StorageResponse::CommitAndOpenPackage(_)
+        | StorageResponse::Snapshot(_)
         | StorageResponse::OpenedPackage(_)
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
@@ -774,49 +1294,90 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
     // non-empty SD manifests at boot materially increases heap pressure before the first
     // auth/TLS exchange.
     loop {
-        let response = match STORAGE_CMD_CH.receive().await {
-            StorageCommand::PersistSnapshot { kind, snapshot } => {
-                StorageResponse::Snapshot(storage.persist_snapshot(kind, *snapshot).map(Box::new))
-            }
+        let command = STORAGE_CMD_CH.receive().await;
+        storage_queue_on_dequeue(&command);
+        let response = match command {
+            StorageCommand::PersistSnapshot {
+                trace,
+                kind,
+                snapshot,
+            } => StorageResponse::Snapshot(
+                storage
+                    .persist_snapshot(trace, kind, *snapshot)
+                    .map(Box::new),
+            ),
             StorageCommand::BeginPackageStage {
+                trace,
                 content_id,
                 remote_revision,
-            } => StorageResponse::Unit(storage.begin_stage(content_id, remote_revision)),
-            StorageCommand::WritePackageChunk { len, bytes } => {
-                StorageResponse::Unit(storage.write_stage_chunk(&bytes[..len]))
+            } => StorageResponse::Unit(storage.begin_stage(trace, content_id, remote_revision)),
+            StorageCommand::WritePackageChunk { trace, len, bytes } => {
+                storage.queue_stage_chunk(trace, bytes.as_slice(len));
+                continue;
             }
             StorageCommand::CommitPackageStage {
+                trace,
                 collection,
                 remote_item_id,
             } => StorageResponse::Snapshot(
                 storage
-                    .commit_stage(collection, remote_item_id)
+                    .commit_stage(trace, collection, remote_item_id)
                     .map(Box::new),
             ),
-            StorageCommand::AbortPackageStage => StorageResponse::Unit(storage.abort_stage()),
+            StorageCommand::CommitAndOpenPackageStage {
+                trace,
+                collection,
+                remote_item_id,
+                content_id,
+            } => StorageResponse::CommitAndOpenPackage(
+                storage
+                    .commit_stage(trace, collection, remote_item_id)
+                    .map(Box::new)
+                    .map(|snapshot| {
+                        Box::new(CommitAndOpenPackageResult {
+                            snapshot,
+                            opened: storage
+                                .open_cached_reader_package(trace, content_id)
+                                .map(Box::new),
+                        })
+                    }),
+            ),
+            StorageCommand::AbortPackageStage { trace } => {
+                StorageResponse::Unit(storage.abort_stage(trace))
+            }
             StorageCommand::UpdatePackageState {
+                trace,
                 collection,
                 remote_item_id,
                 package_state,
             } => StorageResponse::Snapshot(
                 storage
-                    .update_manifest_item_state(collection, remote_item_id, package_state)
+                    .update_manifest_item_state(trace, collection, remote_item_id, package_state)
                     .map(Box::new),
             ),
-            StorageCommand::OpenCachedReaderPackage { content_id } => {
+            StorageCommand::OpenCachedReaderPackage { trace, content_id } => {
                 StorageResponse::OpenedPackage(
-                    storage.open_cached_reader_package(content_id).map(Box::new),
+                    storage
+                        .open_cached_reader_package(trace, content_id)
+                        .map(Box::new),
                 )
             }
             StorageCommand::LoadReaderWindow {
+                trace,
                 content_id,
                 window_start_unit_index,
-            } => StorageResponse::LoadedWindow(
-                storage.load_reader_window(content_id, window_start_unit_index),
-            ),
-            StorageCommand::OpenCachedReaderContent { content_id } => StorageResponse::Opened(
-                storage.open_cached_reader_content(content_id).map(Box::new),
-            ),
+            } => StorageResponse::LoadedWindow(storage.load_reader_window(
+                trace,
+                content_id,
+                window_start_unit_index,
+            )),
+            StorageCommand::OpenCachedReaderContent { trace, content_id } => {
+                StorageResponse::Opened(
+                    storage
+                        .open_cached_reader_content(trace, content_id)
+                        .map(Box::new),
+                )
+            }
         };
 
         STORAGE_RESP_SIG.signal(response);
@@ -863,6 +1424,7 @@ impl<'d> SdContentStorage<'d> {
     fn load_state(&mut self) -> Result<(), StorageError> {
         self.cleanup_active_stage_file()?;
         self.cache_index = self.read_cache_index()?.unwrap_or(CacheIndex::empty());
+        self.cleanup_orphan_package_slots()?;
 
         let saved = self
             .read_manifest_snapshot(CollectionKind::Saved)?
@@ -880,7 +1442,7 @@ impl<'d> SdContentStorage<'d> {
 
         self.reconcile_all_snapshots();
         self.refresh_collection_flags();
-        self.evict_if_needed()?;
+        self.evict_if_needed(TraceContext::none())?;
         Ok(())
     }
 
@@ -906,6 +1468,7 @@ impl<'d> SdContentStorage<'d> {
 
     fn persist_snapshot(
         &mut self,
+        trace: TraceContext,
         kind: CollectionKind,
         snapshot: CollectionManifestState,
     ) -> Result<CollectionManifestState, StorageError> {
@@ -913,12 +1476,34 @@ impl<'d> SdContentStorage<'d> {
         self.reconcile_snapshot(kind);
         self.refresh_collection_flags();
         self.write_manifest_snapshot(kind)?;
-        self.evict_if_needed()?;
-        Ok(self.snapshot(kind))
+        self.evict_if_needed(TraceContext::none())?;
+        let snapshot = self.snapshot(kind);
+        let metrics = self.storage_space_metrics()?;
+        crate::memtrace!(
+            "storage_snapshot",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "collection" = collection_label(kind),
+            "item_count" = snapshot.len(),
+            "sd_total_bytes" = metrics.sd_total_bytes,
+            "sd_free_bytes" = metrics.sd_free_bytes,
+            "sd_free_known" = bool_flag(metrics.sd_free_known),
+            "motif_total_bytes" = metrics.motif_total_bytes,
+            "manifest_bytes" = metrics.manifest_bytes,
+            "cache_bytes" = metrics.cache_bytes,
+            "stage_bytes" = metrics.stage_bytes,
+            "package_bytes" = metrics.package_bytes,
+            "cache_entries" = metrics.cache_entry_count,
+            "cache_budget_remaining" = metrics.cache_budget_remaining,
+        );
+        Ok(snapshot)
     }
 
     fn begin_stage(
         &mut self,
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
         remote_revision: u64,
     ) -> Result<(), StorageError> {
@@ -936,39 +1521,109 @@ impl<'d> SdContentStorage<'d> {
             return Err(StorageError::PartitionFull);
         };
 
-        self.delete_stage_file()?;
-        self.write_stage_file(&[])?;
+        let direct_to_package = overwritten_entry.is_none();
+        let (target_kind, stage_volume, stage_file) =
+            self.open_pending_stage_writer(slot_id, direct_to_package)?;
+        let metrics = self.storage_space_metrics_for_open_volume(stage_volume)?;
         info!(
-            "content storage stage begin content_id={} revision={} slot={} superseded_slot={:?} overwritten_slot={:?} cache_entries={} cache_bytes={}",
+            "content storage stage begin content_id={} revision={} slot={} target={} superseded_slot={:?} overwritten_slot={:?} cache_entries={} cache_bytes={}",
             content_id.as_str(),
             remote_revision,
             slot_id,
+            target_kind.label(),
             superseded_entry.map(|entry| entry.slot_id),
             overwritten_entry.map(|entry| entry.slot_id),
             self.cache_index.len(),
             self.cache_index.total_bytes(),
         );
+        self.pending_stage_error = None;
         self.pending_stage = Some(PendingStage {
+            trace,
             content_id,
             remote_revision,
             slot_id,
+            target_kind,
+            stage_volume,
+            stage_file,
             bytes_written: 0,
+            flushed_bytes: 0,
             crc32: 0xFFFF_FFFF,
             started_at_ms: storage_now_ms(),
             overwritten_entry,
             superseded_entry,
         });
+        crate::memtrace!(
+            "storage_stage",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "action" = "begin",
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "content_id" = content_id.as_str(),
+            "slot_id" = slot_id,
+            "target" = target_kind.label(),
+            "remote_revision" = remote_revision,
+            "cache_entries" = self.cache_index.len(),
+            "cache_bytes" = self.cache_index.total_bytes(),
+            "superseded_slot" = superseded_entry.map(|entry| entry.slot_id).unwrap_or(0),
+            "overwritten_slot" = overwritten_entry.map(|entry| entry.slot_id).unwrap_or(0),
+            "sd_total_bytes" = metrics.sd_total_bytes,
+            "sd_free_bytes" = metrics.sd_free_bytes,
+            "sd_free_known" = bool_flag(metrics.sd_free_known),
+            "motif_total_bytes" = metrics.motif_total_bytes,
+            "stage_bytes" = metrics.stage_bytes,
+            "package_bytes" = metrics.package_bytes,
+            "cache_budget_remaining" = metrics.cache_budget_remaining,
+        );
         Ok(())
     }
 
-    fn write_stage_chunk(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
+    fn write_stage_chunk(
+        &mut self,
+        _trace: TraceContext,
+        chunk: &[u8],
+    ) -> Result<(), StorageError> {
         let Some(mut stage) = self.pending_stage else {
             return Err(StorageError::Unavailable);
         };
+        let trace = stage.trace;
 
-        self.append_stage_file(chunk)?;
+        self.append_stage_file(stage.stage_file, chunk)?;
         stage.bytes_written = stage.bytes_written.saturating_add(chunk.len() as u32);
         stage.crc32 = crc32_continue(stage.crc32, chunk);
+        let dirty_bytes = stage.bytes_written.saturating_sub(stage.flushed_bytes);
+        if dirty_bytes >= STAGE_FLUSH_INTERVAL_BYTES {
+            self.flush_stage_file(stage.stage_file)?;
+            stage.flushed_bytes = stage.bytes_written;
+            let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
+            info!(
+                "content storage stage flush content_id={} slot={} bytes_written={} dirty_bytes={} elapsed_ms={}",
+                stage.content_id.as_str(),
+                stage.slot_id,
+                stage.bytes_written,
+                dirty_bytes,
+                storage_elapsed_since_ms(stage.started_at_ms),
+            );
+            crate::memtrace!(
+                "storage_stage",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "flush",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = stage.content_id.as_str(),
+                "slot_id" = stage.slot_id,
+                "bytes_written" = stage.bytes_written,
+                "dirty_bytes" = dirty_bytes,
+                "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+                "sd_total_bytes" = metrics.sd_total_bytes,
+                "sd_free_bytes" = metrics.sd_free_bytes,
+                "sd_free_known" = bool_flag(metrics.sd_free_known),
+                "stage_bytes" = metrics.stage_bytes,
+                "package_bytes" = metrics.package_bytes,
+                "motif_total_bytes" = metrics.motif_total_bytes,
+            );
+        }
         let crossed_progress_boundary = if stage.bytes_written == chunk.len() as u32 {
             true
         } else {
@@ -977,6 +1632,7 @@ impl<'d> SdContentStorage<'d> {
                     / STAGE_PROGRESS_LOG_INTERVAL_BYTES
         };
         if crossed_progress_boundary {
+            let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
             info!(
                 "content storage stage progress content_id={} slot={} bytes_written={} chunk_len={} elapsed_ms={}",
                 stage.content_id.as_str(),
@@ -985,30 +1641,132 @@ impl<'d> SdContentStorage<'d> {
                 chunk.len(),
                 storage_elapsed_since_ms(stage.started_at_ms),
             );
+            crate::memtrace!(
+                "storage_stage",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "progress",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = stage.content_id.as_str(),
+                "slot_id" = stage.slot_id,
+                "bytes_written" = stage.bytes_written,
+                "chunk_len" = chunk.len(),
+                "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+                "sd_total_bytes" = metrics.sd_total_bytes,
+                "sd_free_bytes" = metrics.sd_free_bytes,
+                "sd_free_known" = bool_flag(metrics.sd_free_known),
+                "stage_bytes" = metrics.stage_bytes,
+                "package_bytes" = metrics.package_bytes,
+                "motif_total_bytes" = metrics.motif_total_bytes,
+            );
         }
         self.pending_stage = Some(stage);
         Ok(())
     }
 
+    fn queue_stage_chunk(&mut self, trace: TraceContext, chunk: &[u8]) {
+        if self.pending_stage_error.is_some() {
+            return;
+        }
+
+        if let Err(err) = self.write_stage_chunk(trace, chunk) {
+            self.record_pending_stage_error(trace, err);
+        }
+    }
+
     fn commit_stage(
         &mut self,
+        _trace: TraceContext,
         collection: CollectionKind,
         remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
     ) -> Result<CollectionManifestState, StorageError> {
         let Some(stage) = self.pending_stage.take() else {
             return Err(StorageError::Unavailable);
         };
+        let trace = stage.trace;
+        if let Some(err) = self.pending_stage_error.take() {
+            self.cleanup_pending_stage_target(&stage)?;
+            info!(
+                "content storage stage commit failed content_id={} slot={} target={} err={:?}",
+                stage.content_id.as_str(),
+                stage.slot_id,
+                stage.target_kind.label(),
+                err,
+            );
+            crate::memtrace!(
+                "storage_stage",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "error",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = stage.content_id.as_str(),
+                "slot_id" = stage.slot_id,
+                "target" = stage.target_kind.label(),
+                "error" = storage_error_label(err),
+                "bytes_written" = stage.bytes_written,
+                "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+            );
+            return Err(err);
+        }
 
-        let header = self.validate_staged_reader_package(stage.bytes_written)?;
+        if stage.bytes_written != stage.flushed_bytes {
+            self.flush_stage_file(stage.stage_file)?;
+            let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
+            let dirty_bytes = stage.bytes_written.saturating_sub(stage.flushed_bytes);
+            info!(
+                "content storage stage flush content_id={} slot={} bytes_written={} dirty_bytes={} elapsed_ms={}",
+                stage.content_id.as_str(),
+                stage.slot_id,
+                stage.bytes_written,
+                dirty_bytes,
+                storage_elapsed_since_ms(stage.started_at_ms),
+            );
+            crate::memtrace!(
+                "storage_stage",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "flush",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = stage.content_id.as_str(),
+                "slot_id" = stage.slot_id,
+                "bytes_written" = stage.bytes_written,
+                "dirty_bytes" = dirty_bytes,
+                "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+                "sd_total_bytes" = metrics.sd_total_bytes,
+                "sd_free_bytes" = metrics.sd_free_bytes,
+                "sd_free_known" = bool_flag(metrics.sd_free_known),
+                "stage_bytes" = metrics.stage_bytes,
+                "package_bytes" = metrics.package_bytes,
+                "motif_total_bytes" = metrics.motif_total_bytes,
+            );
+        }
+        self.close_stage_writer(&stage)?;
+        let header = match stage.target_kind {
+            PendingStageTargetKind::StagingFile => {
+                self.validate_staged_reader_package(stage.bytes_written)?
+            }
+            PendingStageTargetKind::PackageSlot => {
+                self.validate_package_slot_reader_package(stage.slot_id, stage.bytes_written)?
+            }
+        };
 
-        self.copy_stage_to_package_slot(stage.slot_id)?;
+        let copied_bytes = match stage.target_kind {
+            PendingStageTargetKind::StagingFile => {
+                let copied = self.copy_stage_to_package_slot(stage.slot_id)?;
+                self.delete_stage_file()?;
+                copied
+            }
+            PendingStageTargetKind::PackageSlot => 0,
+        };
         self.write_package_meta(
             stage.slot_id,
             stage.remote_revision,
             stage.bytes_written,
             !stage.crc32,
         )?;
-        self.delete_stage_file()?;
 
         if let Some(entry) = stage.overwritten_entry {
             let _ = self.cache_index.remove_slot(entry.slot_id);
@@ -1036,13 +1794,19 @@ impl<'d> SdContentStorage<'d> {
         });
         self.refresh_collection_flags();
         self.write_cache_index()?;
-        let snapshot =
-            self.update_manifest_item_state(collection, remote_item_id, PackageState::Cached)?;
-        self.evict_if_needed()?;
+        let snapshot = self.update_manifest_item_state(
+            trace,
+            collection,
+            remote_item_id,
+            PackageState::Cached,
+        )?;
+        self.evict_if_needed(trace)?;
+        let metrics = self.storage_space_metrics()?;
         info!(
-            "content storage stage commit content_id={} slot={} bytes_written={} crc32=0x{:08x} collection={:?} remote_item_id={} overwritten_slot={:?} superseded_slot={:?} total_units={} paragraphs={} elapsed_ms={}",
+            "content storage stage commit content_id={} slot={} target={} bytes_written={} crc32=0x{:08x} collection={:?} remote_item_id={} overwritten_slot={:?} superseded_slot={:?} total_units={} paragraphs={} elapsed_ms={}",
             stage.content_id.as_str(),
             stage.slot_id,
+            stage.target_kind.label(),
             stage.bytes_written,
             !stage.crc32,
             collection,
@@ -1053,25 +1817,76 @@ impl<'d> SdContentStorage<'d> {
             header.paragraph_count,
             storage_elapsed_since_ms(stage.started_at_ms),
         );
+        crate::memtrace!(
+            "storage_stage",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "action" = "commit",
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "collection" = collection_label(collection),
+            "content_id" = stage.content_id.as_str(),
+            "remote_item_id" = remote_item_id.as_str(),
+            "slot_id" = stage.slot_id,
+            "target" = stage.target_kind.label(),
+            "bytes_written" = stage.bytes_written,
+            "copied_bytes" = copied_bytes,
+            "crc32" = !stage.crc32,
+            "total_units" = header.unit_count,
+            "paragraph_count" = header.paragraph_count,
+            "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+            "sd_total_bytes" = metrics.sd_total_bytes,
+            "sd_free_bytes" = metrics.sd_free_bytes,
+            "sd_free_known" = bool_flag(metrics.sd_free_known),
+            "motif_total_bytes" = metrics.motif_total_bytes,
+            "stage_bytes" = metrics.stage_bytes,
+            "package_bytes" = metrics.package_bytes,
+            "cache_budget_remaining" = metrics.cache_budget_remaining,
+        );
         Ok(snapshot)
     }
 
-    fn abort_stage(&mut self) -> Result<(), StorageError> {
+    fn abort_stage(&mut self, _trace: TraceContext) -> Result<(), StorageError> {
         if let Some(stage) = self.pending_stage {
+            let trace = stage.trace;
+            let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
             info!(
-                "content storage stage abort content_id={} slot={} bytes_written={} elapsed_ms={}",
+                "content storage stage abort content_id={} slot={} target={} bytes_written={} elapsed_ms={}",
                 stage.content_id.as_str(),
                 stage.slot_id,
+                stage.target_kind.label(),
                 stage.bytes_written,
                 storage_elapsed_since_ms(stage.started_at_ms),
             );
+            crate::memtrace!(
+                "storage_stage",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "abort",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = stage.content_id.as_str(),
+                "slot_id" = stage.slot_id,
+                "target" = stage.target_kind.label(),
+                "bytes_written" = stage.bytes_written,
+                "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+                "sd_total_bytes" = metrics.sd_total_bytes,
+                "sd_free_bytes" = metrics.sd_free_bytes,
+                "sd_free_known" = bool_flag(metrics.sd_free_known),
+                "stage_bytes" = metrics.stage_bytes,
+                "package_bytes" = metrics.package_bytes,
+                "motif_total_bytes" = metrics.motif_total_bytes,
+            );
+            self.cleanup_pending_stage_target(&stage)?;
         }
         self.pending_stage = None;
-        self.delete_stage_file()
+        self.pending_stage_error = None;
+        Ok(())
     }
 
     fn update_manifest_item_state(
         &mut self,
+        trace: TraceContext,
         collection: CollectionKind,
         remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
         package_state: PackageState,
@@ -1081,11 +1896,24 @@ impl<'d> SdContentStorage<'d> {
             let _ = snapshot.update_package_state(&remote_item_id, package_state);
         }
         self.write_manifest_snapshot(collection)?;
-        Ok(self.snapshot(collection))
+        let snapshot = self.snapshot(collection);
+        crate::memtrace!(
+            "storage_package_state",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "collection" = collection_label(collection),
+            "remote_item_id" = remote_item_id.as_str(),
+            "package_state" = package_state as u8,
+            "item_count" = snapshot.len(),
+        );
+        Ok(snapshot)
     }
 
     fn open_cached_reader_content(
         &mut self,
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     ) -> Result<OpenedReaderContent, StorageError> {
         let started_at = Instant::now();
@@ -1135,6 +1963,20 @@ impl<'d> SdContentStorage<'d> {
                         source.crc32(),
                         err,
                     );
+                    crate::memtrace!(
+                        "reader_open",
+                        "component" = "storage",
+                        "at_ms" = storage_now_ms(),
+                        "action" = "parse_failed",
+                        "sync_id" = trace.sync_id,
+                        "req_id" = trace.req_id,
+                        "content_id" = content_id.as_str(),
+                        "slot_id" = entry.slot_id,
+                        "bytes_read" = source.bytes_read(),
+                        "expected_bytes" = meta.size_bytes,
+                        "expected_crc32" = meta.crc32,
+                        "actual_crc32" = source.crc32(),
+                    );
                     return Err(err);
                 }
             };
@@ -1172,6 +2014,23 @@ impl<'d> SdContentStorage<'d> {
                 opened.document.paragraph_count,
                 opened.truncated,
             );
+            crate::memtrace!(
+                "reader_open",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "parsed",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = content_id.as_str(),
+                "slot_id" = entry.slot_id,
+                "bytes_read" = source.bytes_read(),
+                "expected_bytes" = meta.size_bytes,
+                "parse_ms" = parse_ms,
+                "total_ms" = total_ms,
+                "unit_count" = opened.document.unit_count,
+                "paragraph_count" = opened.document.paragraph_count,
+                "truncated" = bool_flag(opened.truncated),
+            );
             opened
         };
 
@@ -1185,6 +2044,7 @@ impl<'d> SdContentStorage<'d> {
 
     fn open_cached_reader_package(
         &mut self,
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     ) -> Result<OpenedReaderPackage, StorageError> {
         let entry = self
@@ -1229,6 +2089,22 @@ impl<'d> SdContentStorage<'d> {
                 window.start_unit_index,
                 window.unit_count,
             );
+            crate::memtrace!(
+                "reader_package",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "action" = "open",
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = content_id.as_str(),
+                "slot_id" = entry.slot_id,
+                "size_bytes" = meta.size_bytes,
+                "title_bytes" = header.title_len,
+                "total_units" = header.unit_count,
+                "paragraph_count" = header.paragraph_count,
+                "initial_window_start" = window.start_unit_index,
+                "initial_window_units" = window.unit_count,
+            );
             OpenedReaderPackage {
                 title,
                 total_units: header.unit_count,
@@ -1247,6 +2123,7 @@ impl<'d> SdContentStorage<'d> {
 
     fn load_reader_window(
         &mut self,
+        trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
         window_start_unit_index: u32,
     ) -> Result<ReaderWindow, StorageError> {
@@ -1288,6 +2165,20 @@ impl<'d> SdContentStorage<'d> {
             window.unit_count,
             header.unit_count,
             header.paragraph_count,
+        );
+        crate::memtrace!(
+            "reader_window",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "content_id" = content_id.as_str(),
+            "slot_id" = entry.slot_id,
+            "requested_start" = window_start_unit_index,
+            "loaded_start" = window.start_unit_index,
+            "unit_count" = window.unit_count,
+            "total_units" = header.unit_count,
+            "paragraph_count" = header.paragraph_count,
         );
         Ok(window)
     }
@@ -1354,16 +2245,39 @@ impl<'d> SdContentStorage<'d> {
         }
     }
 
-    fn evict_if_needed(&mut self) -> Result<(), StorageError> {
+    fn evict_if_needed(&mut self, trace: TraceContext) -> Result<(), StorageError> {
         while self.cache_index.len() > CACHE_ENTRY_CAPACITY
             || self.cache_index.total_bytes() > CACHE_SIZE_BUDGET_BYTES
         {
             let Some(candidate) = self.select_eviction_candidate() else {
                 break;
             };
+            let before = self.storage_space_metrics()?;
             self.delete_package_slot(candidate.slot_id)?;
             let _ = self.cache_index.remove_slot(candidate.slot_id);
             self.reconcile_all_snapshots();
+            let after = self.storage_space_metrics()?;
+            crate::memtrace!(
+                "storage_evict",
+                "component" = "storage",
+                "at_ms" = storage_now_ms(),
+                "sync_id" = trace.sync_id,
+                "req_id" = trace.req_id,
+                "content_id" = candidate.content_id.as_str(),
+                "slot_id" = candidate.slot_id,
+                "deleted_bytes" = candidate.size_bytes,
+                "cache_entries_before" = before.cache_entry_count,
+                "cache_entries_after" = after.cache_entry_count,
+                "cache_budget_remaining_before" = before.cache_budget_remaining,
+                "cache_budget_remaining_after" = after.cache_budget_remaining,
+                "sd_free_bytes_before" = before.sd_free_bytes,
+                "sd_free_bytes_after" = after.sd_free_bytes,
+                "sd_free_known" = bool_flag(after.sd_free_known),
+                "motif_total_bytes_before" = before.motif_total_bytes,
+                "motif_total_bytes_after" = after.motif_total_bytes,
+                "package_bytes_before" = before.package_bytes,
+                "package_bytes_after" = after.package_bytes,
+            );
         }
 
         self.write_cache_index()?;
@@ -1459,12 +2373,63 @@ impl<'d> SdContentStorage<'d> {
     }
 
     fn cleanup_active_stage_file(&mut self) -> Result<(), StorageError> {
-        self.pending_stage = None;
+        if let Some(stage) = self.pending_stage.take() {
+            self.cleanup_pending_stage_target(&stage)?;
+        }
+        self.pending_stage_error = None;
         self.delete_stage_file()
+    }
+
+    fn record_pending_stage_error(&mut self, trace: TraceContext, err: StorageError) {
+        let Some(stage) = self.pending_stage.as_ref() else {
+            self.pending_stage_error = Some(err);
+            return;
+        };
+
+        info!(
+            "content storage stage async error content_id={} slot={} target={} err={:?}",
+            stage.content_id.as_str(),
+            stage.slot_id,
+            stage.target_kind.label(),
+            err,
+        );
+        crate::memtrace!(
+            "storage_stage",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "action" = "async_error",
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "content_id" = stage.content_id.as_str(),
+            "slot_id" = stage.slot_id,
+            "target" = stage.target_kind.label(),
+            "error" = storage_error_label(err),
+            "bytes_written" = stage.bytes_written,
+            "elapsed_ms" = storage_elapsed_since_ms(stage.started_at_ms),
+        );
+        self.pending_stage_error = Some(err);
     }
 
     fn validate_staged_reader_package(
         &mut self,
+        expected_size: u32,
+    ) -> Result<ReaderPackageHeader, StorageError> {
+        self.validate_reader_package_file(STAGING_DIR_NAME, ACTIVE_STAGE_FILE_NAME, expected_size)
+    }
+
+    fn validate_package_slot_reader_package(
+        &mut self,
+        slot_id: u8,
+        expected_size: u32,
+    ) -> Result<ReaderPackageHeader, StorageError> {
+        let payload_name = package_payload_file_name(slot_id);
+        self.validate_reader_package_file(PACKAGE_DIR_NAME, payload_name.as_str(), expected_size)
+    }
+
+    fn validate_reader_package_file(
+        &mut self,
+        subdir_name: &str,
+        file_name: &str,
         expected_size: u32,
     ) -> Result<ReaderPackageHeader, StorageError> {
         let volume = self
@@ -1474,9 +2439,9 @@ impl<'d> SdContentStorage<'d> {
         let root = volume.open_root_dir().map_err(map_sd_error)?;
         let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
         let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
-        let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
-        let mut file = stage_dir
-            .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadOnly)
+        let dir = v1.open_dir(subdir_name).map_err(map_sd_error)?;
+        let mut file = dir
+            .open_file_in_dir(file_name, Mode::ReadOnly)
             .map_err(map_sd_error)?;
         if file.length() != expected_size {
             return Err(StorageError::CorruptData);
@@ -1510,28 +2475,76 @@ impl<'d> SdContentStorage<'d> {
         }
     }
 
-    fn write_stage_file(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
-        self.write_named_file_in_stage_dir(ACTIVE_STAGE_FILE_NAME, bytes)
-    }
-
-    fn append_stage_file(&mut self, bytes: &[u8]) -> Result<(), StorageError> {
+    fn open_pending_stage_writer(
+        &mut self,
+        slot_id: u8,
+        direct_to_package: bool,
+    ) -> Result<(PendingStageTargetKind, RawVolume, RawFile), StorageError> {
         let volume = self
             .volume_mgr
             .open_volume(VolumeIdx(0))
             .map_err(map_sd_error)?;
-        let root = volume.open_root_dir().map_err(map_sd_error)?;
-        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
-        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
-        let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
-        let file = stage_dir
-            .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadWriteCreateOrAppend)
-            .map_err(map_sd_error)?;
-        file.write(bytes).map_err(map_sd_error)?;
-        file.flush().map_err(map_sd_error)?;
-        Ok(())
+        let target_kind = if direct_to_package {
+            PendingStageTargetKind::PackageSlot
+        } else {
+            PendingStageTargetKind::StagingFile
+        };
+        let stage_file = {
+            let root = volume.open_root_dir().map_err(map_sd_error)?;
+            let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+            let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+            match target_kind {
+                PendingStageTargetKind::StagingFile => {
+                    let stage_dir = v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?;
+                    stage_dir
+                        .open_file_in_dir(ACTIVE_STAGE_FILE_NAME, Mode::ReadWriteCreateOrTruncate)
+                        .map_err(map_sd_error)?
+                        .to_raw_file()
+                }
+                PendingStageTargetKind::PackageSlot => {
+                    let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+                    let payload_name = package_payload_file_name(slot_id);
+                    pkg_dir
+                        .open_file_in_dir(payload_name.as_str(), Mode::ReadWriteCreateOrTruncate)
+                        .map_err(map_sd_error)?
+                        .to_raw_file()
+                }
+            }
+        };
+        Ok((target_kind, volume.to_raw_volume(), stage_file))
     }
 
-    fn copy_stage_to_package_slot(&mut self, slot_id: u8) -> Result<(), StorageError> {
+    fn append_stage_file(&self, stage_file: RawFile, bytes: &[u8]) -> Result<(), StorageError> {
+        self.volume_mgr
+            .write(stage_file, bytes)
+            .map_err(map_sd_error)
+    }
+
+    fn flush_stage_file(&self, stage_file: RawFile) -> Result<(), StorageError> {
+        self.volume_mgr.flush_file(stage_file).map_err(map_sd_error)
+    }
+
+    fn close_stage_writer(&self, stage: &PendingStage) -> Result<(), StorageError> {
+        let file_result = self
+            .volume_mgr
+            .close_file(stage.stage_file)
+            .map_err(map_sd_error);
+        let volume_result = self
+            .volume_mgr
+            .close_volume(stage.stage_volume)
+            .map_err(map_sd_error);
+        file_result.and(volume_result)
+    }
+
+    fn cleanup_pending_stage_target(&mut self, stage: &PendingStage) -> Result<(), StorageError> {
+        self.close_stage_writer(stage)?;
+        match stage.target_kind {
+            PendingStageTargetKind::StagingFile => self.delete_stage_file(),
+            PendingStageTargetKind::PackageSlot => self.delete_package_slot(stage.slot_id),
+        }
+    }
+
+    fn copy_stage_to_package_slot(&mut self, slot_id: u8) -> Result<u32, StorageError> {
         self.write_named_file_in_pkg_dir(&package_payload_file_name(slot_id), &[])?;
 
         let volume = self
@@ -1554,15 +2567,17 @@ impl<'d> SdContentStorage<'d> {
             .map_err(map_sd_error)?;
 
         let mut buffer = [0u8; PACKAGE_COPY_BUFFER_LEN];
+        let mut copied_bytes = 0u32;
         loop {
             let read = stage_file.read(&mut buffer).map_err(map_sd_error)?;
             if read == 0 {
                 break;
             }
             payload_file.write(&buffer[..read]).map_err(map_sd_error)?;
+            copied_bytes = copied_bytes.saturating_add(read as u32);
         }
         payload_file.flush().map_err(map_sd_error)?;
-        Ok(())
+        Ok(copied_bytes)
     }
 
     fn delete_package_slot(&mut self, slot_id: u8) -> Result<(), StorageError> {
@@ -1586,6 +2601,81 @@ impl<'d> SdContentStorage<'d> {
         }
 
         Ok(())
+    }
+
+    fn storage_space_metrics(&self) -> Result<StorageSpaceMetrics, StorageError> {
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let raw_volume = volume.to_raw_volume();
+        let metrics = self.storage_space_metrics_for_open_volume(raw_volume)?;
+        self.volume_mgr
+            .close_volume(raw_volume)
+            .map_err(map_sd_error)?;
+        Ok(metrics)
+    }
+
+    fn storage_space_metrics_for_open_volume(
+        &self,
+        volume: RawVolume,
+    ) -> Result<StorageSpaceMetrics, StorageError> {
+        let (manifest, cache, stage, package) = {
+            let root = self
+                .volume_mgr
+                .open_root_dir(volume)
+                .map_err(map_sd_error)?
+                .to_directory(&self.volume_mgr);
+            let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+            let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+            let manifest = read_dir_usage(&v1.open_dir(MANIFEST_DIR_NAME).map_err(map_sd_error)?)?;
+            let cache = read_dir_usage(&v1.open_dir(CACHE_DIR_NAME).map_err(map_sd_error)?)?;
+            let stage = read_dir_usage(&v1.open_dir(STAGING_DIR_NAME).map_err(map_sd_error)?)?;
+            let package = read_dir_usage(&v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?)?;
+            (manifest, cache, stage, package)
+        };
+        let (sd_free_bytes, sd_free_known, sd_cluster_size_bytes) =
+            self.read_sd_free_bytes().unwrap_or((0, false, 0));
+
+        Ok(StorageSpaceMetrics {
+            sd_total_bytes: self.total_bytes,
+            sd_free_bytes,
+            sd_free_known,
+            sd_cluster_size_bytes,
+            motif_total_bytes: manifest
+                .bytes
+                .saturating_add(cache.bytes)
+                .saturating_add(stage.bytes)
+                .saturating_add(package.bytes),
+            manifest_bytes: manifest.bytes,
+            cache_bytes: cache.bytes,
+            stage_bytes: stage.bytes,
+            package_bytes: package.bytes,
+            package_files: package.files,
+            cache_entry_count: self.cache_index.len(),
+            cache_budget_remaining: CACHE_SIZE_BUDGET_BYTES
+                .saturating_sub(self.cache_index.total_bytes()),
+        })
+    }
+
+    fn cleanup_orphan_package_slots(&mut self) -> Result<(), StorageError> {
+        let mut slot_id = 1u8;
+        while (slot_id as usize) <= CACHE_ENTRY_CAPACITY {
+            if !self.cache_index.contains_slot(slot_id) {
+                self.delete_package_slot(slot_id)?;
+            }
+            slot_id = slot_id.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn read_sd_free_bytes(&self) -> Result<(u64, bool, u32), StorageError> {
+        let mut result = None;
+        let _ = self.volume_mgr.device(|device| {
+            result = Some(read_fat_volume_free_bytes(device));
+            FixedTimeSource
+        });
+        result.unwrap_or(Err(StorageError::Unavailable))
     }
 
     fn write_named_file_in_manif_dir(
@@ -1794,6 +2884,21 @@ fn collection_index(kind: CollectionKind) -> usize {
         CollectionKind::Saved => 0,
         CollectionKind::Inbox => 1,
         CollectionKind::Recommendations => 2,
+    }
+}
+
+const fn storage_error_label(error: StorageError) -> &'static str {
+    match error {
+        StorageError::Unavailable => "unavailable",
+        StorageError::PartitionMissing => "partition_missing",
+        StorageError::InvalidPartition => "invalid_partition",
+        StorageError::CorruptData => "corrupt_data",
+        StorageError::PayloadTooLarge => "payload_too_large",
+        StorageError::PartitionFull => "partition_full",
+        StorageError::UnsupportedLayout => "unsupported_layout",
+        StorageError::TooManyKeys => "too_many_keys",
+        StorageError::FlashFailure => "flash_failure",
+        StorageError::CodecFailure => "codec_failure",
     }
 }
 

@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::net::IpAddr;
-use core::{ffi::CStr, fmt::Write as _, future::Future, net::SocketAddr, ptr::addr_of_mut, str};
+use core::{ffi::CStr, fmt::Write as _, future::Future, mem::size_of, net::SocketAddr, str};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -24,8 +24,8 @@ use esp_hal::{
 };
 use log::info;
 use mbedtls_rs::{
-    Certificate, ClientSessionConfig, Session, SessionConfig, SessionError, Tls, TlsReference,
-    TlsVersion, X509,
+    Certificate, ClientSessionConfig, SerializedClientSession, Session, SessionConfig,
+    SessionError, Tls, TlsReference, TlsVersion, X509,
 };
 use services::backend_sync::SyncStatus;
 use services::storage::StorageError;
@@ -34,6 +34,7 @@ use crate::{
     bootstrap::{persist_backend_credential, publish_event},
     content_storage,
     storage::{BACKEND_REFRESH_TOKEN_MAX_LEN, BackendCredential},
+    telemetry::{TraceContext, bool_flag, collection_label, next_request_id, next_sync_id},
 };
 use domain::{
     content::{
@@ -52,9 +53,9 @@ const BACKEND_BASE_URL: &str = "https://motif-backend-production-a143.up.railway
 const HEALTH_PATH: &str = "/health";
 const REFRESH_PATH: &str = "/device/v1/auth/session/refresh";
 const ME_PATH: &str = "/device/v1/me";
-const INBOX_PATH: &str = "/device/v1/me/inbox?limit=16";
-const SAVED_CONTENT_PATH: &str = "/device/v1/me/saved-content?limit=16&archived=false";
-const RECOMMENDATIONS_PATH: &str = "/device/v1/me/recommendations/content?limit=16";
+const INBOX_PATH: &str = "/device/v1/me/inbox";
+const SAVED_CONTENT_PATH: &str = "/device/v1/me/saved-content";
+const RECOMMENDATIONS_PATH: &str = "/device/v1/me/recommendations/content";
 pub(crate) const BACKEND_PORT: u16 = 443;
 const NETWORK_POLL_MS: u64 = 500;
 const RETRY_BACKOFF_MS: u64 = 10_000;
@@ -63,19 +64,30 @@ const TRANSPORT_RETRY_BACKOFF_MS: u64 = 750;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
 const HTTP_BODY_TIMEOUT_SECS: u64 = 15;
-const KEEPALIVE_IDLE_TIMEOUT_SECS: u64 = 10;
-const KEEPALIVE_PING_INTERVAL_SECS: u64 = 5;
+const REQUEST_NETWORK_READY_TIMEOUT_SECS: u64 = 6;
+const REQUEST_NETWORK_READY_POLL_MS: u64 = 250;
+// Real device traces showed that an aggressive background `/device/v1/me`
+// keepalive could kill an otherwise healthy reusable TLS session between two
+// article opens. Keep passive reuse for nearby follow-up requests, but apply a
+// much stricter age limit to streaming package fetches because the server path
+// was already resetting ~20 s idle package sockets on first write.
+const REUSABLE_BUFFERED_SESSION_IDLE_TIMEOUT_SECS: u64 = 60;
+const REUSABLE_STREAMING_SESSION_IDLE_TIMEOUT_SECS: u64 = 10;
 const MBEDTLS_DEBUG_LEVEL: u32 = 1;
 const STREAM_PROGRESS_LOG_INTERVAL_BYTES: usize = 16 * 1024;
 const HTTP_RESPONSE_MAX_LEN: usize = 8 * 1024;
 const HTTP_STREAM_HEADER_MAX_LEN: usize = 2048;
+const COLLECTION_PAGE_LIMIT: usize = 4;
+const COLLECTION_CURSOR_MAX_LEN: usize = 192;
+const COLLECTION_PAGE_PATH_MAX_LEN: usize = 320;
+const COLLECTION_FETCH_MAX_PAGES: usize = 32;
 const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
 const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
-// 1 KiB halves package read/write round-trips while adding only ~512 B to the
-// backend streaming scratch buffer. A 2 KiB jump would cost noticeably more
-// RAM once the storage queue and sender-side scratch buffer are included.
-const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 1024;
+// A 4 KiB staging chunk lets the backend coalesce several smaller socket reads
+// before each storage round-trip, which materially improves uncached package
+// download throughput while the payload scratch lives in PSRAM-backed buffers.
+const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 4 * 1024;
 // Package prefetch materially increases boot-time latency and was timing out on
 // real device/package responses. Keep startup focused on refresh + manifest sync.
 const STARTUP_SAVED_PREFETCH_ENABLED: bool = false;
@@ -84,9 +96,15 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const BACKEND_CA_CHAIN_PEM: &str =
     concat!(include_str!("../certs/letsencrypt_isrg_root_x1.pem"), "\0");
 const BACKEND_CMD_QUEUE_CAPACITY: usize = 4;
-type BackendTcpClientState = TcpClientState<1, 1024, 1024>;
-type BackendTcpClient<'a> = TcpClient<'a, 1, 1024, 1024>;
-type BackendTcpConnection<'a> = TcpConnection<'a, 1, 1024, 1024>;
+// Keep the transport buffers aligned with the 4 KiB package chunk size so the
+// socket layer is not forced to drip-feed an otherwise larger streaming path.
+const BACKEND_TCP_RX_BUFFER_LEN: usize = 4 * 1024;
+const BACKEND_TCP_TX_BUFFER_LEN: usize = 4 * 1024;
+type BackendTcpClientState =
+    TcpClientState<1, BACKEND_TCP_RX_BUFFER_LEN, BACKEND_TCP_TX_BUFFER_LEN>;
+type BackendTcpClient<'a> = TcpClient<'a, 1, BACKEND_TCP_RX_BUFFER_LEN, BACKEND_TCP_TX_BUFFER_LEN>;
+type BackendTcpConnection<'a> =
+    TcpConnection<'a, 1, BACKEND_TCP_RX_BUFFER_LEN, BACKEND_TCP_TX_BUFFER_LEN>;
 type BackendTlsSession<'a> = Session<'a, CompatConnection<BackendTcpConnection<'a>>>;
 
 static BACKEND_CMD_CH: Channel<
@@ -94,7 +112,6 @@ static BACKEND_CMD_CH: Channel<
     BackendCommand,
     BACKEND_CMD_QUEUE_CAPACITY,
 > = Channel::new();
-static mut HTTP_RESPONSE_BUFFER: [u8; HTTP_RESPONSE_MAX_LEN] = [0; HTTP_RESPONSE_MAX_LEN];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CredentialSource {
@@ -158,8 +175,12 @@ struct MeProfile {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct CollectionFetchSummary {
+    trace: TraceContext,
     item_count: usize,
     next_cursor_present: bool,
+    page_count: usize,
+    body_bytes_total: usize,
+    truncated_by_capacity: bool,
     body_preview: Option<heapless::String<INBOX_LOG_PREVIEW_MAX_LEN>>,
     body_preview_truncated: bool,
 }
@@ -170,10 +191,159 @@ struct CollectionFetchResult {
     collection: CollectionManifestState,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CollectionEndpoint {
+    Inbox,
+    Saved,
+    Recommendations,
+}
+
+impl CollectionEndpoint {
+    const fn kind(self) -> CollectionKind {
+        match self {
+            Self::Inbox => CollectionKind::Inbox,
+            Self::Saved => CollectionKind::Saved,
+            Self::Recommendations => CollectionKind::Recommendations,
+        }
+    }
+
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Inbox => INBOX_PATH,
+            Self::Saved => SAVED_CONTENT_PATH,
+            Self::Recommendations => RECOMMENDATIONS_PATH,
+        }
+    }
+
+    const fn extra_query(self) -> &'static str {
+        match self {
+            Self::Inbox => "",
+            Self::Saved => "&archived=false",
+            Self::Recommendations => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CollectionFetchPage {
+    collection: CollectionManifestState,
+    next_cursor: Option<heapless::String<COLLECTION_CURSOR_MAX_LEN>>,
+    body_preview: Option<heapless::String<INBOX_LOG_PREVIEW_MAX_LEN>>,
+    body_preview_truncated: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct CollectionFetchAccumulator {
+    trace: TraceContext,
+    collection: CollectionManifestState,
+    page_count: usize,
+    body_bytes_total: usize,
+    next_cursor: Option<heapless::String<COLLECTION_CURSOR_MAX_LEN>>,
+    truncated_by_capacity: bool,
+    body_preview: Option<heapless::String<INBOX_LOG_PREVIEW_MAX_LEN>>,
+    body_preview_truncated: bool,
+}
+
+impl CollectionFetchAccumulator {
+    fn new(trace: TraceContext) -> Self {
+        Self {
+            trace,
+            collection: CollectionManifestState::empty(),
+            page_count: 0,
+            body_bytes_total: 0,
+            next_cursor: None,
+            truncated_by_capacity: false,
+            body_preview: None,
+            body_preview_truncated: false,
+        }
+    }
+
+    fn absorb_page(
+        &mut self,
+        endpoint: CollectionEndpoint,
+        path: &str,
+        body_bytes: usize,
+        page_index: usize,
+        page: CollectionFetchPage,
+    ) {
+        let page_item_count = page.collection.len();
+        let next_cursor_present = page.next_cursor.is_some();
+        let response_headroom = HTTP_RESPONSE_MAX_LEN.saturating_sub(body_bytes);
+
+        self.page_count = self.page_count.saturating_add(1);
+        self.body_bytes_total = self.body_bytes_total.saturating_add(body_bytes);
+
+        if self.body_preview.is_none()
+            && let Some(preview) = page.body_preview.as_ref()
+        {
+            self.body_preview = Some(preview.clone());
+            self.body_preview_truncated = page.body_preview_truncated;
+        }
+
+        if matches!(endpoint, CollectionEndpoint::Recommendations)
+            && self.collection.serve_id.is_empty()
+            && !page.collection.serve_id.is_empty()
+        {
+            self.collection.serve_id = page.collection.serve_id;
+        }
+
+        let mut accepted_items = 0usize;
+        while accepted_items < page.collection.len() {
+            if !self
+                .collection
+                .try_push(page.collection.items[accepted_items])
+            {
+                self.truncated_by_capacity = true;
+                break;
+            }
+            accepted_items += 1;
+        }
+
+        self.next_cursor = page.next_cursor;
+        log_collection_fetch_page_metrics(
+            self.trace,
+            endpoint.kind(),
+            path,
+            page_index,
+            body_bytes,
+            page_item_count,
+            accepted_items,
+            next_cursor_present,
+            response_headroom,
+            self.collection.len(),
+            self.truncated_by_capacity,
+        );
+    }
+
+    fn should_continue(&self) -> bool {
+        self.next_cursor.is_some()
+            && !self.truncated_by_capacity
+            && self.collection.len() < MANIFEST_ITEM_CAPACITY
+            && self.page_count < COLLECTION_FETCH_MAX_PAGES
+    }
+
+    fn into_result(self) -> CollectionFetchResult {
+        CollectionFetchResult {
+            summary: CollectionFetchSummary {
+                trace: self.trace,
+                item_count: self.collection.len(),
+                next_cursor_present: self.next_cursor.is_some() || self.truncated_by_capacity,
+                page_count: self.page_count,
+                body_bytes_total: self.body_bytes_total,
+                truncated_by_capacity: self.truncated_by_capacity,
+                body_preview: self.body_preview,
+                body_preview_truncated: self.body_preview_truncated,
+            },
+            collection: self.collection,
+        }
+    }
+}
+
 struct StartupSyncResult<'a> {
     refresh_session: RefreshSession,
     saved_result: Result<CollectionFetchResult, CollectionQueryError>,
     reusable_session: Option<ReusableBackendSession<'a>>,
+    tls_session_cache: Option<SerializedClientSession>,
 }
 
 struct ReusableBackendSession<'a> {
@@ -183,13 +353,12 @@ struct ReusableBackendSession<'a> {
 }
 
 impl ReusableBackendSession<'_> {
-    fn is_usable_on(&self, stack: Stack<'static>, now_ms: u64) -> bool {
+    fn is_usable_on(&self, stack: Stack<'static>, now_ms: u64, streaming: bool) -> bool {
         stack.is_link_up()
             && stack
                 .config_v4()
                 .is_some_and(|config| config.address == self.network_address)
-            && now_ms.saturating_sub(self.last_used_ms)
-                <= Duration::from_secs(KEEPALIVE_IDLE_TIMEOUT_SECS).as_millis()
+            && is_reusable_session_age_usable(self.last_used_ms, now_ms, streaming)
     }
 
     fn mark_used(&mut self, now_ms: u64) {
@@ -226,6 +395,7 @@ struct HttpResponse<'a> {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct HttpRequest<'a> {
+    trace: TraceContext,
     method: &'a str,
     path: &'a str,
     content_type: Option<&'a str>,
@@ -251,6 +421,7 @@ struct StreamingHttpResponse {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct RequestMetrics {
+    trace: TraceContext,
     started_ms: u64,
     dns_ms: u64,
     connect_ms: u64,
@@ -258,12 +429,23 @@ struct RequestMetrics {
     first_byte_ms: Option<u64>,
     total_ms: u64,
     reused_session: bool,
+    tls_resume_offered: bool,
     streaming: bool,
+    header_bytes: usize,
+    body_bytes: usize,
+    response_bytes: usize,
+    response_buffer_capacity: usize,
+    response_buffer_headroom: usize,
+    content_length: usize,
+    content_length_known: bool,
+    stream_header_capacity: usize,
+    stream_header_headroom: usize,
 }
 
 impl RequestMetrics {
-    fn new(reused_session: bool, streaming: bool) -> Self {
+    fn new(trace: TraceContext, reused_session: bool, streaming: bool) -> Self {
         Self {
+            trace,
             started_ms: now_ms(),
             dns_ms: 0,
             connect_ms: 0,
@@ -271,7 +453,17 @@ impl RequestMetrics {
             first_byte_ms: None,
             total_ms: 0,
             reused_session,
+            tls_resume_offered: false,
             streaming,
+            header_bytes: 0,
+            body_bytes: 0,
+            response_bytes: 0,
+            response_buffer_capacity: 0,
+            response_buffer_headroom: 0,
+            content_length: 0,
+            content_length_known: false,
+            stream_header_capacity: 0,
+            stream_header_headroom: 0,
         }
     }
 
@@ -290,8 +482,45 @@ impl RequestMetrics {
     }
 }
 
+fn next_request_trace(sync_id: u32) -> TraceContext {
+    TraceContext {
+        sync_id,
+        req_id: next_request_id(),
+    }
+}
+
+pub(crate) fn log_static_inventory() {
+    crate::memtrace!(
+        "static_inventory",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "driver_loop_future_storage" = "external_pinned_box",
+        "backend_tcp_state_bytes" = size_of::<BackendTcpClientState>(),
+        "http_request_bytes" = size_of::<HttpRequest<'static>>(),
+        "http_response_metadata_bytes" = size_of::<HttpResponseMetadata>(),
+        "request_metrics_bytes" = size_of::<RequestMetrics>(),
+        "reusable_session_bytes" = size_of::<ReusableBackendSession<'static>>(),
+        "active_access_session_bytes" = size_of::<ActiveAccessSession>(),
+        "collection_fetch_summary_bytes" = size_of::<CollectionFetchSummary>(),
+        "http_response_buffer_len" = HTTP_RESPONSE_MAX_LEN,
+        "http_response_buffer_storage" = "external_preferred_box",
+        "http_stream_header_max_len" = HTTP_STREAM_HEADER_MAX_LEN,
+        "http_stream_header_storage" = "external_preferred_box",
+        "package_download_chunk_len" = PACKAGE_DOWNLOAD_CHUNK_LEN,
+        "package_download_chunk_storage" = "external_preferred_box",
+        "collection_page_limit" = COLLECTION_PAGE_LIMIT,
+        "collection_cursor_max_len" = COLLECTION_CURSOR_MAX_LEN,
+        "collection_page_path_max_len" = COLLECTION_PAGE_PATH_MAX_LEN,
+        "stream_progress_log_interval_bytes" = STREAM_PROGRESS_LOG_INTERVAL_BYTES,
+        "tcp_rx_buffer_bytes" = BACKEND_TCP_RX_BUFFER_LEN,
+        "tcp_tx_buffer_bytes" = BACKEND_TCP_TX_BUFFER_LEN,
+        "backend_cmd_queue_capacity" = BACKEND_CMD_QUEUE_CAPACITY,
+    );
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum BackendError {
+    Alloc,
     Dns,
     Connect,
     Tls,
@@ -423,92 +652,141 @@ async fn backend_task(
 
     let mut current = startup;
     let tcp_state = Box::new(BackendTcpClientState::new());
+    let event_loop = crate::memory_policy::try_external_pinned_box(async move {
+        loop {
+            log_status(SyncStatus::WaitingForNetwork);
+            let network = wait_for_network(stack).await;
+            info!("backend network ready ip={:?}", network.address);
+            log_heap("backend network ready");
+            let mut tcp_client = BackendTcpClient::new(stack, tcp_state.as_ref());
+            tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
 
-    loop {
-        log_status(SyncStatus::WaitingForNetwork);
-        let network = wait_for_network(stack).await;
-        info!("backend network ready ip={:?}", network.address);
-        log_heap("backend network ready");
-        let mut tcp_client = BackendTcpClient::new(stack, tcp_state.as_ref());
-        tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
+            log_status(SyncStatus::RefreshingSession);
+            crate::internet::set_probe_suspended(true);
+            let startup_sync_id = next_sync_id();
+            crate::memtrace!(
+                "backend_sync",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "action" = "startup_begin",
+                "sync_id" = startup_sync_id,
+                "req_id" = 0,
+            );
+            let startup_sync = perform_startup_refresh_and_saved_sync(
+                stack,
+                tls.reference(),
+                &ca_chain,
+                &tcp_client,
+                &current.credential,
+                startup_sync_id,
+            )
+            .await;
+            crate::internet::set_probe_suspended(false);
 
-        log_status(SyncStatus::RefreshingSession);
-        crate::internet::set_probe_suspended(true);
-        let startup_sync = perform_startup_refresh_and_saved_sync(
-            stack,
-            tls.reference(),
-            &ca_chain,
-            &tcp_client,
-            &current.credential,
-        )
-        .await;
-        crate::internet::set_probe_suspended(false);
+            let startup_sync = match startup_sync {
+                Ok(result) => result,
+                Err(RefreshError::Rejected(status)) => {
+                    crate::memtrace!(
+                        "backend_sync",
+                        "component" = "backend",
+                        "at_ms" = now_ms(),
+                        "action" = "startup_auth_failed",
+                        "sync_id" = startup_sync_id,
+                        "req_id" = 0,
+                        "status" = status,
+                    );
+                    log_status(SyncStatus::AuthFailed);
+                    info!(
+                        "backend refresh rejected status={} source={}",
+                        status,
+                        current.source.label(),
+                    );
+                    return;
+                }
+                Err(RefreshError::Other(err)) => {
+                    crate::memtrace!(
+                        "backend_sync",
+                        "component" = "backend",
+                        "at_ms" = now_ms(),
+                        "action" = "startup_transport_failed",
+                        "sync_id" = startup_sync_id,
+                        "req_id" = 0,
+                        "error" = backend_error_label(err),
+                    );
+                    log_status(SyncStatus::TransportFailed);
+                    info!("backend refresh failed: {:?}", err);
+                    Timer::after(Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                    continue;
+                }
+            };
+            crate::memtrace!(
+                "backend_sync",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "action" = "startup_ok",
+                "sync_id" = startup_sync_id,
+                "req_id" = 0,
+                "expires_in" = startup_sync.refresh_session.expires_in,
+            );
 
-        let startup_sync = match startup_sync {
-            Ok(result) => result,
-            Err(RefreshError::Rejected(status)) => {
-                log_status(SyncStatus::AuthFailed);
-                info!(
-                    "backend refresh rejected status={} source={}",
-                    status,
-                    current.source.label(),
-                );
-                return;
+            info!(
+                "backend refresh ok expires_in={}s",
+                startup_sync.refresh_session.expires_in
+            );
+
+            match BackendCredential::from_refresh_token(
+                startup_sync.refresh_session.refresh_token.as_str(),
+            ) {
+                Ok(credential) => {
+                    current = StartupCredential {
+                        credential,
+                        source: CredentialSource::Stored,
+                    };
+                    persist_backend_credential(credential).await;
+                    info!("backend credential persisted");
+                }
+                Err(err) => {
+                    info!("backend credential persistence skipped: {:?}", err);
+                }
             }
-            Err(RefreshError::Other(err)) => {
-                log_status(SyncStatus::TransportFailed);
-                info!("backend refresh failed: {:?}", err);
-                Timer::after(Duration::from_millis(RETRY_BACKOFF_MS)).await;
-                continue;
-            }
-        };
+            let mut access_session = Some(ActiveAccessSession::from_refresh_session(
+                &startup_sync.refresh_session,
+                now_ms(),
+            ));
+            let initial_reusable_session = startup_sync.reusable_session;
+            let initial_tls_session_cache = startup_sync.tls_session_cache;
 
-        info!(
-            "backend refresh ok expires_in={}s",
-            startup_sync.refresh_session.expires_in
-        );
-
-        match BackendCredential::from_refresh_token(
-            startup_sync.refresh_session.refresh_token.as_str(),
-        ) {
-            Ok(credential) => {
-                current = StartupCredential {
-                    credential,
-                    source: CredentialSource::Stored,
-                };
-                persist_backend_credential(credential).await;
-                info!("backend credential persisted");
-            }
-            Err(err) => {
-                info!("backend credential persistence skipped: {:?}", err);
-            }
+            sync_one_collection(
+                CollectionKind::Saved,
+                startup_sync.saved_result,
+                "backend saved",
+            )
+            .await;
+            log_status(SyncStatus::Ready);
+            log_heap("backend ready");
+            run_backend_command_loop(
+                stack,
+                tls.reference(),
+                &ca_chain,
+                &tcp_client,
+                tcp_state.as_ref(),
+                &mut current,
+                &mut access_session,
+                initial_reusable_session,
+                initial_tls_session_cache,
+            )
+            .await;
         }
-        let mut access_session = Some(ActiveAccessSession::from_refresh_session(
-            &startup_sync.refresh_session,
-            now_ms(),
-        ));
-        let initial_reusable_session = startup_sync.reusable_session;
-
-        sync_one_collection(
-            CollectionKind::Saved,
-            startup_sync.saved_result,
-            "backend saved",
-        )
-        .await;
-        log_status(SyncStatus::Ready);
-        log_heap("backend ready");
-        run_backend_command_loop(
-            stack,
-            tls.reference(),
-            &ca_chain,
-            &tcp_client,
-            tcp_state.as_ref(),
-            &mut current,
-            &mut access_session,
-            initial_reusable_session,
-        )
-        .await;
-    }
+    });
+    let event_loop = match event_loop {
+        Ok(event_loop) => event_loop,
+        Err(_) => {
+            log_status(SyncStatus::TransportFailed);
+            info!("backend event loop alloc failed");
+            return;
+        }
+    };
+    event_loop.await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,8 +799,10 @@ async fn run_backend_command_loop<'a>(
     current: &mut StartupCredential,
     access_session: &mut Option<ActiveAccessSession>,
     initial_reusable_session: Option<ReusableBackendSession<'a>>,
+    initial_tls_session_cache: Option<SerializedClientSession>,
 ) {
     let mut reusable_session: Option<ReusableBackendSession<'a>> = initial_reusable_session;
+    let mut tls_session_cache = initial_tls_session_cache;
     let context = BackendRequestContext {
         stack,
         tls,
@@ -532,20 +812,27 @@ async fn run_backend_command_loop<'a>(
     };
 
     loop {
-        let keepalive_ready = reusable_session.is_some()
-            && access_session
-                .as_ref()
-                .is_some_and(|session| session.is_valid_at(now_ms()));
-        let command = if keepalive_ready {
+        let command = if reusable_session.is_some() {
             match select(
                 BACKEND_CMD_CH.receive(),
-                Timer::after(Duration::from_secs(KEEPALIVE_PING_INTERVAL_SECS)),
+                Timer::after(Duration::from_millis(
+                    reusable_session_idle_reap_timeout_ms(),
+                )),
             )
             .await
             {
                 Either::First(command) => Some(command),
                 Either::Second(()) => {
-                    keep_reusable_session_alive(access_session, &mut reusable_session).await;
+                    let idle_age_ms = reusable_session
+                        .as_ref()
+                        .map(|session| now_ms().saturating_sub(session.last_used_ms))
+                        .unwrap_or_default();
+                    info!(
+                        "backend reusable session idle reap age_ms={} idle_limit_ms={}",
+                        idle_age_ms,
+                        reusable_session_idle_reap_timeout_ms(),
+                    );
+                    close_reusable_session(&mut reusable_session, "idle reap").await;
                     None
                 }
             }
@@ -564,6 +851,7 @@ async fn run_backend_command_loop<'a>(
                     current,
                     access_session,
                     &mut reusable_session,
+                    &mut tls_session_cache,
                     request,
                 )
                 .await;
@@ -576,6 +864,7 @@ async fn run_backend_command_loop<'a>(
 async fn wait_for_network(stack: Stack<'static>) -> NetworkReady {
     loop {
         if stack.is_link_up()
+            && crate::internet::backend_path_ready()
             && let Some(config) = stack.config_v4()
         {
             return NetworkReady {
@@ -593,16 +882,19 @@ async fn perform_health_check(
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
 ) -> Result<(), BackendError> {
+    let mut response_buffer = allocate_standard_response_buffer(HEALTH_PATH)?;
+    let mut tls_session_cache = None;
     let mut last_error = None;
     let mut attempt = 0;
     while attempt < 3 {
-        let response_buffer = standard_response_buffer();
         let response = send_https_request(
             stack,
             tls,
             ca_chain,
             tcp_state,
+            &mut tls_session_cache,
             HttpRequest {
+                trace: TraceContext::none(),
                 method: "GET",
                 path: HEALTH_PATH,
                 content_type: None,
@@ -610,7 +902,7 @@ async fn perform_health_check(
                 body: b"",
                 connection_close: true,
             },
-            response_buffer,
+            response_buffer.as_mut_slice(),
         )
         .await;
 
@@ -643,80 +935,14 @@ async fn perform_health_check(
     Err(last_error.unwrap_or(BackendError::Io))
 }
 
-async fn keep_reusable_session_alive(
-    access_session: &mut Option<ActiveAccessSession>,
-    reusable_session: &mut Option<ReusableBackendSession<'_>>,
-) {
-    let now_ms = now_ms();
-    let Some((valid_for_ms, access_token)) = access_session.as_ref().and_then(|session| {
-        session.is_valid_at(now_ms).then_some((
-            session.valid_until_ms.saturating_sub(now_ms),
-            session.access_token.as_str(),
-        ))
-    }) else {
-        return;
-    };
-    let session_age_ms = reusable_session
-        .as_ref()
-        .map(|session| now_ms.saturating_sub(session.last_used_ms))
-        .unwrap_or_default();
-    info!(
-        "backend reusable session keepalive path={} age_ms={} valid_for_ms={}",
-        ME_PATH, session_age_ms, valid_for_ms
-    );
-
-    let request = HttpRequest {
-        method: "GET",
-        path: ME_PATH,
-        content_type: Some("application/json"),
-        bearer_token: Some(access_token),
-        body: b"",
-        connection_close: false,
-    };
-    let response = match reusable_session {
-        Some(reusable) => {
-            let response_buffer = standard_response_buffer();
-            send_https_request_over_session_with_metrics(
-                &mut reusable.session,
-                request,
-                response_buffer,
-                RequestMetrics::new(true, false),
-            )
-            .await
-        }
-        None => return,
-    };
-
-    update_reusable_session_after_buffered_request(reusable_session, request, &response).await;
-    match response {
-        Ok(response) => {
-            info!(
-                "backend reusable session keepalive ok path={} status={} response_reusable={}",
-                ME_PATH, response.status, response.connection_reusable
-            );
-            if is_auth_status(response.status) {
-                info!(
-                    "backend reusable session keepalive auth rejected status={}",
-                    response.status
-                );
-                invalidate_access_state(access_session, reusable_session).await;
-            }
-        }
-        Err(err) => {
-            info!(
-                "backend reusable session keepalive failed path={} err={:?}",
-                ME_PATH, err
-            );
-        }
-    }
-}
-
 async fn perform_refresh(
     stack: Stack<'static>,
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     credential: &BackendCredential,
+    sync_id: u32,
 ) -> Result<RefreshSession, RefreshError> {
     let refresh_token = credential
         .refresh_token()
@@ -726,31 +952,32 @@ async fn perform_refresh(
         refresh_token.len()
     );
 
-    let response = {
-        let body = Box::new(
-            build_refresh_body(refresh_token)
-                .map_err(|_| RefreshError::Other(BackendError::InvalidResponse))?,
-        );
-        info!("backend refresh request ready body_len={}", body.len());
-        let response_buffer = standard_response_buffer();
-        send_https_request(
-            stack,
-            tls,
-            ca_chain,
-            tcp_state,
-            HttpRequest {
-                method: "POST",
-                path: REFRESH_PATH,
-                content_type: Some("application/json"),
-                bearer_token: None,
-                body: body.as_bytes(),
-                connection_close: true,
-            },
-            response_buffer,
-        )
-        .await
-        .map_err(RefreshError::Other)?
-    };
+    let mut response_buffer =
+        allocate_standard_response_buffer(REFRESH_PATH).map_err(RefreshError::Other)?;
+    let body = Box::new(
+        build_refresh_body(refresh_token)
+            .map_err(|_| RefreshError::Other(BackendError::InvalidResponse))?,
+    );
+    info!("backend refresh request ready body_len={}", body.len());
+    let response = send_https_request(
+        stack,
+        tls,
+        ca_chain,
+        tcp_state,
+        tls_session_cache,
+        HttpRequest {
+            trace: next_request_trace(sync_id),
+            method: "POST",
+            path: REFRESH_PATH,
+            content_type: Some("application/json"),
+            bearer_token: None,
+            body: body.as_bytes(),
+            connection_close: true,
+        },
+        response_buffer.as_mut_slice(),
+    )
+    .await
+    .map_err(RefreshError::Other)?;
 
     if (400..500).contains(&response.status) {
         info!(
@@ -775,15 +1002,20 @@ async fn perform_identity_check(
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     access_token: &str,
+    sync_id: u32,
 ) -> Result<MeProfile, IdentityError> {
-    let response_buffer = standard_response_buffer();
+    let mut response_buffer =
+        allocate_standard_response_buffer(ME_PATH).map_err(IdentityError::Other)?;
     let response = send_https_request(
         stack,
         tls,
         ca_chain,
         tcp_state,
+        tls_session_cache,
         HttpRequest {
+            trace: next_request_trace(sync_id),
             method: "GET",
             path: ME_PATH,
             content_type: Some("application/json"),
@@ -791,7 +1023,7 @@ async fn perform_identity_check(
             body: b"",
             connection_close: true,
         },
-        response_buffer,
+        response_buffer.as_mut_slice(),
     )
     .await
     .map_err(IdentityError::Other)?;
@@ -819,12 +1051,22 @@ async fn sync_collection_manifests(
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     access_token: &str,
 ) {
     info!("backend startup sync mode=saved-only");
     sync_one_collection(
         CollectionKind::Saved,
-        perform_saved_content_fetch(stack, tls, ca_chain, tcp_state, access_token).await,
+        perform_saved_content_fetch(
+            stack,
+            tls,
+            ca_chain,
+            tcp_state,
+            tls_session_cache,
+            access_token,
+            0,
+        )
+        .await,
         "backend saved",
     )
     .await;
@@ -836,12 +1078,20 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     credential: &BackendCredential,
+    sync_id: u32,
 ) -> Result<StartupSyncResult<'a>, RefreshError> {
     let mut attempt = 0usize;
+    let mut tls_session_cache = None;
 
     loop {
         let result = perform_startup_refresh_and_saved_sync_once(
-            stack, tls, ca_chain, tcp_client, credential,
+            stack,
+            tls,
+            ca_chain,
+            tcp_client,
+            &mut tls_session_cache,
+            credential,
+            sync_id,
         )
         .await;
         match result {
@@ -862,7 +1112,9 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     credential: &BackendCredential,
+    sync_id: u32,
 ) -> Result<StartupSyncResult<'a>, RefreshError> {
     let refresh_token = credential
         .refresh_token()
@@ -872,7 +1124,9 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         refresh_token.len()
     );
 
-    let mut refresh_metrics = RequestMetrics::new(false, false);
+    let refresh_trace = next_request_trace(sync_id);
+    let mut refresh_metrics = RequestMetrics::new(refresh_trace, false, false);
+    log_request_phase(refresh_trace, REFRESH_PATH, "open", false, 0);
     let dns = DnsSocket::new(stack);
     let dns_started_ms = now_ms();
     let remote = dns
@@ -893,6 +1147,13 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         }
     };
     let connect_started_ms = now_ms();
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        "dns_ok",
+        false,
+        refresh_metrics.dns_ms,
+    );
     let connection = with_timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
         tcp_client.connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT)),
@@ -909,21 +1170,64 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         RefreshError::Other(BackendError::Connect)
     })?;
     refresh_metrics.connect_ms = elapsed_since_ms(connect_started_ms);
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        "connect_ok",
+        false,
+        refresh_metrics.elapsed_ms(),
+    );
     log_request_heap(REFRESH_PATH, "tls setup start");
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        "tls_setup_start",
+        false,
+        refresh_metrics.elapsed_ms(),
+    );
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
             info!("backend request tls setup failed path={}", REFRESH_PATH);
             log_request_heap(REFRESH_PATH, "tls setup failed");
         })
         .map_err(RefreshError::Other)?;
+    prepare_tls_session_resume(
+        &mut session,
+        tls_session_cache,
+        REFRESH_PATH,
+        false,
+        &mut refresh_metrics,
+    );
     log_request_heap(REFRESH_PATH, "tls setup ok");
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        "tls_setup_ok",
+        false,
+        refresh_metrics.elapsed_ms(),
+    );
     let tls_started_ms = now_ms();
     log_request_heap(REFRESH_PATH, "tls handshake start");
-    await_tls_handshake(&mut session, REFRESH_PATH)
-        .await
-        .map_err(RefreshError::Other)?;
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        "tls_handshake_start",
+        false,
+        refresh_metrics.elapsed_ms(),
+    );
+    if let Err(err) = await_tls_handshake(&mut session, REFRESH_PATH).await {
+        discard_failed_tls_session_resume(tls_session_cache, REFRESH_PATH, false, &refresh_metrics);
+        return Err(RefreshError::Other(err));
+    }
     refresh_metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     log_request_heap(REFRESH_PATH, "tls handshake ok");
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        "tls_handshake_ok",
+        false,
+        refresh_metrics.elapsed_ms(),
+    );
     let verification_flags = session.tls_verification_details();
     if verification_flags != 0 {
         info!(
@@ -931,30 +1235,31 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
             REFRESH_PATH, verification_flags
         );
     }
+    cache_negotiated_tls_session(&session, tls_session_cache, REFRESH_PATH, false);
 
-    let refresh_response = {
-        let body = Box::new(
-            build_refresh_body(refresh_token)
-                .map_err(|_| RefreshError::Other(BackendError::InvalidResponse))?,
-        );
-        info!("backend refresh request ready body_len={}", body.len());
-        let response_buffer = standard_response_buffer();
-        send_https_request_over_session_with_metrics(
-            &mut session,
-            HttpRequest {
-                method: "POST",
-                path: REFRESH_PATH,
-                content_type: Some("application/json"),
-                bearer_token: None,
-                body: body.as_bytes(),
-                connection_close: false,
-            },
-            response_buffer,
-            refresh_metrics,
-        )
-        .await
-        .map_err(RefreshError::Other)?
-    };
+    let mut response_buffer =
+        allocate_standard_response_buffer(REFRESH_PATH).map_err(RefreshError::Other)?;
+    let body = Box::new(
+        build_refresh_body(refresh_token)
+            .map_err(|_| RefreshError::Other(BackendError::InvalidResponse))?,
+    );
+    info!("backend refresh request ready body_len={}", body.len());
+    let refresh_response = send_https_request_over_session_with_metrics(
+        &mut session,
+        HttpRequest {
+            trace: refresh_trace,
+            method: "POST",
+            path: REFRESH_PATH,
+            content_type: Some("application/json"),
+            bearer_token: None,
+            body: body.as_bytes(),
+            connection_close: false,
+        },
+        response_buffer.as_mut_slice(),
+        refresh_metrics,
+    )
+    .await
+    .map_err(RefreshError::Other)?;
 
     if (400..500).contains(&refresh_response.status) {
         info!(
@@ -985,6 +1290,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         &mut session,
         refresh_session.access_token.as_str(),
         false,
+        sync_id,
     )
     .await;
 
@@ -999,8 +1305,13 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     }
 
     if let Ok(result) = &mut saved_result {
-        prefetch_startup_saved_content(&mut session, refresh_session.access_token.as_str(), result)
-            .await;
+        prefetch_startup_saved_content(
+            &mut session,
+            refresh_session.access_token.as_str(),
+            result,
+            sync_id,
+        )
+        .await;
     }
 
     let reusable_session = if saved_result.is_ok() {
@@ -1033,6 +1344,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         refresh_session,
         saved_result,
         reusable_session,
+        tls_session_cache: tls_session_cache.clone(),
     })
 }
 
@@ -1040,6 +1352,7 @@ async fn prefetch_startup_saved_content<T>(
     session: &mut Session<'_, T>,
     access_token: &str,
     result: &mut CollectionFetchResult,
+    sync_id: u32,
 ) where
     T: AsyncRead07 + AsyncWrite07,
 {
@@ -1057,7 +1370,7 @@ async fn prefetch_startup_saved_content<T>(
             continue;
         }
         let request = PrepareContentRequest::from_manifest(CollectionKind::Saved, item);
-        match fetch_and_stage_package_over_session(session, access_token, request).await {
+        match fetch_and_stage_package_over_session(session, access_token, request, sync_id).await {
             Ok(_snapshot) => {
                 mark_prefetched_item_cached(&mut result.collection, &request);
                 prefetched += 1;
@@ -1100,6 +1413,7 @@ fn mark_prefetched_item_cached(
     let _ = collection.update_package_state(&request.remote_item_id, PackageState::Cached);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_access_session<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
@@ -1108,6 +1422,8 @@ async fn ensure_access_session<'a>(
     current: &mut StartupCredential,
     access_session: &mut Option<ActiveAccessSession>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    sync_id: u32,
 ) -> Result<(), RefreshError> {
     let now_ms = now_ms();
     match access_session.as_ref() {
@@ -1133,8 +1449,47 @@ async fn ensure_access_session<'a>(
 
     close_reusable_session(reusable_session, "refresh").await;
     log_status(SyncStatus::RefreshingSession);
-    let refresh_session =
-        perform_refresh(stack, tls, ca_chain, tcp_state, &current.credential).await?;
+    let mut refresh_attempt = 0usize;
+    let refresh_session = loop {
+        wait_for_backend_request_path_ready(
+            stack,
+            TraceContext { sync_id, req_id: 0 },
+            REFRESH_PATH,
+            false,
+            if refresh_attempt == 0 {
+                "prepare_refresh"
+            } else {
+                "prepare_refresh_retry"
+            },
+        )
+        .await
+        .map_err(RefreshError::Other)?;
+
+        match perform_refresh(
+            stack,
+            tls,
+            ca_chain,
+            tcp_state,
+            tls_session_cache,
+            &current.credential,
+            sync_id,
+        )
+        .await
+        {
+            Err(RefreshError::Other(err))
+                if is_transient_transport_error(err)
+                    && refresh_attempt + 1 < TRANSPORT_RETRY_ATTEMPTS =>
+            {
+                refresh_attempt += 1;
+                info!(
+                    "backend access session refresh retry attempt={} err={:?}",
+                    refresh_attempt, err
+                );
+                Timer::after(Duration::from_millis(TRANSPORT_RETRY_BACKOFF_MS)).await;
+            }
+            other => break other?,
+        }
+    };
     info!(
         "backend access session refreshed expires_in={}s",
         refresh_session.expires_in
@@ -1165,7 +1520,12 @@ async fn sync_one_collection(
 ) {
     match result {
         Ok(result) => {
-            let collection = match content_storage::persist_snapshot(kind, result.collection).await
+            let collection = match content_storage::persist_snapshot_traced(
+                result.summary.trace,
+                kind,
+                result.collection,
+            )
+            .await
             {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
@@ -1178,9 +1538,12 @@ async fn sync_one_collection(
                 now_ms(),
             );
             info!(
-                "{} ok item_count={} next_cursor={}",
+                "{} ok item_count={} pages={} body_bytes_total={} truncated={} next_cursor={}",
                 label,
                 result.summary.item_count,
+                result.summary.page_count,
+                result.summary.body_bytes_total,
+                result.summary.truncated_by_capacity,
                 if result.summary.next_cursor_present {
                     "present"
                 } else {
@@ -1212,27 +1575,29 @@ async fn handle_prepare_content_request<'a>(
     current: &mut StartupCredential,
     access_session: &mut Option<ActiveAccessSession>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: PrepareContentRequest,
 ) {
     if request.remote_item_id.is_empty() || request.content_id.is_empty() {
         return;
     }
-
-    if !context.stack.is_link_up() {
-        *access_session = None;
-        close_reusable_session(reusable_session, "link down").await;
-        let _ = publish_package_state(
-            request.collection,
-            request.remote_item_id,
-            PackageState::Missing,
-        )
-        .await;
-        info!(
-            "backend content prepare skipped: network unavailable collection={:?}",
-            request.collection
-        );
-        return;
-    }
+    let operation_sync_id = next_sync_id();
+    let operation_trace = TraceContext {
+        sync_id: operation_sync_id,
+        req_id: 0,
+    };
+    crate::memtrace!(
+        "backend_sync",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "action" = "prepare_begin",
+        "sync_id" = operation_sync_id,
+        "req_id" = 0,
+        "collection" = collection_label(request.collection),
+        "content_id" = request.content_id.as_str(),
+        "remote_item_id" = request.remote_item_id.as_str(),
+        "remote_revision" = request.remote_revision,
+    );
 
     if let Err(err) = ensure_access_session(
         context.stack,
@@ -1242,11 +1607,23 @@ async fn handle_prepare_content_request<'a>(
         current,
         access_session,
         reusable_session,
+        tls_session_cache,
+        operation_sync_id,
     )
     .await
     {
         match err {
             RefreshError::Rejected(status) => {
+                crate::memtrace!(
+                    "backend_sync",
+                    "component" = "backend",
+                    "at_ms" = now_ms(),
+                    "action" = "prepare_auth_failed",
+                    "sync_id" = operation_sync_id,
+                    "req_id" = 0,
+                    "status" = status,
+                    "content_id" = request.content_id.as_str(),
+                );
                 log_status(SyncStatus::AuthFailed);
                 info!(
                     "backend content prepare refresh rejected status={} source={}",
@@ -1254,6 +1631,7 @@ async fn handle_prepare_content_request<'a>(
                     current.source.label(),
                 );
                 let _ = publish_package_state(
+                    operation_trace,
                     request.collection,
                     request.remote_item_id,
                     PackageState::Failed,
@@ -1261,10 +1639,21 @@ async fn handle_prepare_content_request<'a>(
                 .await;
             }
             RefreshError::Other(err) => {
+                crate::memtrace!(
+                    "backend_sync",
+                    "component" = "backend",
+                    "at_ms" = now_ms(),
+                    "action" = "prepare_refresh_failed",
+                    "sync_id" = operation_sync_id,
+                    "req_id" = 0,
+                    "error" = backend_error_label(err),
+                    "content_id" = request.content_id.as_str(),
+                );
                 *access_session = None;
                 log_status(SyncStatus::TransportFailed);
                 info!("backend content prepare refresh failed: {:?}", err);
                 let _ = publish_package_state(
+                    operation_trace,
                     request.collection,
                     request.remote_item_id,
                     prepare_error_package_state(err),
@@ -1288,21 +1677,35 @@ async fn handle_prepare_content_request<'a>(
         context.tcp_client,
         access_token,
         reusable_session,
+        tls_session_cache,
         request,
+        operation_sync_id,
     )
     .await
     {
-        Ok(snapshot) => {
+        Ok(result) => {
+            let snapshot = *result.snapshot;
             publish_event(
                 Event::CollectionContentUpdated(request.collection, Box::new(snapshot)),
                 now_ms(),
+            );
+            crate::memtrace!(
+                "backend_sync",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "action" = "prepare_cached",
+                "sync_id" = operation_sync_id,
+                "req_id" = 0,
+                "collection" = collection_label(request.collection),
+                "content_id" = request.content_id.as_str(),
+                "remote_item_id" = request.remote_item_id.as_str(),
             );
             info!(
                 "backend content cached collection={:?} content_id={}",
                 request.collection,
                 request.content_id.as_str(),
             );
-            match content_storage::open_cached_reader_package(request.content_id).await {
+            match result.opened {
                 Ok(opened) => {
                     let total_units = opened.total_units;
                     let paragraph_count = opened.paragraphs.len();
@@ -1326,9 +1729,24 @@ async fn handle_prepare_content_request<'a>(
                         paragraph_count,
                         window_unit_count,
                     );
+                    crate::memtrace!(
+                        "backend_sync",
+                        "component" = "backend",
+                        "at_ms" = now_ms(),
+                        "action" = "prepare_opened",
+                        "sync_id" = operation_sync_id,
+                        "req_id" = 0,
+                        "collection" = collection_label(request.collection),
+                        "content_id" = request.content_id.as_str(),
+                        "remote_item_id" = request.remote_item_id.as_str(),
+                        "total_units" = total_units,
+                        "paragraph_count" = paragraph_count,
+                        "window_units" = window_unit_count,
+                    );
                 }
                 Err(err) => {
                     let _ = publish_package_state(
+                        operation_trace,
                         request.collection,
                         request.remote_item_id,
                         PackageState::Failed,
@@ -1344,7 +1762,17 @@ async fn handle_prepare_content_request<'a>(
             }
         }
         Err(PackagePrepareError::PendingRemote) => {
+            crate::memtrace!(
+                "backend_sync",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "action" = "prepare_pending_remote",
+                "sync_id" = operation_sync_id,
+                "req_id" = 0,
+                "content_id" = request.content_id.as_str(),
+            );
             let _ = publish_package_state(
+                operation_trace,
                 request.collection,
                 request.remote_item_id,
                 PackageState::PendingRemote,
@@ -1357,11 +1785,22 @@ async fn handle_prepare_content_request<'a>(
             );
         }
         Err(PackagePrepareError::Rejected(status)) => {
+            crate::memtrace!(
+                "backend_sync",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "action" = "prepare_rejected",
+                "sync_id" = operation_sync_id,
+                "req_id" = 0,
+                "status" = status,
+                "content_id" = request.content_id.as_str(),
+            );
             if is_auth_status(status) {
                 invalidate_access_state(access_session, reusable_session).await;
                 log_status(SyncStatus::AuthFailed);
             }
             let _ = publish_package_state(
+                operation_trace,
                 request.collection,
                 request.remote_item_id,
                 PackageState::Failed,
@@ -1370,8 +1809,19 @@ async fn handle_prepare_content_request<'a>(
             info!("backend content fetch rejected status={}", status);
         }
         Err(PackagePrepareError::Other(err)) => {
+            crate::memtrace!(
+                "backend_sync",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "action" = "prepare_failed",
+                "sync_id" = operation_sync_id,
+                "req_id" = 0,
+                "error" = backend_error_label(err),
+                "content_id" = request.content_id.as_str(),
+            );
             *access_session = None;
             let _ = publish_package_state(
+                operation_trace,
                 request.collection,
                 request.remote_item_id,
                 prepare_error_package_state(err),
@@ -1387,6 +1837,7 @@ async fn send_https_request<'a>(
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_state: &'a BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
     response_buffer: &'a mut [u8],
 ) -> Result<HttpResponse<'a>, BackendError> {
@@ -1399,6 +1850,7 @@ async fn send_https_request<'a>(
             tls,
             ca_chain,
             tcp_state,
+            tls_session_cache,
             request,
             &mut *response_buffer_ptr,
         )
@@ -1417,6 +1869,7 @@ async fn send_https_request<'a>(
                     tls,
                     ca_chain,
                     tcp_state,
+                    tls_session_cache,
                     request,
                     &mut *response_buffer_ptr,
                 )
@@ -1432,6 +1885,7 @@ async fn send_https_request_once<'a>(
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_state: &'a BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
     response_buffer: &'a mut [u8],
 ) -> Result<HttpResponse<'a>, BackendError> {
@@ -1441,7 +1895,17 @@ async fn send_https_request_once<'a>(
         mut session,
         metrics,
         ..
-    } = open_backend_session(stack, tls, ca_chain, &tcp_client, request.path, false).await?;
+    } = open_backend_session(
+        stack,
+        tls,
+        ca_chain,
+        &tcp_client,
+        tls_session_cache,
+        request.trace,
+        request.path,
+        false,
+    )
+    .await?;
     let response = send_https_request_over_session_with_metrics(
         &mut session,
         request,
@@ -1454,12 +1918,14 @@ async fn send_https_request_once<'a>(
     response
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_https_request_reusing_session<'a, 'b>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
     response_buffer: &'b mut [u8],
 ) -> Result<HttpResponse<'b>, BackendError> {
@@ -1471,6 +1937,7 @@ async fn send_https_request_reusing_session<'a, 'b>(
             ca_chain,
             tcp_client,
             reusable_session,
+            tls_session_cache,
             request,
             &mut *response_buffer_ptr,
         )
@@ -1491,6 +1958,7 @@ async fn send_https_request_reusing_session<'a, 'b>(
                     ca_chain,
                     tcp_client,
                     reusable_session,
+                    tls_session_cache,
                     request,
                     &mut *response_buffer_ptr,
                 )
@@ -1501,12 +1969,14 @@ async fn send_https_request_reusing_session<'a, 'b>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_https_request_reusing_session_once<'a, 'b>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
     response_buffer: &'b mut [u8],
 ) -> Result<HttpResponse<'b>, BackendError> {
@@ -1516,6 +1986,8 @@ async fn send_https_request_reusing_session_once<'a, 'b>(
         ca_chain,
         tcp_client,
         reusable_session,
+        tls_session_cache,
+        request.trace,
         request.path,
         false,
     )
@@ -1549,7 +2021,7 @@ where
         session,
         request,
         response_buffer,
-        RequestMetrics::new(true, false),
+        RequestMetrics::new(request.trace, true, false),
     )
     .await
 }
@@ -1573,6 +2045,13 @@ where
         request.connection_close,
     )
     .await?;
+    log_request_phase(
+        metrics.trace,
+        request.path,
+        "request_sent",
+        metrics.streaming,
+        metrics.elapsed_ms(),
+    );
     let response = read_http_response(
         session,
         request.path,
@@ -1610,19 +2089,159 @@ where
     Session::new(tls, stream, &SessionConfig::Client(config)).map_err(|_| BackendError::Tls)
 }
 
+fn prepare_tls_session_resume<T>(
+    session: &mut Session<'_, T>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    path: &str,
+    streaming: bool,
+    metrics: &mut RequestMetrics,
+) where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    let Some(cached_session_len) = tls_session_cache.as_ref().map(SerializedClientSession::len)
+    else {
+        return;
+    };
+    let resume_result = tls_session_cache
+        .as_ref()
+        .map(|cached_session| session.set_serialized_session(cached_session));
+
+    match resume_result {
+        Some(Ok(())) => {
+            metrics.tls_resume_offered = true;
+            info!(
+                "backend tls session resume prepared path={} streaming={} bytes={}",
+                path, streaming, cached_session_len,
+            );
+        }
+        Some(Err(err)) => {
+            info!(
+                "backend tls session resume discarded path={} streaming={} err={:?}",
+                path, streaming, err
+            );
+            *tls_session_cache = None;
+        }
+        None => {}
+    }
+}
+
+fn discard_failed_tls_session_resume(
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    path: &str,
+    streaming: bool,
+    metrics: &RequestMetrics,
+) {
+    if metrics.tls_resume_offered && tls_session_cache.take().is_some() {
+        info!(
+            "backend tls session resume discarded path={} streaming={} reason=handshake_failed",
+            path, streaming
+        );
+    }
+}
+
+fn cache_negotiated_tls_session<T>(
+    session: &Session<'_, T>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    path: &str,
+    streaming: bool,
+) where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    match session.export_serialized_session() {
+        Ok(cached_session) => {
+            info!(
+                "backend tls session cached path={} streaming={} bytes={}",
+                path,
+                streaming,
+                cached_session.len(),
+            );
+            *tls_session_cache = Some(cached_session);
+        }
+        Err(err) => {
+            info!(
+                "backend tls session cache save failed path={} streaming={} err={:?}",
+                path, streaming, err
+            );
+        }
+    }
+}
+
 fn current_network_address(stack: Stack<'static>) -> Option<embassy_net::Ipv4Cidr> {
     stack.config_v4().map(|config| config.address)
 }
 
+fn is_backend_request_path_ready(stack: Stack<'static>) -> bool {
+    stack.is_link_up()
+        && current_network_address(stack).is_some()
+        && crate::internet::backend_path_ready()
+}
+
+async fn wait_for_backend_request_path_ready(
+    stack: Stack<'static>,
+    trace: TraceContext,
+    path: &str,
+    streaming: bool,
+    reason: &'static str,
+) -> Result<(), BackendError> {
+    if is_backend_request_path_ready(stack) {
+        return Ok(());
+    }
+
+    let started_ms = now_ms();
+    let timeout_ms = Duration::from_secs(REQUEST_NETWORK_READY_TIMEOUT_SECS).as_millis();
+    let mut logged_wait = false;
+
+    loop {
+        let link_up = stack.is_link_up();
+        let network_address = current_network_address(stack);
+        let backend_path_ready = crate::internet::backend_path_ready();
+
+        if link_up && network_address.is_some() && backend_path_ready {
+            let waited_ms = elapsed_since_ms(started_ms);
+            info!(
+                "backend request network ready path={} reason={} wait_ms={} network_ip={:?} backend_path_ready={}",
+                path, reason, waited_ms, network_address, backend_path_ready,
+            );
+            log_request_phase(trace, path, "network_ready", streaming, waited_ms);
+            return Ok(());
+        }
+
+        let waited_ms = elapsed_since_ms(started_ms);
+        if waited_ms >= timeout_ms {
+            info!(
+                "backend request network wait timed out path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
+                path, reason, waited_ms, link_up, network_address, backend_path_ready,
+            );
+            log_request_phase(trace, path, "network_wait_timeout", streaming, waited_ms);
+            return Err(BackendError::Connect);
+        }
+
+        if !logged_wait {
+            info!(
+                "backend request waiting for network path={} reason={} link_up={} network_ip={:?} backend_path_ready={}",
+                path, reason, link_up, network_address, backend_path_ready,
+            );
+            log_request_phase(trace, path, "network_wait_start", streaming, waited_ms);
+            logged_wait = true;
+        }
+
+        Timer::after(Duration::from_millis(REQUEST_NETWORK_READY_POLL_MS)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn open_backend_session<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    trace: TraceContext,
     path: &str,
     streaming: bool,
 ) -> Result<ConnectedBackendSession<'a>, BackendError> {
     let network_address = current_network_address(stack).ok_or_else(|| {
+        crate::internet::invalidate_backend_path("missing_ip");
         info!("backend request network unavailable path={}", path);
         log_request_heap(path, "network unavailable");
         BackendError::Connect
@@ -1631,7 +2250,8 @@ async fn open_backend_session<'a>(
         "backend request open path={} streaming={} network_ip={:?}",
         path, streaming, network_address
     );
-    let mut metrics = RequestMetrics::new(false, streaming);
+    let mut metrics = RequestMetrics::new(trace, false, streaming);
+    log_request_phase(trace, path, "open", streaming, 0);
 
     let dns = DnsSocket::new(stack);
     let dns_started_ms = now_ms();
@@ -1639,6 +2259,7 @@ async fn open_backend_session<'a>(
         .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
         .await
         .map_err(|_| {
+            crate::internet::invalidate_backend_path("dns_failed");
             info!("backend request dns failed path={}", path);
             log_request_heap(path, "dns failed");
             BackendError::Dns
@@ -1647,6 +2268,7 @@ async fn open_backend_session<'a>(
     let remote = match remote {
         IpAddr::V4(addr) => addr,
         IpAddr::V6(_) => {
+            crate::internet::invalidate_backend_path("dns_invalid_family");
             info!("backend request dns returned ipv6 path={}", path);
             log_request_heap(path, "dns ipv6");
             return Err(BackendError::Dns);
@@ -1656,6 +2278,7 @@ async fn open_backend_session<'a>(
         "backend request dns ok path={} remote_ip={} dns_ms={}",
         path, remote, metrics.dns_ms
     );
+    log_request_phase(trace, path, "dns_ok", streaming, metrics.dns_ms);
     let connect_started_ms = now_ms();
     let connection = with_timeout(
         Duration::from_secs(CONNECT_TIMEOUT_SECS),
@@ -1663,11 +2286,13 @@ async fn open_backend_session<'a>(
     )
     .await
     .map_err(|_| {
+        crate::internet::invalidate_backend_path("connect_timeout");
         info!("backend request connect timed out path={}", path);
         log_request_heap(path, "connect timeout");
         BackendError::Connect
     })?
     .map_err(|_| {
+        crate::internet::invalidate_backend_path("connect_failed");
         info!("backend request connect failed path={}", path);
         log_request_heap(path, "connect failed");
         BackendError::Connect
@@ -1677,18 +2302,51 @@ async fn open_backend_session<'a>(
         "backend request connect ok path={} remote_ip={} connect_ms={}",
         path, remote, metrics.connect_ms
     );
+    log_request_phase(trace, path, "connect_ok", streaming, metrics.elapsed_ms());
     log_request_heap(path, "tls setup start");
+    log_request_phase(
+        trace,
+        path,
+        "tls_setup_start",
+        streaming,
+        metrics.elapsed_ms(),
+    );
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
             info!("backend request tls setup failed path={}", path);
             log_request_heap(path, "tls setup failed");
         })?;
+    prepare_tls_session_resume(
+        &mut session,
+        tls_session_cache,
+        path,
+        streaming,
+        &mut metrics,
+    );
     log_request_heap(path, "tls setup ok");
+    log_request_phase(trace, path, "tls_setup_ok", streaming, metrics.elapsed_ms());
     let tls_started_ms = now_ms();
     log_request_heap(path, "tls handshake start");
-    await_tls_handshake(&mut session, path).await?;
+    log_request_phase(
+        trace,
+        path,
+        "tls_handshake_start",
+        streaming,
+        metrics.elapsed_ms(),
+    );
+    if let Err(err) = await_tls_handshake(&mut session, path).await {
+        discard_failed_tls_session_resume(tls_session_cache, path, streaming, &metrics);
+        return Err(err);
+    }
     metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     log_request_heap(path, "tls handshake ok");
+    log_request_phase(
+        trace,
+        path,
+        "tls_handshake_ok",
+        streaming,
+        metrics.elapsed_ms(),
+    );
     let verification_flags = session.tls_verification_details();
     info!(
         "backend request tls ok path={} tls_ms={} verification_flags=0x{:08x}",
@@ -1700,6 +2358,7 @@ async fn open_backend_session<'a>(
             path, verification_flags
         );
     }
+    cache_negotiated_tls_session(&session, tls_session_cache, path, streaming);
 
     Ok(ConnectedBackendSession {
         session,
@@ -1746,18 +2405,21 @@ async fn invalidate_access_state(
     close_reusable_session(reusable_session, "auth invalid").await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_reusable_session<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    trace: TraceContext,
     path: &str,
     streaming: bool,
 ) -> Result<RequestMetrics, BackendError> {
     let now_ms = now_ms();
     match reusable_session.as_ref() {
-        Some(session) if session.is_usable_on(stack, now_ms) => {
+        Some(session) if session.is_usable_on(stack, now_ms, streaming) => {
             info!(
                 "backend reusable session reuse path={} streaming={} age_ms={} session_ip={:?}",
                 path,
@@ -1765,7 +2427,7 @@ async fn ensure_reusable_session<'a>(
                 now_ms.saturating_sub(session.last_used_ms),
                 session.network_address,
             );
-            return Ok(RequestMetrics::new(true, streaming));
+            return Ok(RequestMetrics::new(trace, true, streaming));
         }
         Some(session) => {
             let link_up = stack.is_link_up();
@@ -1774,9 +2436,9 @@ async fn ensure_reusable_session<'a>(
                 "backend reusable session discard path={} streaming={} reason={} age_ms={} idle_limit_ms={} link_up={} current_network={:?} session_network={:?}",
                 path,
                 streaming,
-                reusable_session_discard_reason(stack, session, now_ms),
+                reusable_session_discard_reason(stack, session, now_ms, streaming),
                 now_ms.saturating_sub(session.last_used_ms),
-                Duration::from_secs(KEEPALIVE_IDLE_TIMEOUT_SECS).as_millis(),
+                reusable_session_idle_timeout_ms(streaming),
                 link_up,
                 current_network,
                 session.network_address,
@@ -1795,7 +2457,17 @@ async fn ensure_reusable_session<'a>(
         session,
         network_address,
         metrics,
-    } = open_backend_session(stack, tls, ca_chain, tcp_client, path, streaming).await?;
+    } = open_backend_session(
+        stack,
+        tls,
+        ca_chain,
+        tcp_client,
+        tls_session_cache,
+        trace,
+        path,
+        streaming,
+    )
+    .await?;
     *reusable_session = Some(ReusableBackendSession {
         session,
         network_address,
@@ -1878,20 +2550,101 @@ async fn update_reusable_session_after_streaming_request(
     }
 }
 
-fn standard_response_buffer() -> &'static mut [u8] {
-    // The backend task processes request/response flows serially, so one shared
-    // fixed buffer avoids repeated 8 KiB stack frames during startup sync.
-    unsafe {
-        core::slice::from_raw_parts_mut(
-            addr_of_mut!(HTTP_RESPONSE_BUFFER).cast::<u8>(),
-            HTTP_RESPONSE_MAX_LEN,
-        )
+enum NetworkByteBuffer<const N: usize> {
+    External(crate::memory_policy::ExternalBox<[u8; N]>),
+    Internal(crate::memory_policy::InternalBox<[u8; N]>),
+}
+
+impl<const N: usize> NetworkByteBuffer<N> {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::External(buffer) => &mut buffer[..],
+            Self::Internal(buffer) => &mut buffer[..],
+        }
     }
+}
+
+fn allocate_zeroed_network_buffer<const N: usize>(
+    path: &str,
+    kind: &str,
+) -> Result<NetworkByteBuffer<N>, BackendError> {
+    match crate::memory_policy::try_external_zeroed_array_box::<N>() {
+        Ok(buffer) => {
+            info!(
+                "backend buffer alloc kind={} path={} bytes={} placement=external",
+                kind, path, N
+            );
+            crate::memtrace!(
+                "request_buffer_alloc",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "path" = path,
+                "buffer_kind" = kind,
+                "bytes" = N,
+                "placement" = "external",
+            );
+            Ok(NetworkByteBuffer::External(buffer))
+        }
+        Err(_) => match crate::memory_policy::try_internal_zeroed_array_box::<N>() {
+            Ok(buffer) => {
+                info!(
+                    "backend buffer alloc kind={} path={} bytes={} placement=internal_fallback",
+                    kind, path, N
+                );
+                crate::memtrace!(
+                    "request_buffer_alloc",
+                    "component" = "backend",
+                    "at_ms" = now_ms(),
+                    "path" = path,
+                    "buffer_kind" = kind,
+                    "bytes" = N,
+                    "placement" = "internal_fallback",
+                );
+                Ok(NetworkByteBuffer::Internal(buffer))
+            }
+            Err(_) => {
+                info!(
+                    "backend buffer alloc failed kind={} path={} bytes={}",
+                    kind, path, N
+                );
+                crate::memtrace!(
+                    "request_buffer_alloc",
+                    "component" = "backend",
+                    "at_ms" = now_ms(),
+                    "path" = path,
+                    "buffer_kind" = kind,
+                    "bytes" = N,
+                    "placement" = "failed",
+                );
+                log_request_heap(path, "buffer alloc failed");
+                Err(BackendError::Alloc)
+            }
+        },
+    }
+}
+
+fn allocate_standard_response_buffer(
+    path: &str,
+) -> Result<NetworkByteBuffer<HTTP_RESPONSE_MAX_LEN>, BackendError> {
+    allocate_zeroed_network_buffer::<HTTP_RESPONSE_MAX_LEN>(path, "buffered_response")
+}
+
+fn allocate_stream_header_buffer(
+    path: &str,
+) -> Result<NetworkByteBuffer<HTTP_STREAM_HEADER_MAX_LEN>, BackendError> {
+    allocate_zeroed_network_buffer::<HTTP_STREAM_HEADER_MAX_LEN>(path, "stream_header")
+}
+
+fn allocate_stream_chunk_buffer(
+    path: &str,
+) -> Result<NetworkByteBuffer<PACKAGE_DOWNLOAD_CHUNK_LEN>, BackendError> {
+    allocate_zeroed_network_buffer::<PACKAGE_DOWNLOAD_CHUNK_LEN>(path, "stream_chunk")
 }
 
 fn map_logged_session_error(path: &str, stage: &str, error: SessionError) -> BackendError {
     match error {
         SessionError::MbedTls(err) => {
+            crate::internet::invalidate_backend_path("tls_failed");
             info!(
                 "backend request tls {} failed path={} err={:?}",
                 stage, path, err
@@ -1900,6 +2653,7 @@ fn map_logged_session_error(path: &str, stage: &str, error: SessionError) -> Bac
             BackendError::Tls
         }
         SessionError::Io(err) => {
+            crate::internet::invalidate_backend_path("io_failed");
             info!(
                 "backend request io {} failed path={} err={:?}",
                 stage, path, err
@@ -1911,6 +2665,16 @@ fn map_logged_session_error(path: &str, stage: &str, error: SessionError) -> Bac
 }
 
 fn log_request_timeout(path: &str, stage: &str, error: BackendError) -> BackendError {
+    if is_transient_transport_error(error) {
+        let reason = match error {
+            BackendError::Dns => "dns_timeout",
+            BackendError::Connect => "connect_timeout",
+            BackendError::Tls => "tls_timeout",
+            BackendError::Io => "io_timeout",
+            _ => unreachable!(),
+        };
+        crate::internet::invalidate_backend_path(reason);
+    }
     info!("backend request {} timed out path={}", stage, path);
     log_request_heap(path, stage);
     error
@@ -2165,6 +2929,29 @@ where
                 None if connection_close => None,
                 None => return Err(BackendError::InvalidResponse),
             };
+            metrics.header_bytes = metadata.body_start;
+            metrics.response_buffer_capacity = response_buffer.len();
+            metrics.content_length = metadata.content_length.unwrap_or(0);
+            metrics.content_length_known = metadata.content_length.is_some();
+            metrics.response_buffer_headroom = expected_total
+                .map(|expected| response_buffer.len().saturating_sub(expected))
+                .unwrap_or_else(|| response_buffer.len().saturating_sub(total));
+            crate::memtrace!(
+                "request_headers",
+                "component" = "backend",
+                "at_ms" = now_ms(),
+                "sync_id" = metrics.trace.sync_id,
+                "req_id" = metrics.trace.req_id,
+                "path" = path,
+                "streaming" = bool_flag(metrics.streaming),
+                "header_bytes" = metadata.body_start,
+                "initial_body_bytes" = total.saturating_sub(metadata.body_start),
+                "content_length_known" = bool_flag(metadata.content_length.is_some()),
+                "content_length" = metadata.content_length.unwrap_or(0),
+                "response_buffer_capacity" = response_buffer.len(),
+                "response_buffer_headroom" = metrics.response_buffer_headroom,
+                "connection_close" = bool_flag(connection_close),
+            );
             saw_headers = true;
         }
 
@@ -2176,7 +2963,15 @@ where
         }
     }
 
-    parse_http_response(&response_buffer[..total])
+    let parsed = parse_http_response(&response_buffer[..total])?;
+    metrics.body_bytes = parsed.body.len();
+    metrics.response_bytes = total;
+    metrics.response_buffer_capacity = response_buffer.len();
+    metrics.response_buffer_headroom = response_buffer.len().saturating_sub(total);
+    if !metrics.content_length_known {
+        metrics.content_length = parsed.body.len();
+    }
+    Ok(parsed)
 }
 
 fn parse_http_response(response: &[u8]) -> Result<HttpResponse<'_>, BackendError> {
@@ -2286,40 +3081,370 @@ fn parse_me_profile(body: &str) -> Result<MeProfile, IdentityError> {
     })
 }
 
+fn build_collection_page_path(
+    endpoint: CollectionEndpoint,
+    cursor: Option<&heapless::String<COLLECTION_CURSOR_MAX_LEN>>,
+) -> Result<heapless::String<COLLECTION_PAGE_PATH_MAX_LEN>, BackendError> {
+    let mut path = heapless::String::<COLLECTION_PAGE_PATH_MAX_LEN>::new();
+    write!(
+        &mut path,
+        "{}?limit={}",
+        endpoint.path(),
+        COLLECTION_PAGE_LIMIT
+    )
+    .map_err(|_| BackendError::ResponseTooLarge)?;
+    path.push_str(endpoint.extra_query())
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=")
+            .map_err(|_| BackendError::ResponseTooLarge)?;
+        path.push_str(cursor.as_str())
+            .map_err(|_| BackendError::ResponseTooLarge)?;
+    }
+    Ok(path)
+}
+
+fn parse_collection_page_cursor(
+    endpoint: CollectionEndpoint,
+    body: &str,
+) -> Result<Option<heapless::String<COLLECTION_CURSOR_MAX_LEN>>, BackendError> {
+    match endpoint {
+        CollectionEndpoint::Recommendations => {
+            extract_json_optional_string(body, "\"next_cursor\"")
+                .unwrap_or(None)
+                .map(bounded_string)
+                .transpose()
+        }
+        CollectionEndpoint::Inbox | CollectionEndpoint::Saved => {
+            extract_json_optional_string(body, "\"next_cursor\"")
+                .ok_or(BackendError::MissingField)?
+                .map(bounded_string)
+                .transpose()
+        }
+    }
+}
+
+fn collection_body_preview(
+    body: &str,
+    item_count: usize,
+) -> Result<(Option<heapless::String<INBOX_LOG_PREVIEW_MAX_LEN>>, bool), BackendError> {
+    if item_count == 0 {
+        Ok((None, false))
+    } else {
+        let (preview, truncated) = utf8_log_prefix(body, INBOX_LOG_PREVIEW_MAX_LEN);
+        Ok((Some(bounded_string(preview)?), truncated))
+    }
+}
+
+fn parse_inbox_fetch_page(body: &str) -> Result<CollectionFetchPage, BackendError> {
+    let collection = parse_inbox_collection(body)?;
+    let next_cursor = parse_collection_page_cursor(CollectionEndpoint::Inbox, body)?;
+    let (body_preview, body_preview_truncated) = collection_body_preview(body, collection.len())?;
+    Ok(CollectionFetchPage {
+        collection,
+        next_cursor,
+        body_preview,
+        body_preview_truncated,
+    })
+}
+
+fn parse_saved_content_fetch_page(body: &str) -> Result<CollectionFetchPage, BackendError> {
+    let collection = parse_saved_content_collection(body)?;
+    let next_cursor = parse_collection_page_cursor(CollectionEndpoint::Saved, body)?;
+    let (body_preview, body_preview_truncated) = collection_body_preview(body, collection.len())?;
+    Ok(CollectionFetchPage {
+        collection,
+        next_cursor,
+        body_preview,
+        body_preview_truncated,
+    })
+}
+
+fn parse_recommendation_fetch_page(body: &str) -> Result<CollectionFetchPage, BackendError> {
+    let collection = parse_recommendation_collection(body)?;
+    let next_cursor = parse_collection_page_cursor(CollectionEndpoint::Recommendations, body)?;
+    let (body_preview, body_preview_truncated) = collection_body_preview(body, collection.len())?;
+    Ok(CollectionFetchPage {
+        collection,
+        next_cursor,
+        body_preview,
+        body_preview_truncated,
+    })
+}
+
+fn parse_collection_fetch_page(
+    endpoint: CollectionEndpoint,
+    body: &str,
+) -> Result<CollectionFetchPage, BackendError> {
+    match endpoint {
+        CollectionEndpoint::Inbox => parse_inbox_fetch_page(body),
+        CollectionEndpoint::Saved => parse_saved_content_fetch_page(body),
+        CollectionEndpoint::Recommendations => parse_recommendation_fetch_page(body),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_collection_fetch_page_metrics(
+    trace: TraceContext,
+    kind: CollectionKind,
+    path: &str,
+    page_index: usize,
+    body_bytes: usize,
+    item_count: usize,
+    accepted_items: usize,
+    next_cursor_present: bool,
+    response_body_headroom: usize,
+    merged_item_count: usize,
+    truncated_by_capacity: bool,
+) {
+    let avg_item_bytes = if item_count == 0 {
+        0
+    } else {
+        body_bytes / item_count
+    };
+    let estimated_max_items = if item_count == 0 || avg_item_bytes == 0 {
+        item_count
+    } else {
+        item_count.saturating_add(response_body_headroom / avg_item_bytes)
+    };
+
+    crate::memtrace!(
+        "collection_fetch_page",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "sync_id" = trace.sync_id,
+        "req_id" = trace.req_id,
+        "collection" = collection_label(kind),
+        "path" = path,
+        "page_index" = page_index,
+        "body_bytes" = body_bytes,
+        "item_count" = item_count,
+        "accepted_items" = accepted_items,
+        "merged_item_count" = merged_item_count,
+        "avg_item_bytes" = avg_item_bytes,
+        "next_cursor_present" = bool_flag(next_cursor_present),
+        "response_body_headroom" = response_body_headroom,
+        "estimated_max_items" = estimated_max_items,
+        "page_limit" = COLLECTION_PAGE_LIMIT,
+        "truncated_by_capacity" = bool_flag(truncated_by_capacity),
+    );
+}
+
+fn log_collection_fetch_total_metrics(
+    trace: TraceContext,
+    kind: CollectionKind,
+    page_count: usize,
+    body_bytes_total: usize,
+    item_count: usize,
+    next_cursor_present: bool,
+    truncated_by_capacity: bool,
+) {
+    crate::memtrace!(
+        "collection_fetch_total",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "sync_id" = trace.sync_id,
+        "req_id" = trace.req_id,
+        "collection" = collection_label(kind),
+        "page_count" = page_count,
+        "page_limit" = COLLECTION_PAGE_LIMIT,
+        "body_bytes_total" = body_bytes_total,
+        "item_count" = item_count,
+        "next_cursor_present" = bool_flag(next_cursor_present),
+        "truncated_by_capacity" = bool_flag(truncated_by_capacity),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_collection_fetch_paginated(
+    stack: Stack<'static>,
+    tls: TlsReference<'_>,
+    ca_chain: &Certificate<'static>,
+    tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    access_token: &str,
+    sync_id: u32,
+    endpoint: CollectionEndpoint,
+) -> Result<CollectionFetchResult, CollectionQueryError> {
+    let mut accumulator = CollectionFetchAccumulator::new(next_request_trace(sync_id));
+    let mut page_index = 0usize;
+    let mut cursor = None::<heapless::String<COLLECTION_CURSOR_MAX_LEN>>;
+
+    loop {
+        if page_index >= COLLECTION_FETCH_MAX_PAGES {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        let path = build_collection_page_path(endpoint, cursor.as_ref())
+            .map_err(CollectionQueryError::Other)?;
+        let request_trace = if page_index == 0 {
+            accumulator.trace
+        } else {
+            next_request_trace(sync_id)
+        };
+        let mut response_buffer = allocate_standard_response_buffer(path.as_str())
+            .map_err(CollectionQueryError::Other)?;
+        let response = send_https_request(
+            stack,
+            tls,
+            ca_chain,
+            tcp_state,
+            tls_session_cache,
+            HttpRequest {
+                trace: request_trace,
+                method: "GET",
+                path: path.as_str(),
+                content_type: Some("application/json"),
+                bearer_token: Some(access_token),
+                body: b"",
+                connection_close: true,
+            },
+            response_buffer.as_mut_slice(),
+        )
+        .await
+        .map_err(CollectionQueryError::Other)?;
+
+        if (400..500).contains(&response.status) {
+            return Err(CollectionQueryError::Rejected(response.status));
+        }
+        if response.status != 200 {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        let page = parse_collection_fetch_page(endpoint, response.body)
+            .map_err(CollectionQueryError::Other)?;
+        if page.collection.is_empty() && page.next_cursor.is_some() {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+        accumulator.absorb_page(
+            endpoint,
+            path.as_str(),
+            response.body.len(),
+            page_index,
+            page,
+        );
+        page_index += 1;
+
+        if !accumulator.should_continue() {
+            break;
+        }
+        cursor = accumulator.next_cursor.clone();
+    }
+
+    log_collection_fetch_total_metrics(
+        accumulator.trace,
+        endpoint.kind(),
+        accumulator.page_count,
+        accumulator.body_bytes_total,
+        accumulator.collection.len(),
+        accumulator.next_cursor.is_some() || accumulator.truncated_by_capacity,
+        accumulator.truncated_by_capacity,
+    );
+    Ok(accumulator.into_result())
+}
+
+async fn perform_saved_content_fetch_paginated_over_session<T>(
+    session: &mut Session<'_, T>,
+    access_token: &str,
+    connection_close: bool,
+    sync_id: u32,
+) -> Result<CollectionFetchResult, CollectionQueryError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    let mut accumulator = CollectionFetchAccumulator::new(next_request_trace(sync_id));
+    let mut page_index = 0usize;
+    let mut cursor = None::<heapless::String<COLLECTION_CURSOR_MAX_LEN>>;
+
+    loop {
+        if page_index >= COLLECTION_FETCH_MAX_PAGES {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        let path = build_collection_page_path(CollectionEndpoint::Saved, cursor.as_ref())
+            .map_err(CollectionQueryError::Other)?;
+        let request_trace = if page_index == 0 {
+            accumulator.trace
+        } else {
+            next_request_trace(sync_id)
+        };
+        let mut response_buffer = allocate_standard_response_buffer(path.as_str())
+            .map_err(CollectionQueryError::Other)?;
+        let response = send_https_request_over_session(
+            session,
+            HttpRequest {
+                trace: request_trace,
+                method: "GET",
+                path: path.as_str(),
+                content_type: Some("application/json"),
+                bearer_token: Some(access_token),
+                body: b"",
+                connection_close: connection_close && page_index == 0,
+            },
+            response_buffer.as_mut_slice(),
+        )
+        .await
+        .map_err(CollectionQueryError::Other)?;
+
+        if (400..500).contains(&response.status) {
+            return Err(CollectionQueryError::Rejected(response.status));
+        }
+        if response.status != 200 {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        let page =
+            parse_saved_content_fetch_page(response.body).map_err(CollectionQueryError::Other)?;
+        if page.collection.is_empty() && page.next_cursor.is_some() {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+        accumulator.absorb_page(
+            CollectionEndpoint::Saved,
+            path.as_str(),
+            response.body.len(),
+            page_index,
+            page,
+        );
+        page_index += 1;
+
+        if !accumulator.should_continue() {
+            break;
+        }
+        cursor = accumulator.next_cursor.clone();
+    }
+
+    log_collection_fetch_total_metrics(
+        accumulator.trace,
+        CollectionEndpoint::Saved.kind(),
+        accumulator.page_count,
+        accumulator.body_bytes_total,
+        accumulator.collection.len(),
+        accumulator.next_cursor.is_some() || accumulator.truncated_by_capacity,
+        accumulator.truncated_by_capacity,
+    );
+    Ok(accumulator.into_result())
+}
+
 async fn perform_inbox_fetch(
     stack: Stack<'static>,
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     access_token: &str,
+    sync_id: u32,
 ) -> Result<CollectionFetchResult, CollectionQueryError> {
-    let response_buffer = standard_response_buffer();
-    let response = send_https_request(
+    perform_collection_fetch_paginated(
         stack,
         tls,
         ca_chain,
         tcp_state,
-        HttpRequest {
-            method: "GET",
-            path: INBOX_PATH,
-            content_type: Some("application/json"),
-            bearer_token: Some(access_token),
-            body: b"",
-            connection_close: true,
-        },
-        response_buffer,
+        tls_session_cache,
+        access_token,
+        sync_id,
+        CollectionEndpoint::Inbox,
     )
     .await
-    .map_err(CollectionQueryError::Other)?;
-
-    if (400..500).contains(&response.status) {
-        return Err(CollectionQueryError::Rejected(response.status));
-    }
-    if response.status != 200 {
-        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
-    }
-
-    parse_inbox_fetch_result(response.body).map_err(CollectionQueryError::Other)
 }
 
 async fn perform_saved_content_fetch(
@@ -2327,35 +3452,21 @@ async fn perform_saved_content_fetch(
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     access_token: &str,
+    sync_id: u32,
 ) -> Result<CollectionFetchResult, CollectionQueryError> {
-    let response_buffer = standard_response_buffer();
-    let response = send_https_request(
+    perform_collection_fetch_paginated(
         stack,
         tls,
         ca_chain,
         tcp_state,
-        HttpRequest {
-            method: "GET",
-            path: SAVED_CONTENT_PATH,
-            content_type: Some("application/json"),
-            bearer_token: Some(access_token),
-            body: b"",
-            connection_close: true,
-        },
-        response_buffer,
+        tls_session_cache,
+        access_token,
+        sync_id,
+        CollectionEndpoint::Saved,
     )
     .await
-    .map_err(CollectionQueryError::Other)?;
-
-    if (400..500).contains(&response.status) {
-        return Err(CollectionQueryError::Rejected(response.status));
-    }
-    if response.status != 200 {
-        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
-    }
-
-    parse_saved_content_fetch_result(response.body).map_err(CollectionQueryError::Other)
 }
 
 async fn perform_recommendation_fetch(
@@ -2363,37 +3474,24 @@ async fn perform_recommendation_fetch(
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     access_token: &str,
+    sync_id: u32,
 ) -> Result<CollectionFetchResult, CollectionQueryError> {
-    let response_buffer = standard_response_buffer();
-    let response = send_https_request(
+    perform_collection_fetch_paginated(
         stack,
         tls,
         ca_chain,
         tcp_state,
-        HttpRequest {
-            method: "GET",
-            path: RECOMMENDATIONS_PATH,
-            content_type: Some("application/json"),
-            bearer_token: Some(access_token),
-            body: b"",
-            connection_close: true,
-        },
-        response_buffer,
+        tls_session_cache,
+        access_token,
+        sync_id,
+        CollectionEndpoint::Recommendations,
     )
     .await
-    .map_err(CollectionQueryError::Other)?;
-
-    if (400..500).contains(&response.status) {
-        return Err(CollectionQueryError::Rejected(response.status));
-    }
-    if response.status != 200 {
-        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
-    }
-
-    parse_recommendation_fetch_result(response.body).map_err(CollectionQueryError::Other)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_and_stage_package<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
@@ -2401,12 +3499,42 @@ async fn fetch_and_stage_package<'a>(
     tcp_client: &'a BackendTcpClient<'a>,
     access_token: &str,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: PrepareContentRequest,
-) -> Result<CollectionManifestState, PackagePrepareError> {
+    sync_id: u32,
+) -> Result<content_storage::CommitAndOpenPackageResult, PackagePrepareError> {
     let path = build_package_path(request).map_err(PackagePrepareError::Other)?;
     let mut attempt = 0usize;
 
     loop {
+        let request_trace = next_request_trace(sync_id);
+        if let Err(err) = wait_for_backend_request_path_ready(
+            stack,
+            request_trace,
+            path.as_str(),
+            true,
+            if attempt == 0 {
+                "package_fetch"
+            } else {
+                "package_retry"
+            },
+        )
+        .await
+        {
+            if attempt + 1 < TRANSPORT_RETRY_ATTEMPTS {
+                attempt += 1;
+                info!(
+                    "backend package retry content_id={} attempt={} err={:?}",
+                    request.content_id.as_str(),
+                    attempt,
+                    err
+                );
+                Timer::after(Duration::from_millis(TRANSPORT_RETRY_BACKOFF_MS)).await;
+                continue;
+            }
+            return Err(PackagePrepareError::Other(err));
+        }
+
         info!(
             "backend package fetch begin content_id={} remote_item_id={} revision={} collection={:?} path={} outer_attempt={}/{}",
             request.content_id.as_str(),
@@ -2417,9 +3545,13 @@ async fn fetch_and_stage_package<'a>(
             attempt + 1,
             TRANSPORT_RETRY_ATTEMPTS,
         );
-        content_storage::begin_package_stage(request.content_id, request.remote_revision)
-            .await
-            .map_err(map_storage_prepare_error)?;
+        content_storage::begin_package_stage_traced(
+            request_trace,
+            request.content_id,
+            request.remote_revision,
+        )
+        .await
+        .map_err(map_storage_prepare_error)?;
 
         let status = match stream_https_response_body_to_storage_reusing_session(
             stack,
@@ -2427,7 +3559,9 @@ async fn fetch_and_stage_package<'a>(
             ca_chain,
             tcp_client,
             reusable_session,
+            tls_session_cache,
             HttpRequest {
+                trace: request_trace,
                 method: "GET",
                 path: path.as_str(),
                 content_type: Some("application/json"),
@@ -2442,7 +3576,7 @@ async fn fetch_and_stage_package<'a>(
             Err(err)
                 if is_transient_transport_error(err) && attempt + 1 < TRANSPORT_RETRY_ATTEMPTS =>
             {
-                let _ = content_storage::abort_package_stage().await;
+                let _ = content_storage::abort_package_stage_traced(request_trace).await;
                 close_reusable_session(reusable_session, "package retry").await;
                 attempt += 1;
                 info!(
@@ -2455,36 +3589,40 @@ async fn fetch_and_stage_package<'a>(
                 continue;
             }
             Err(err) => {
-                let _ = content_storage::abort_package_stage().await;
+                let _ = content_storage::abort_package_stage_traced(request_trace).await;
                 return Err(PackagePrepareError::Other(err));
             }
         };
 
         if status == 409 {
-            let _ = content_storage::abort_package_stage().await;
+            let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::PendingRemote);
         }
         if (400..500).contains(&status) {
-            let _ = content_storage::abort_package_stage().await;
+            let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::Rejected(status));
         }
         if status != 200 {
-            let _ = content_storage::abort_package_stage().await;
+            let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
         }
 
-        let snapshot =
-            content_storage::commit_package_stage(request.collection, request.remote_item_id)
-                .await
-                .map_err(map_storage_prepare_error)?;
+        let result = content_storage::commit_package_stage_and_open_cached_reader_package_traced(
+            request_trace,
+            request.collection,
+            request.remote_item_id,
+            request.content_id,
+        )
+        .await
+        .map_err(map_storage_prepare_error)?;
 
-        if manifest_item_state(&snapshot, &request.remote_item_id)
+        if manifest_item_state(&result.snapshot, &request.remote_item_id)
             == Some(PackageState::PendingRemote)
         {
             return Err(PackagePrepareError::PendingRemote);
         }
 
-        return Ok(snapshot);
+        return Ok(result);
     }
 }
 
@@ -2492,18 +3630,25 @@ async fn fetch_and_stage_package_over_session<T>(
     session: &mut Session<'_, T>,
     access_token: &str,
     request: PrepareContentRequest,
+    sync_id: u32,
 ) -> Result<CollectionManifestState, PackagePrepareError>
 where
     T: AsyncRead07 + AsyncWrite07,
 {
     let path = build_package_path(request).map_err(PackagePrepareError::Other)?;
-    content_storage::begin_package_stage(request.content_id, request.remote_revision)
-        .await
-        .map_err(map_storage_prepare_error)?;
+    let request_trace = next_request_trace(sync_id);
+    content_storage::begin_package_stage_traced(
+        request_trace,
+        request.content_id,
+        request.remote_revision,
+    )
+    .await
+    .map_err(map_storage_prepare_error)?;
 
     let status = match stream_https_response_body_to_storage_over_session(
         session,
         HttpRequest {
+            trace: request_trace,
             method: "GET",
             path: path.as_str(),
             content_type: Some("application/json"),
@@ -2516,28 +3661,31 @@ where
     {
         Ok(status) => status,
         Err(err) => {
-            let _ = content_storage::abort_package_stage().await;
+            let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::Other(err));
         }
     };
 
     if status == 409 {
-        let _ = content_storage::abort_package_stage().await;
+        let _ = content_storage::abort_package_stage_traced(request_trace).await;
         return Err(PackagePrepareError::PendingRemote);
     }
     if (400..500).contains(&status) {
-        let _ = content_storage::abort_package_stage().await;
+        let _ = content_storage::abort_package_stage_traced(request_trace).await;
         return Err(PackagePrepareError::Rejected(status));
     }
     if status != 200 {
-        let _ = content_storage::abort_package_stage().await;
+        let _ = content_storage::abort_package_stage_traced(request_trace).await;
         return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
     }
 
-    let snapshot =
-        content_storage::commit_package_stage(request.collection, request.remote_item_id)
-            .await
-            .map_err(map_storage_prepare_error)?;
+    let snapshot = content_storage::commit_package_stage_traced(
+        request_trace,
+        request.collection,
+        request.remote_item_id,
+    )
+    .await
+    .map_err(map_storage_prepare_error)?;
 
     if manifest_item_state(&snapshot, &request.remote_item_id) == Some(PackageState::PendingRemote)
     {
@@ -2551,15 +3699,28 @@ async fn stream_https_response_body_to_storage(
     tls: TlsReference<'_>,
     ca_chain: &Certificate<'static>,
     tcp_state: &BackendTcpClientState,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
 ) -> Result<u16, BackendError> {
+    let mut header_buffer = allocate_stream_header_buffer(request.path)?;
+    let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     let mut tcp_client = TcpClient::new(stack, tcp_state);
     tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
     let ConnectedBackendSession {
         mut session,
         mut metrics,
         ..
-    } = open_backend_session(stack, tls, ca_chain, &tcp_client, request.path, true).await?;
+    } = open_backend_session(
+        stack,
+        tls,
+        ca_chain,
+        &tcp_client,
+        tls_session_cache,
+        request.trace,
+        request.path,
+        true,
+    )
+    .await?;
     write_http_request(
         &mut session,
         request.path,
@@ -2576,6 +3737,8 @@ async fn stream_https_response_body_to_storage(
         request.path,
         request.connection_close,
         &mut metrics,
+        header_buffer.as_mut_slice(),
+        chunk_buffer.as_mut_slice(),
     )
     .await;
     close_backend_tls_session(&mut session, "stream request").await;
@@ -2599,6 +3762,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
 ) -> Result<u16, BackendError> {
     let first_attempt = stream_https_response_body_to_storage_reusing_session_once(
@@ -2607,6 +3771,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
         ca_chain,
         tcp_client,
         reusable_session,
+        tls_session_cache,
         request,
     )
     .await;
@@ -2624,6 +3789,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
                 ca_chain,
                 tcp_client,
                 reusable_session,
+                tls_session_cache,
                 request,
             )
             .await
@@ -2638,14 +3804,19 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
     ca_chain: &Certificate<'static>,
     tcp_client: &'a BackendTcpClient<'a>,
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
 ) -> Result<u16, BackendError> {
+    let mut header_buffer = allocate_stream_header_buffer(request.path)?;
+    let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     let metrics = ensure_reusable_session(
         stack,
         tls,
         ca_chain,
         tcp_client,
         reusable_session,
+        tls_session_cache,
+        request.trace,
         request.path,
         true,
     )
@@ -2660,6 +3831,8 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
                 &mut reusable.session,
                 request,
                 metrics,
+                header_buffer.as_mut_slice(),
+                chunk_buffer.as_mut_slice(),
             )
             .await
         }
@@ -2677,10 +3850,14 @@ async fn stream_https_response_body_to_storage_over_session<T>(
 where
     T: AsyncRead07 + AsyncWrite07,
 {
+    let mut header_buffer = allocate_stream_header_buffer(request.path)?;
+    let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     stream_https_response_body_to_storage_over_session_with_metrics(
         session,
         request,
-        RequestMetrics::new(true, true),
+        RequestMetrics::new(request.trace, true, true),
+        header_buffer.as_mut_slice(),
+        chunk_buffer.as_mut_slice(),
     )
     .await
     .map(|response| response.status)
@@ -2690,6 +3867,8 @@ async fn stream_https_response_body_to_storage_over_session_with_metrics<T>(
     session: &mut Session<'_, T>,
     request: HttpRequest<'_>,
     mut metrics: RequestMetrics,
+    header: &mut [u8],
+    chunk: &mut [u8],
 ) -> Result<StreamingHttpResponse, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -2704,12 +3883,21 @@ where
         request.connection_close,
     )
     .await?;
+    log_request_phase(
+        metrics.trace,
+        request.path,
+        "request_sent",
+        metrics.streaming,
+        metrics.elapsed_ms(),
+    );
 
     let response = read_streaming_http_response_to_storage(
         session,
         request.path,
         request.connection_close,
         &mut metrics,
+        header,
+        chunk,
     )
     .await;
     match response {
@@ -2730,15 +3918,18 @@ async fn read_streaming_http_response_to_storage<T>(
     path: &str,
     connection_close: bool,
     metrics: &mut RequestMetrics,
+    header: &mut [u8],
+    chunk: &mut [u8],
 ) -> Result<StreamingHttpResponse, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
 {
-    let mut header = [0u8; HTTP_STREAM_HEADER_MAX_LEN];
     let mut header_len = 0usize;
-    let mut chunk = [0u8; PACKAGE_DOWNLOAD_CHUNK_LEN];
     let mut streamed_body_bytes = 0usize;
+    let mut buffered_chunk_len = 0usize;
     let mut next_progress_log = STREAM_PROGRESS_LOG_INTERVAL_BYTES;
+    metrics.stream_header_capacity = header.len();
+    metrics.stream_header_headroom = header.len();
 
     loop {
         if header_len == header.len() {
@@ -2776,7 +3967,31 @@ where
             response_reusable,
             metrics.elapsed_ms(),
         );
+        crate::memtrace!(
+            "request_headers",
+            "component" = "backend",
+            "at_ms" = now_ms(),
+            "sync_id" = metrics.trace.sync_id,
+            "req_id" = metrics.trace.req_id,
+            "path" = path,
+            "streaming" = 1,
+            "header_bytes" = metadata.body_start,
+            "initial_body_bytes" = initial_body_len,
+            "content_length_known" = bool_flag(metadata.content_length.is_some()),
+            "content_length" = metadata.content_length.unwrap_or(0),
+            "response_buffer_capacity" = 0,
+            "response_buffer_headroom" = 0,
+            "connection_close" = bool_flag(connection_close),
+        );
         if metadata.status != 200 {
+            metrics.header_bytes = metadata.body_start;
+            metrics.body_bytes = initial_body_len;
+            metrics.response_bytes = header_len;
+            metrics.stream_header_headroom = header.len().saturating_sub(header_len);
+            if let Some(content_length) = metadata.content_length {
+                metrics.content_length = content_length;
+                metrics.content_length_known = true;
+            }
             return Ok(StreamingHttpResponse {
                 status: metadata.status,
                 connection_reusable: false,
@@ -2788,12 +4003,22 @@ where
                 if initial_body_len > content_length {
                     return Err(BackendError::InvalidResponse);
                 }
+                metrics.header_bytes = metadata.body_start;
+                metrics.body_bytes = content_length;
+                metrics.response_bytes = metadata.body_start.saturating_add(content_length);
+                metrics.content_length = content_length;
+                metrics.content_length_known = true;
+                metrics.stream_header_headroom = header.len().saturating_sub(header_len);
                 if initial_body_len > 0 {
-                    content_storage::write_package_chunk(&header[body_start..header_len])
-                        .await
-                        .map_err(map_storage_backend_error)?;
+                    chunk[..initial_body_len].copy_from_slice(&header[body_start..header_len]);
+                    buffered_chunk_len = initial_body_len;
+                    if buffered_chunk_len == chunk.len() {
+                        flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len)
+                            .await?;
+                    }
                     streamed_body_bytes = initial_body_len;
                     log_stream_progress_if_needed(
+                        metrics.trace,
                         path,
                         &mut next_progress_log,
                         streamed_body_bytes,
@@ -2804,30 +4029,38 @@ where
 
                 let mut remaining = content_length - initial_body_len;
                 while remaining > 0 {
-                    let read_len = remaining.min(chunk.len());
+                    let read_len = remaining.min(chunk.len().saturating_sub(buffered_chunk_len));
                     let read = await_body_io_timeout(
                         path,
                         "stream response body read",
-                        AsyncRead07::read(session, &mut chunk[..read_len]),
+                        AsyncRead07::read(
+                            session,
+                            &mut chunk[buffered_chunk_len..buffered_chunk_len + read_len],
+                        ),
                     )
                     .await?;
                     if read == 0 {
                         return Err(BackendError::InvalidResponse);
                     }
-                    content_storage::write_package_chunk(&chunk[..read])
-                        .await
-                        .map_err(map_storage_backend_error)?;
+                    buffered_chunk_len += read;
                     streamed_body_bytes = streamed_body_bytes.saturating_add(read);
                     remaining -= read;
                     log_stream_progress_if_needed(
+                        metrics.trace,
                         path,
                         &mut next_progress_log,
                         streamed_body_bytes,
                         Some(content_length),
                         metrics.elapsed_ms(),
                     );
+                    if buffered_chunk_len == chunk.len() {
+                        flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len)
+                            .await?;
+                    }
                 }
+                flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
                 log_stream_complete(
+                    metrics.trace,
                     path,
                     streamed_body_bytes,
                     Some(content_length),
@@ -2840,12 +4073,18 @@ where
                 });
             }
             None if connection_close => {
+                metrics.header_bytes = metadata.body_start;
+                metrics.stream_header_headroom = header.len().saturating_sub(header_len);
                 if initial_body_len > 0 {
-                    content_storage::write_package_chunk(&header[body_start..header_len])
-                        .await
-                        .map_err(map_storage_backend_error)?;
+                    chunk[..initial_body_len].copy_from_slice(&header[body_start..header_len]);
+                    buffered_chunk_len = initial_body_len;
+                    if buffered_chunk_len == chunk.len() {
+                        flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len)
+                            .await?;
+                    }
                     streamed_body_bytes = initial_body_len;
                     log_stream_progress_if_needed(
+                        metrics.trace,
                         path,
                         &mut next_progress_log,
                         streamed_body_bytes,
@@ -2860,20 +4099,22 @@ where
     }
 
     loop {
+        if buffered_chunk_len == chunk.len() {
+            flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
+        }
         let read = await_body_io_timeout(
             path,
             "stream response body read",
-            AsyncRead07::read(session, &mut chunk),
+            AsyncRead07::read(session, &mut chunk[buffered_chunk_len..]),
         )
         .await?;
         if read == 0 {
             break;
         }
-        content_storage::write_package_chunk(&chunk[..read])
-            .await
-            .map_err(map_storage_backend_error)?;
+        buffered_chunk_len += read;
         streamed_body_bytes = streamed_body_bytes.saturating_add(read);
         log_stream_progress_if_needed(
+            metrics.trace,
             path,
             &mut next_progress_log,
             streamed_body_bytes,
@@ -2881,12 +4122,37 @@ where
             metrics.elapsed_ms(),
         );
     }
+    flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
 
-    log_stream_complete(path, streamed_body_bytes, None, false, metrics.elapsed_ms());
+    metrics.body_bytes = streamed_body_bytes;
+    metrics.response_bytes = metrics.header_bytes.saturating_add(streamed_body_bytes);
+    log_stream_complete(
+        metrics.trace,
+        path,
+        streamed_body_bytes,
+        None,
+        false,
+        metrics.elapsed_ms(),
+    );
     Ok(StreamingHttpResponse {
         status: 200,
         connection_reusable: false,
     })
+}
+
+async fn flush_buffered_package_chunk(
+    trace: TraceContext,
+    chunk: &mut [u8],
+    buffered_len: &mut usize,
+) -> Result<(), BackendError> {
+    if *buffered_len == 0 {
+        return Ok(());
+    }
+    content_storage::write_package_chunk_traced(trace, &chunk[..*buffered_len])
+        .await
+        .map_err(map_storage_backend_error)?;
+    *buffered_len = 0;
+    Ok(())
 }
 
 fn parse_http_status(response: &[u8]) -> Result<u16, BackendError> {
@@ -2906,42 +4172,34 @@ async fn perform_saved_content_fetch_over_session<T>(
     session: &mut Session<'_, T>,
     access_token: &str,
     connection_close: bool,
+    sync_id: u32,
 ) -> Result<CollectionFetchResult, CollectionQueryError>
 where
     T: AsyncRead07 + AsyncWrite07,
 {
-    let response_buffer = standard_response_buffer();
-    let response = send_https_request_over_session(
+    perform_saved_content_fetch_paginated_over_session(
         session,
-        HttpRequest {
-            method: "GET",
-            path: SAVED_CONTENT_PATH,
-            content_type: Some("application/json"),
-            bearer_token: Some(access_token),
-            body: b"",
-            connection_close,
-        },
-        response_buffer,
+        access_token,
+        connection_close,
+        sync_id,
     )
     .await
-    .map_err(CollectionQueryError::Other)?;
-
-    if (400..500).contains(&response.status) {
-        return Err(CollectionQueryError::Rejected(response.status));
-    }
-    if response.status != 200 {
-        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
-    }
-
-    parse_saved_content_fetch_result(response.body).map_err(CollectionQueryError::Other)
 }
 
 async fn publish_package_state(
+    trace: TraceContext,
     collection: CollectionKind,
     remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
     package_state: PackageState,
 ) -> Result<(), StorageError> {
-    match content_storage::update_package_state(collection, remote_item_id, package_state).await {
+    match content_storage::update_package_state_traced(
+        trace,
+        collection,
+        remote_item_id,
+        package_state,
+    )
+    .await
+    {
         Ok(snapshot) => {
             publish_event(
                 Event::CollectionContentUpdated(collection, Box::new(snapshot)),
@@ -3274,87 +4532,77 @@ fn parse_collection_fetch_summary(
     let next_cursor_present = extract_json_optional_string(body, "\"next_cursor\"")
         .ok_or(BackendError::MissingField)?
         .is_some();
-    let (body_preview, body_preview_truncated) = if item_count > 0 {
-        let (preview, truncated) = utf8_log_prefix(body, INBOX_LOG_PREVIEW_MAX_LEN);
-        (Some(bounded_string(preview)?), truncated)
-    } else {
-        (None, false)
-    };
+    let (body_preview, body_preview_truncated) = collection_body_preview(body, item_count)?;
 
     Ok(CollectionFetchSummary {
+        trace: TraceContext::none(),
         item_count,
         next_cursor_present,
+        page_count: 1,
+        body_bytes_total: body.len(),
+        truncated_by_capacity: false,
         body_preview,
         body_preview_truncated,
     })
 }
 
 fn parse_inbox_fetch_result(body: &str) -> Result<CollectionFetchResult, BackendError> {
-    let collection = parse_inbox_collection(body)?;
-    let next_cursor_present = extract_json_optional_string(body, "\"next_cursor\"")
-        .ok_or(BackendError::MissingField)?
-        .is_some();
-    let (body_preview, body_preview_truncated) = if collection.is_empty() {
-        (None, false)
-    } else {
-        let (preview, truncated) = utf8_log_prefix(body, INBOX_LOG_PREVIEW_MAX_LEN);
-        (Some(bounded_string(preview)?), truncated)
-    };
+    let page = parse_inbox_fetch_page(body)?;
+    let next_cursor_present = page.next_cursor.is_some();
+    let item_count = page.collection.len();
 
     Ok(CollectionFetchResult {
         summary: CollectionFetchSummary {
-            item_count: collection.len(),
+            trace: TraceContext::none(),
+            item_count,
             next_cursor_present,
-            body_preview,
-            body_preview_truncated,
+            page_count: 1,
+            body_bytes_total: body.len(),
+            truncated_by_capacity: false,
+            body_preview: page.body_preview,
+            body_preview_truncated: page.body_preview_truncated,
         },
-        collection,
+        collection: page.collection,
     })
 }
 
 fn parse_saved_content_fetch_result(body: &str) -> Result<CollectionFetchResult, BackendError> {
-    let collection = parse_saved_content_collection(body)?;
-    let next_cursor_present = extract_json_optional_string(body, "\"next_cursor\"")
-        .ok_or(BackendError::MissingField)?
-        .is_some();
-    let (body_preview, body_preview_truncated) = if collection.is_empty() {
-        (None, false)
-    } else {
-        let (preview, truncated) = utf8_log_prefix(body, INBOX_LOG_PREVIEW_MAX_LEN);
-        (Some(bounded_string(preview)?), truncated)
-    };
+    let page = parse_saved_content_fetch_page(body)?;
+    let next_cursor_present = page.next_cursor.is_some();
+    let item_count = page.collection.len();
 
     Ok(CollectionFetchResult {
         summary: CollectionFetchSummary {
-            item_count: collection.len(),
+            trace: TraceContext::none(),
+            item_count,
             next_cursor_present,
-            body_preview,
-            body_preview_truncated,
+            page_count: 1,
+            body_bytes_total: body.len(),
+            truncated_by_capacity: false,
+            body_preview: page.body_preview,
+            body_preview_truncated: page.body_preview_truncated,
         },
-        collection,
+        collection: page.collection,
     })
 }
 
 fn parse_recommendation_fetch_result(body: &str) -> Result<CollectionFetchResult, BackendError> {
-    let collection = parse_recommendation_collection(body)?;
-    let next_cursor_present = extract_json_optional_string(body, "\"next_cursor\"")
-        .unwrap_or(None)
-        .is_some();
-    let (body_preview, body_preview_truncated) = if collection.is_empty() {
-        (None, false)
-    } else {
-        let (preview, truncated) = utf8_log_prefix(body, INBOX_LOG_PREVIEW_MAX_LEN);
-        (Some(bounded_string(preview)?), truncated)
-    };
+    let page = parse_recommendation_fetch_page(body)?;
+    let next_cursor_present = page.next_cursor.is_some();
+    let item_count = page.collection.len();
 
     Ok(CollectionFetchResult {
         summary: CollectionFetchSummary {
-            item_count: collection.len(),
+            trace: TraceContext::none(),
+            item_count,
             next_cursor_present,
-            body_preview,
-            body_preview_truncated,
+            page_count: 1,
+            body_bytes_total: body.len(),
+            truncated_by_capacity: false,
+            body_preview: page.body_preview,
+            body_preview_truncated: page.body_preview_truncated,
         },
-        collection,
+        collection: page.collection,
     })
 }
 
@@ -3802,25 +5050,84 @@ fn log_status(status: SyncStatus) {
 }
 
 fn log_heap(label: &str) {
-    let stats = esp_alloc::HEAP.stats();
+    let stats = crate::telemetry::capture_heap();
     info!(
-        "heap label={} size={} used={} free={}",
+        "heap label={} size={} used={} free={} internal_size={} internal_used={} internal_free={} internal_peak_used={} internal_min_free={} external_size={} external_used={} external_free={} external_peak_used={} external_min_free={}",
         label,
         stats.size,
-        stats.current_usage,
-        stats.size.saturating_sub(stats.current_usage),
+        stats.used,
+        stats.free,
+        stats.internal_size,
+        stats.internal_used,
+        stats.internal_free,
+        stats.internal_peak_used,
+        stats.internal_min_free,
+        stats.external_size,
+        stats.external_used,
+        stats.external_free,
+        stats.external_peak_used,
+        stats.external_min_free,
+    );
+    info!(
+        "heap regions label={} region0_kind={} region0_used={} region0_free={} region0_peak_used={} region0_min_free={} region1_kind={} region1_used={} region1_free={} region1_peak_used={} region1_min_free={} region2_kind={} region2_used={} region2_free={} region2_peak_used={} region2_min_free={}",
+        label,
+        stats.regions[0].kind,
+        stats.regions[0].used,
+        stats.regions[0].free,
+        stats.regions[0].peak_used,
+        stats.regions[0].min_free,
+        stats.regions[1].kind,
+        stats.regions[1].used,
+        stats.regions[1].free,
+        stats.regions[1].peak_used,
+        stats.regions[1].min_free,
+        stats.regions[2].kind,
+        stats.regions[2].used,
+        stats.regions[2].free,
+        stats.regions[2].peak_used,
+        stats.regions[2].min_free,
     );
 }
 
 fn log_request_heap(path: &str, stage: &str) {
-    let stats = esp_alloc::HEAP.stats();
+    let stats = crate::telemetry::capture_heap();
     info!(
-        "backend heap path={} stage={} size={} used={} free={}",
+        "backend heap path={} stage={} size={} used={} free={} internal_size={} internal_used={} internal_free={} internal_peak_used={} internal_min_free={} external_size={} external_used={} external_free={} external_peak_used={} external_min_free={}",
         path,
         stage,
         stats.size,
-        stats.current_usage,
-        stats.size.saturating_sub(stats.current_usage),
+        stats.used,
+        stats.free,
+        stats.internal_size,
+        stats.internal_used,
+        stats.internal_free,
+        stats.internal_peak_used,
+        stats.internal_min_free,
+        stats.external_size,
+        stats.external_used,
+        stats.external_free,
+        stats.external_peak_used,
+        stats.external_min_free,
+    );
+    info!(
+        "backend heap regions path={} stage={} region0_kind={} region0_used={} region0_free={} region0_peak_used={} region0_min_free={} region1_kind={} region1_used={} region1_free={} region1_peak_used={} region1_min_free={} region2_kind={} region2_used={} region2_free={} region2_peak_used={} region2_min_free={}",
+        path,
+        stage,
+        stats.regions[0].kind,
+        stats.regions[0].used,
+        stats.regions[0].free,
+        stats.regions[0].peak_used,
+        stats.regions[0].min_free,
+        stats.regions[1].kind,
+        stats.regions[1].used,
+        stats.regions[1].free,
+        stats.regions[1].peak_used,
+        stats.regions[1].min_free,
+        stats.regions[2].kind,
+        stats.regions[2].used,
+        stats.regions[2].free,
+        stats.regions[2].peak_used,
+        stats.regions[2].min_free,
     );
 }
 
@@ -3832,10 +5139,31 @@ fn elapsed_since_ms(started_ms: u64) -> u64 {
     now_ms().saturating_sub(started_ms)
 }
 
+fn log_request_phase(
+    trace: TraceContext,
+    path: &str,
+    phase: &str,
+    streaming: bool,
+    elapsed_ms: u64,
+) {
+    crate::memtrace!(
+        "request_phase",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "sync_id" = trace.sync_id,
+        "req_id" = trace.req_id,
+        "path" = path,
+        "phase" = phase,
+        "streaming" = bool_flag(streaming),
+        "elapsed_ms" = elapsed_ms,
+    );
+}
+
 fn reusable_session_discard_reason(
     stack: Stack<'static>,
     session: &ReusableBackendSession<'_>,
     now_ms: u64,
+    streaming: bool,
 ) -> &'static str {
     if !stack.is_link_up() {
         return "link_down";
@@ -3845,9 +5173,7 @@ fn reusable_session_discard_reason(
         None => "missing_ip",
         Some(current) if current != session.network_address => "network_changed",
         Some(_) => {
-            if now_ms.saturating_sub(session.last_used_ms)
-                > Duration::from_secs(KEEPALIVE_IDLE_TIMEOUT_SECS).as_millis()
-            {
+            if !is_reusable_session_age_usable(session.last_used_ms, now_ms, streaming) {
                 "idle_timeout"
             } else {
                 "unknown"
@@ -3856,7 +5182,25 @@ fn reusable_session_discard_reason(
     }
 }
 
+fn reusable_session_idle_reap_timeout_ms() -> u64 {
+    Duration::from_secs(REUSABLE_BUFFERED_SESSION_IDLE_TIMEOUT_SECS).as_millis()
+}
+
+fn reusable_session_idle_timeout_ms(streaming: bool) -> u64 {
+    let seconds = if streaming {
+        REUSABLE_STREAMING_SESSION_IDLE_TIMEOUT_SECS
+    } else {
+        REUSABLE_BUFFERED_SESSION_IDLE_TIMEOUT_SECS
+    };
+    Duration::from_secs(seconds).as_millis()
+}
+
+fn is_reusable_session_age_usable(last_used_ms: u64, now_ms: u64, streaming: bool) -> bool {
+    now_ms.saturating_sub(last_used_ms) <= reusable_session_idle_timeout_ms(streaming)
+}
+
 fn log_stream_progress_if_needed(
+    trace: TraceContext,
     path: &str,
     next_progress_log: &mut usize,
     received_bytes: usize,
@@ -3879,6 +5223,20 @@ fn log_stream_progress_if_needed(
         stats.current_usage,
         stats.size.saturating_sub(stats.current_usage),
     );
+    crate::memtrace!(
+        "request_stream_progress",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "sync_id" = trace.sync_id,
+        "req_id" = trace.req_id,
+        "path" = path,
+        "received_bytes" = received_bytes,
+        "total_bytes_known" = bool_flag(total_bytes.is_some()),
+        "total_bytes" = total_bytes.unwrap_or(0),
+        "remaining_bytes_known" = bool_flag(remaining_bytes.is_some()),
+        "remaining_bytes" = remaining_bytes.unwrap_or(0),
+        "elapsed_ms" = elapsed_ms,
+    );
 
     while received_bytes >= *next_progress_log {
         *next_progress_log = next_progress_log.saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
@@ -3886,6 +5244,7 @@ fn log_stream_progress_if_needed(
 }
 
 fn log_stream_complete(
+    trace: TraceContext,
     path: &str,
     received_bytes: usize,
     total_bytes: Option<usize>,
@@ -3903,21 +5262,64 @@ fn log_stream_complete(
         stats.current_usage,
         stats.size.saturating_sub(stats.current_usage),
     );
+    crate::memtrace!(
+        "request_stream_complete",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "sync_id" = trace.sync_id,
+        "req_id" = trace.req_id,
+        "path" = path,
+        "received_bytes" = received_bytes,
+        "total_bytes_known" = bool_flag(total_bytes.is_some()),
+        "total_bytes" = total_bytes.unwrap_or(0),
+        "response_reusable" = bool_flag(response_reusable),
+        "elapsed_ms" = elapsed_ms,
+    );
 }
 
 fn log_request_timing(request: HttpRequest<'_>, status: u16, metrics: &RequestMetrics) {
+    crate::internet::mark_backend_path_ready("backend_request");
     info!(
-        "backend request timing method={} path={} status={} reused={} streaming={} dns_ms={} connect_ms={} tls_ms={} first_byte_ms={} total_ms={}",
+        "backend request timing method={} path={} status={} reused={} resumed={} streaming={} dns_ms={} connect_ms={} tls_ms={} first_byte_ms={} total_ms={}",
         request.method,
         request.path,
         status,
         metrics.reused_session,
+        metrics.tls_resume_offered,
         metrics.streaming,
         metrics.dns_ms,
         metrics.connect_ms,
         metrics.tls_ms,
         metrics.first_byte_ms.unwrap_or(metrics.total_ms),
         metrics.total_ms,
+    );
+    crate::memtrace!(
+        "request_complete",
+        "component" = "backend",
+        "at_ms" = now_ms(),
+        "sync_id" = request.trace.sync_id,
+        "req_id" = request.trace.req_id,
+        "method" = request.method,
+        "path" = request.path,
+        "status" = status,
+        "reused" = bool_flag(metrics.reused_session),
+        "tls_resume_offered" = bool_flag(metrics.tls_resume_offered),
+        "streaming" = bool_flag(metrics.streaming),
+        "request_body_bytes" = request.body.len(),
+        "dns_ms" = metrics.dns_ms,
+        "connect_ms" = metrics.connect_ms,
+        "tls_ms" = metrics.tls_ms,
+        "first_byte_ms" = metrics.first_byte_ms.unwrap_or(metrics.total_ms),
+        "total_ms" = metrics.total_ms,
+        "header_bytes" = metrics.header_bytes,
+        "body_bytes" = metrics.body_bytes,
+        "response_bytes" = metrics.response_bytes,
+        "content_length_known" = bool_flag(metrics.content_length_known),
+        "content_length" = metrics.content_length,
+        "response_buffer_capacity" = metrics.response_buffer_capacity,
+        "response_buffer_headroom" = metrics.response_buffer_headroom,
+        "stream_header_capacity" = metrics.stream_header_capacity,
+        "stream_header_headroom" = metrics.stream_header_headroom,
     );
 }
 
@@ -3926,6 +5328,20 @@ const fn is_transient_transport_error(error: BackendError) -> bool {
         error,
         BackendError::Dns | BackendError::Connect | BackendError::Tls | BackendError::Io
     )
+}
+
+const fn backend_error_label(error: BackendError) -> &'static str {
+    match error {
+        BackendError::Alloc => "alloc",
+        BackendError::Dns => "dns",
+        BackendError::Connect => "connect",
+        BackendError::Tls => "tls",
+        BackendError::Io => "io",
+        BackendError::InvalidResponse => "invalid_response",
+        BackendError::InvalidUtf8 => "invalid_utf8",
+        BackendError::ResponseTooLarge => "response_too_large",
+        BackendError::MissingField => "missing_field",
+    }
 }
 
 const fn is_auth_status(status: u16) -> bool {
@@ -4132,6 +5548,26 @@ mod tests {
     }
 
     #[test]
+    fn reusable_session_age_window_allows_recent_use_and_rejects_stale_use() {
+        assert!(is_reusable_session_age_usable(1_000, 1_000, true));
+        assert!(is_reusable_session_age_usable(
+            1_000,
+            1_000 + reusable_session_idle_timeout_ms(true),
+            true,
+        ));
+        assert!(!is_reusable_session_age_usable(
+            1_000,
+            1_001 + reusable_session_idle_timeout_ms(true),
+            true,
+        ));
+        assert!(is_reusable_session_age_usable(
+            1_000,
+            1_000 + reusable_session_idle_timeout_ms(false),
+            false,
+        ));
+    }
+
+    #[test]
     fn content_length_keep_alive_response_is_reusable() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}";
         let metadata = parse_http_response_metadata(response).unwrap();
@@ -4222,5 +5658,30 @@ mod tests {
         );
         assert_eq!(item.meta.as_str(), "CRA / SAVED");
         assert_eq!(item.title.as_str(), "Optimizing content for agents");
+    }
+
+    #[test]
+    fn builds_saved_content_page_path_with_cursor() {
+        let mut cursor = heapless::String::<COLLECTION_CURSOR_MAX_LEN>::new();
+        cursor.push_str("cursor-123").unwrap();
+
+        let path = build_collection_page_path(CollectionEndpoint::Saved, Some(&cursor)).unwrap();
+
+        assert_eq!(
+            path.as_str(),
+            "/device/v1/me/saved-content?limit=4&archived=false&cursor=cursor-123"
+        );
+    }
+
+    #[test]
+    fn parses_saved_content_page_cursor() {
+        let page = parse_saved_content_fetch_page(
+            r#"{"content":[{"id":"80ac9044-964c-4067-9de3-0d2476cd7d4a","submitted_url":"https://cra.mr/article","read_state":"unread","is_favorited":false,"created_at":1,"updated_at":2,"tags":[],"content":{"id":"c8e17b7a-95e9-4d3b-93da-5d8dca584e4a","canonical_url":"https://cra.mr/article","host":"cra.mr","site_name":"CRA","title":"Optimizing content for agents"}}],"next_cursor":"cursor-2"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(page.collection.len(), 1);
+        assert_eq!(page.next_cursor.as_ref().unwrap().as_str(), "cursor-2");
+        assert!(page.body_preview.is_some());
     }
 }

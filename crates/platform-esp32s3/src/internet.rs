@@ -30,6 +30,7 @@ const RECONNECT_BACKOFF_MS: u64 = 5_000;
 const NETWORK_STACK_SOCKET_CAPACITY: usize = 4;
 
 static PROBE_SUSPENDED: AtomicBool = AtomicBool::new(false);
+static BACKEND_PATH_READY: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct WifiCredentials {
@@ -134,6 +135,22 @@ pub(crate) fn set_probe_suspended(suspended: bool) {
     PROBE_SUSPENDED.store(suspended, Ordering::Relaxed);
 }
 
+pub(crate) fn backend_path_ready() -> bool {
+    BACKEND_PATH_READY.load(Ordering::Relaxed)
+}
+
+pub(crate) fn mark_backend_path_ready(source: &'static str) {
+    if !BACKEND_PATH_READY.swap(true, Ordering::Relaxed) {
+        info!("internet backend path ready source={}", source);
+    }
+}
+
+pub(crate) fn invalidate_backend_path(reason: &'static str) {
+    if BACKEND_PATH_READY.swap(false, Ordering::Relaxed) {
+        info!("internet backend path invalidated reason={}", reason);
+    }
+}
+
 #[embassy_executor::task]
 async fn connection_task(mut controller: WifiController<'static>, credentials: WifiCredentials) {
     info!(
@@ -147,6 +164,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
         if matches!(esp_radio::wifi::sta_state(), WifiStaState::Connected) {
             controller.wait_for_event(WifiEvent::StaDisconnected).await;
             info!("internet wifi disconnected");
+            invalidate_backend_path("wifi_disconnected");
             publish_status(NetworkStatus::Offline);
             Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
         }
@@ -160,6 +178,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
 
             if let Err(err) = controller.set_config(&client_config) {
                 info!("internet wifi config failed: {:?}", err);
+                invalidate_backend_path("wifi_config_failed");
                 publish_status(NetworkStatus::Offline);
                 Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
                 continue;
@@ -168,6 +187,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
             info!("internet starting wifi");
             if let Err(err) = controller.start_async().await {
                 info!("internet wifi start failed: {:?}", err);
+                invalidate_backend_path("wifi_start_failed");
                 publish_status(NetworkStatus::Offline);
                 Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
                 continue;
@@ -181,6 +201,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
             Ok(_) => info!("internet wifi associated"),
             Err(err) => {
                 info!("internet wifi connect failed: {:?}", err);
+                invalidate_backend_path("wifi_connect_failed");
                 publish_status(NetworkStatus::Offline);
                 Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
             }
@@ -200,11 +221,13 @@ async fn probe_task(stack: Stack<'static>) {
     loop {
         if !stack.is_link_up() {
             probe_ready = false;
+            invalidate_backend_path("link_down");
             Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
             continue;
         }
 
         let Some(config) = stack.config_v4() else {
+            invalidate_backend_path("missing_ip");
             Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
             continue;
         };
@@ -214,7 +237,7 @@ async fn probe_task(stack: Stack<'static>) {
             continue;
         }
 
-        if probe_ready {
+        if probe_ready && backend_path_ready() {
             Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
             continue;
         }
@@ -227,11 +250,13 @@ async fn probe_task(stack: Stack<'static>) {
                     "internet probe succeeded host={} port={}",
                     BACKEND_HOST, BACKEND_PORT
                 );
+                mark_backend_path_ready("probe");
                 publish_status(NetworkStatus::Online);
                 probe_ready = true;
             }
             Err(err) => {
                 info!("internet probe failed: {:?}", err);
+                invalidate_backend_path("probe_failed");
                 publish_status(NetworkStatus::ProbeFailed);
                 Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
             }

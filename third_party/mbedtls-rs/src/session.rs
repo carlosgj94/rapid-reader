@@ -1,9 +1,31 @@
+use alloc::vec::Vec;
 use core::ffi::{c_int, c_void, CStr};
 
 use embedded_io::{Error, ErrorKind};
 
 use super::sys::*;
-use super::{mbedtls_rng, Certificate, MBox, PrivateKey, Tls, TlsReference, TlsVersion};
+use super::{
+    Certificate, MBox, PrivateKey, Tls, TlsReference, TlsVersion, mbedtls_rng,
+};
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SerializedClientSession {
+    bytes: Vec<u8>,
+}
+
+impl SerializedClientSession {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
 
 pub use asynch::*;
 
@@ -328,4 +350,57 @@ impl embedded_io::Error for SessionError {
             _ => embedded_io::ErrorKind::Other,
         }
     }
+}
+
+fn alloc_failed_error() -> SessionError {
+    SessionError::MbedTls(MbedtlsError::new(MBEDTLS_ERR_SSL_ALLOC_FAILED))
+}
+
+fn validate_serialized_client_session(bytes: &[u8]) -> Result<(), SessionError> {
+    let mut session = MBox::<mbedtls_ssl_session>::new().ok_or_else(alloc_failed_error)?;
+    merr!(unsafe { mbedtls_ssl_session_load(&mut *session, bytes.as_ptr(), bytes.len()) })?;
+    Ok(())
+}
+
+fn apply_serialized_client_session(
+    ssl_context: *mut mbedtls_ssl_context,
+    bytes: &[u8],
+) -> Result<(), SessionError> {
+    let mut session = MBox::<mbedtls_ssl_session>::new().ok_or_else(alloc_failed_error)?;
+    merr!(unsafe { mbedtls_ssl_session_load(&mut *session, bytes.as_ptr(), bytes.len()) })?;
+    merr!(unsafe { mbedtls_ssl_set_session(ssl_context, &*session) })?;
+    Ok(())
+}
+
+fn export_serialized_client_session(
+    ssl_context: &mbedtls_ssl_context,
+) -> Result<SerializedClientSession, SessionError> {
+    let mut session = MBox::<mbedtls_ssl_session>::new().ok_or_else(alloc_failed_error)?;
+    merr!(unsafe { mbedtls_ssl_get_session(ssl_context, &mut *session) })?;
+
+    let mut serialized_len = 0usize;
+    let sizing = unsafe {
+        mbedtls_ssl_session_save(&*session, core::ptr::null_mut(), 0, &mut serialized_len)
+    };
+    if sizing != 0 && sizing != MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL {
+        return Err(SessionError::MbedTls(MbedtlsError::new(sizing)));
+    }
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(serialized_len)
+        .map_err(|_| alloc_failed_error())?;
+    bytes.resize(serialized_len, 0);
+
+    merr!(unsafe {
+        mbedtls_ssl_session_save(
+            &*session,
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            &mut serialized_len,
+        )
+    })?;
+    bytes.truncate(serialized_len);
+
+    Ok(SerializedClientSession { bytes })
 }

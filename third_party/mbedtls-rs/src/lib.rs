@@ -1,6 +1,8 @@
 #![no_std]
 #![allow(clippy::uninlined_format_args)]
 
+extern crate alloc;
+
 use core::cell::RefCell;
 use core::ffi::{c_char, c_int, c_uchar, c_void, CStr};
 use core::marker::PhantomData;
@@ -15,8 +17,9 @@ use crate::sys::{mbedtls_calloc, mbedtls_free};
 use crate::sys::{
     mbedtls_ctr_drbg_context, mbedtls_ctr_drbg_free, mbedtls_ctr_drbg_init, mbedtls_pk_context,
     mbedtls_pk_free, mbedtls_pk_init, mbedtls_ssl_conf_dbg, mbedtls_ssl_config,
-    mbedtls_ssl_config_free, mbedtls_ssl_config_init, mbedtls_ssl_context, mbedtls_ssl_free,
-    mbedtls_ssl_init, mbedtls_x509_crt, mbedtls_x509_crt_free, mbedtls_x509_crt_init,
+    mbedtls_ssl_config_free, mbedtls_ssl_config_init, mbedtls_ssl_context,
+    mbedtls_ssl_free, mbedtls_ssl_init, mbedtls_ssl_session, mbedtls_ssl_session_free,
+    mbedtls_ssl_session_init, mbedtls_x509_crt, mbedtls_x509_crt_free, mbedtls_x509_crt_init,
 };
 
 use rand_core::CryptoRng;
@@ -211,6 +214,20 @@ impl MInit for mbedtls_ssl_context {
     fn deinit(&mut self) {
         unsafe {
             mbedtls_ssl_free(self);
+        }
+    }
+}
+
+impl MInit for mbedtls_ssl_session {
+    fn init(&mut self) {
+        unsafe {
+            mbedtls_ssl_session_init(self);
+        }
+    }
+
+    fn deinit(&mut self) {
+        unsafe {
+            mbedtls_ssl_session_free(self);
         }
     }
 }

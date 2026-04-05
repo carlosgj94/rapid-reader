@@ -10,7 +10,10 @@ use io::{ErrorType, Read, Write};
 use crate::sys::*;
 use crate::{SessionError, TlsReference};
 
-use super::{SessionConfig, SessionState};
+use super::{
+    SessionConfig, SessionState, SerializedClientSession, apply_serialized_client_session,
+    export_serialized_client_session, validate_serialized_client_session,
+};
 
 /// Re-export of the `embedded-io-async` crate so that users don't have to explicitly depend on it
 /// to use e.g. `write_all` or `read_exact`.
@@ -42,6 +45,8 @@ where
     read_byte: Option<u8>,
     /// A state necessary so as to implement `MBio::writable`
     write_byte: Option<u8>,
+    /// Optional serialized session blob to offer for session resumption
+    resume_session: Option<SerializedClientSession>,
     /// Reference to the active Tls instance
     _token: TlsReference<'a>,
 }
@@ -71,6 +76,7 @@ where
             eof: false,
             read_byte: None,
             write_byte: None,
+            resume_session: None,
             _token: tls,
         })
     }
@@ -86,6 +92,26 @@ where
     /// NOTE: This function should be called only after a `connect()` call.
     pub fn tls_verification_details(&self) -> u32 {
         unsafe { mbedtls_ssl_get_verify_result(&*self.state.ssl_context) }
+    }
+
+    /// Store serialized client-session data to be offered for resumption on the next handshake.
+    pub fn set_serialized_session(
+        &mut self,
+        session: &SerializedClientSession,
+    ) -> Result<(), SessionError> {
+        validate_serialized_client_session(session.as_bytes())?;
+        self.resume_session = Some(session.clone());
+        Ok(())
+    }
+
+    /// Clear any pending serialized client-session data.
+    pub fn clear_serialized_session(&mut self) {
+        self.resume_session = None;
+    }
+
+    /// Export the current negotiated client session so it can be reused later.
+    pub fn export_serialized_session(&self) -> Result<SerializedClientSession, SessionError> {
+        export_serialized_client_session(&self.state.ssl_context)
     }
 
     /// Get a mutable reference to the underlying stream
@@ -455,6 +481,8 @@ struct MBio<'a, T> {
     read_byte: &'a mut Option<u8>,
     /// A state necessary so as to implement `MBio::wait_writable`
     write_byte: &'a mut Option<u8>,
+    /// Optional serialized session data to offer for resumption after reset
+    resume_session: Option<&'a SerializedClientSession>,
 }
 
 impl<'a, T> MBio<'a, &'a mut T>
@@ -468,6 +496,7 @@ where
             &mut session.eof,
             &mut session.read_byte,
             &mut session.write_byte,
+            session.resume_session.as_ref(),
         )
     }
 }
@@ -483,6 +512,7 @@ where
             session.eof,
             session.read_byte,
             &mut session.write_byte,
+            None,
         )
     }
 }
@@ -498,6 +528,7 @@ where
             &mut session.eof,
             &mut session.read_byte,
             session.write_byte,
+            None,
         )
     }
 }
@@ -512,6 +543,7 @@ where
         eof: &'a mut bool,
         read_byte: &'a mut Option<u8>,
         write_byte: &'a mut Option<u8>,
+        resume_session: Option<&'a SerializedClientSession>,
     ) -> Self {
         Self {
             stream,
@@ -519,6 +551,7 @@ where
             eof,
             read_byte,
             write_byte,
+            resume_session,
         }
     }
 
@@ -527,6 +560,12 @@ where
         debug!("Establishing SSL connection");
 
         merr!(unsafe { mbedtls_ssl_session_reset(self.ssl_context as *const _ as *mut _) })?;
+        if let Some(session) = self.resume_session {
+            let _ = apply_serialized_client_session(
+                self.ssl_context as *const _ as *mut mbedtls_ssl_context,
+                session.as_bytes(),
+            );
+        }
 
         loop {
             match self

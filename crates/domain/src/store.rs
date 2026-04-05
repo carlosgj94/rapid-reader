@@ -27,10 +27,17 @@ pub enum DispatchError {
 
 pub type DispatchResult = Result<Effect, DispatchError>;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PendingPrepare {
+    request: PrepareContentRequest,
+    previous_state: PackageState,
+}
+
 #[derive(Debug)]
 pub struct Store {
     pub device: DeviceState,
     content: Option<Box<ContentState>>,
+    pending_prepare: Option<PendingPrepare>,
     pub input: InputState,
     pub network: NetworkState,
     pub power: PowerStatus,
@@ -67,6 +74,7 @@ impl Store {
         Self {
             device: snapshot.device,
             content: snapshot.content,
+            pending_prepare: None,
             input: InputState::new(),
             network: snapshot.network,
             power: PowerStatus::new(82),
@@ -103,11 +111,27 @@ impl Store {
             }
             Event::NetworkStatusChanged(status) => {
                 self.network.status = status;
+                if let Some(request) = self.take_pending_prepare_if_dispatchable() {
+                    return Ok(Effect::PrepareContent(request));
+                }
             }
             Event::BackendSyncStatusChanged(status) => {
                 self.backend_sync.set_status(status);
+                if matches!(status, SyncStatus::AuthFailed | SyncStatus::Disabled) {
+                    self.restore_pending_prepare();
+                } else if let Some(request) = self.take_pending_prepare_if_dispatchable() {
+                    return Ok(Effect::PrepareContent(request));
+                }
             }
-            Event::CollectionContentUpdated(kind, collection) => {
+            Event::CollectionContentUpdated(kind, mut collection) => {
+                if let Some(pending) = self.pending_prepare
+                    && pending.request.collection == kind
+                {
+                    let _ = collection.update_package_state(
+                        &pending.request.remote_item_id,
+                        PackageState::Fetching,
+                    );
+                }
                 if self.content.is_some() || !collection.is_empty() {
                     self.content_mut().update_boxed_collection(kind, collection);
                 }
@@ -144,6 +168,14 @@ impl Store {
                     &remote_item_id,
                     package_state,
                 );
+                if package_state != PackageState::Fetching
+                    && self.pending_prepare.is_some_and(|pending| {
+                        pending.request.collection == collection
+                            && pending.request.remote_item_id == remote_item_id
+                    })
+                {
+                    self.pending_prepare = None;
+                }
             }
             Event::UiTick(tick_ms) => {
                 if matches!(self.ui.route, UiRoute::Dashboard | UiRoute::Collection(_)) {
@@ -190,6 +222,11 @@ impl Store {
         paragraphs: Box<[crate::reader::ReaderParagraphInfo]>,
         window: Box<crate::reader::ReaderWindow>,
     ) {
+        if self.pending_prepare.is_some_and(|pending| {
+            pending.request.collection == collection && pending.request.content_id == content_id
+        }) {
+            self.pending_prepare = None;
+        }
         self.reader.open_cached_reader_content(
             collection,
             crate::content::ArticleId(0),
@@ -280,23 +317,17 @@ impl Store {
                     );
                 }
 
+                if self.pending_prepare.is_some() {
+                    return self.collection_confirm_ignored(
+                        kind,
+                        CollectionConfirmIgnoredReason::AlreadyFetching,
+                    );
+                }
+
                 if !self.storage.sd_card_ready {
                     return self.collection_confirm_ignored(
                         kind,
                         CollectionConfirmIgnoredReason::StorageUnavailable,
-                    );
-                }
-
-                if !matches!(self.backend_sync.status, SyncStatus::Ready) {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::BackendUnavailable,
-                    );
-                }
-                if self.network.status != NetworkStatus::Online {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::BackendUnavailable,
                     );
                 }
 
@@ -313,7 +344,28 @@ impl Store {
                     &request.remote_item_id,
                     PackageState::Fetching,
                 );
-                return Effect::PrepareContent(request);
+                if self.can_dispatch_prepare_now() {
+                    return Effect::PrepareContent(request);
+                }
+                if matches!(
+                    self.backend_sync.status,
+                    SyncStatus::AuthFailed | SyncStatus::Disabled
+                ) {
+                    let _ = self.content_mut().update_package_state(
+                        kind,
+                        &request.remote_item_id,
+                        item.package_state,
+                    );
+                    return self.collection_confirm_ignored(
+                        kind,
+                        CollectionConfirmIgnoredReason::BackendUnavailable,
+                    );
+                }
+                self.pending_prepare = Some(PendingPrepare {
+                    request,
+                    previous_state: item.package_state,
+                });
+                return Effect::Noop;
             }
             UiCommand::Back => {
                 self.ui.route = UiRoute::Dashboard;
@@ -335,6 +387,28 @@ impl Store {
         reason: CollectionConfirmIgnoredReason,
     ) -> Effect {
         Effect::CollectionConfirmIgnored { collection, reason }
+    }
+
+    fn can_dispatch_prepare_now(&self) -> bool {
+        matches!(self.backend_sync.status, SyncStatus::Ready)
+            && self.network.status == NetworkStatus::Online
+    }
+
+    fn take_pending_prepare_if_dispatchable(&mut self) -> Option<PrepareContentRequest> {
+        if self.can_dispatch_prepare_now() {
+            return self.pending_prepare.take().map(|pending| pending.request);
+        }
+        None
+    }
+
+    fn restore_pending_prepare(&mut self) {
+        if let Some(pending) = self.pending_prepare.take() {
+            let _ = self.content_mut().update_package_state(
+                pending.request.collection,
+                &pending.request.remote_item_id,
+                pending.previous_state,
+            );
+        }
     }
 
     fn dispatch_reader(&mut self, command: UiCommand) -> Effect {
@@ -722,24 +796,40 @@ mod tests {
     }
 
     #[test]
-    fn saved_confirm_ignores_when_backend_not_ready() {
+    fn saved_confirm_queues_when_backend_not_ready() {
         let mut store = Store::new();
         store.ui.route = UiRoute::Collection(CollectionKind::Saved);
         store.storage = make_storage_with_sd();
+        store
+            .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+            .unwrap();
         let mut manifest = CollectionManifestState::empty();
-        let _ = manifest.try_push(make_ready_saved_item(PackageState::Missing));
+        let item = make_ready_saved_item(PackageState::Missing);
+        let _ = manifest.try_push(item);
         store
             .content_mut()
             .update_collection(CollectionKind::Saved, manifest);
 
         let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
+        assert_eq!(effect, Effect::Noop);
         assert_eq!(
-            effect,
-            Effect::CollectionConfirmIgnored {
-                collection: CollectionKind::Saved,
-                reason: CollectionConfirmIgnoredReason::BackendUnavailable,
-            }
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .item_at(0)
+                .unwrap()
+                .package_state,
+            PackageState::Fetching
+        );
+        assert_eq!(
+            store
+                .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
+                .unwrap(),
+            Effect::PrepareContent(PrepareContentRequest::from_manifest(
+                CollectionKind::Saved,
+                item,
+            ))
         );
     }
 
@@ -778,6 +868,71 @@ mod tests {
                 .unwrap()
                 .package_state,
             PackageState::Fetching
+        );
+    }
+
+    #[test]
+    fn saved_confirm_queues_until_network_recovers() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        store.storage = make_storage_with_sd();
+        store
+            .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
+            .unwrap();
+        let mut manifest = CollectionManifestState::empty();
+        let item = make_ready_saved_item(PackageState::Missing);
+        let _ = manifest.try_push(item);
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(
+            store
+                .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+                .unwrap(),
+            Effect::PrepareContent(PrepareContentRequest::from_manifest(
+                CollectionKind::Saved,
+                item,
+            ))
+        );
+    }
+
+    #[test]
+    fn auth_failed_restores_queued_prepare_state() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        store.storage = make_storage_with_sd();
+        store
+            .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+            .unwrap();
+        let mut manifest = CollectionManifestState::empty();
+        let item = make_ready_saved_item(PackageState::Missing);
+        let _ = manifest.try_push(item);
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
+
+        assert_eq!(
+            store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap(),
+            Effect::Noop
+        );
+        assert_eq!(
+            store
+                .handle_event(Event::BackendSyncStatusChanged(SyncStatus::AuthFailed), 0)
+                .unwrap(),
+            Effect::Noop
+        );
+        assert_eq!(
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .item_at(0)
+                .unwrap()
+                .package_state,
+            PackageState::Missing
         );
     }
 
