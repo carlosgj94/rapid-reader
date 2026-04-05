@@ -1,3 +1,6 @@
+extern crate alloc;
+
+use alloc::boxed::Box;
 use allocator_api2::{
     alloc::AllocError, boxed::Box as AllocBox, collections::TryReserveError, vec::Vec as AllocVec,
 };
@@ -126,6 +129,31 @@ pub fn try_external_pinned_box<T>(value: T) -> Result<PinnedExternalBox<T>, Allo
 
 pub fn try_internal_pinned_box<T>(value: T) -> Result<PinnedInternalBox<T>, AllocError> {
     Ok(AllocBox::into_pin(try_internal_box(value)?))
+}
+
+pub fn external_or_global_box<T>(value: T) -> Box<T> {
+    match AllocBox::<T, _>::try_new_uninit_in(esp_alloc::ExternalMemory) {
+        Ok(mut boxed) => {
+            unsafe {
+                boxed.as_mut_ptr().write(value);
+            }
+            let raw = AllocBox::into_raw(boxed).cast::<T>();
+            // SAFETY: `raw` came from `esp_alloc::HEAP`; global deallocation uses the same heap.
+            unsafe { Box::from_raw(raw) }
+        }
+        Err(_) => Box::new(value),
+    }
+}
+
+pub fn external_or_global_boxed_slice<T>(slice: alloc::vec::Vec<T>) -> Box<[T]> {
+    let mut external = match try_external_vec_with_capacity(slice.len()) {
+        Ok(vec) => vec,
+        Err(_) => return slice.into_boxed_slice(),
+    };
+    external.extend(slice);
+    let raw = AllocBox::into_raw(external.into_boxed_slice());
+    // SAFETY: `raw` came from `esp_alloc::HEAP`; global deallocation uses the same heap.
+    unsafe { Box::from_raw(raw) }
 }
 
 pub fn try_external_zeroed_array_box<const N: usize>() -> Result<ExternalBox<[u8; N]>, AllocError> {

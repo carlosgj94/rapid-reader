@@ -54,11 +54,11 @@ const MAX_PACKAGE_META_LEN: usize = 128;
 const READER_PACKAGE_HEADER_LEN: usize = 32;
 const READER_PACKAGE_PARAGRAPH_ENTRY_LEN: usize = 72;
 const READER_PACKAGE_UNIT_ENTRY_LEN: usize = 40;
-const PACKAGE_COPY_BUFFER_LEN: usize = 4 * 1024;
+const PACKAGE_COPY_BUFFER_LEN: usize = 8 * 1024;
 // Keep this aligned with the backend download chunk. The payload itself is now
 // boxed so we can raise the transfer size without exploding the storage
 // command queue's fixed internal residency.
-const STAGE_WRITE_CHUNK_LEN: usize = 4 * 1024;
+const STAGE_WRITE_CHUNK_LEN: usize = 8 * 1024;
 const STAGE_FLUSH_INTERVAL_BYTES: u32 = 16 * 1024;
 const STAGE_PROGRESS_LOG_INTERVAL_BYTES: u32 = 16 * 1024;
 const CACHE_ENTRY_CAPACITY: usize = 48;
@@ -448,7 +448,7 @@ enum StorageResponse {
     CommitAndOpenPackage(Result<Box<CommitAndOpenPackageResult>, StorageError>),
     OpenedPackage(Result<Box<OpenedReaderPackage>, StorageError>),
     Opened(Result<Box<OpenedReaderContent>, StorageError>),
-    LoadedWindow(Result<ReaderWindow, StorageError>),
+    LoadedWindow(Result<Box<ReaderWindow>, StorageError>),
     Unit(Result<(), StorageError>),
 }
 
@@ -1089,7 +1089,7 @@ pub async fn open_cached_reader_package_traced(
 pub async fn load_reader_window(
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     window_start_unit_index: u32,
-) -> Result<ReaderWindow, StorageError> {
+) -> Result<Box<ReaderWindow>, StorageError> {
     load_reader_window_traced(TraceContext::none(), content_id, window_start_unit_index).await
 }
 
@@ -1097,7 +1097,7 @@ pub async fn load_reader_window_traced(
     trace: TraceContext,
     content_id: InlineText<CONTENT_ID_MAX_BYTES>,
     window_start_unit_index: u32,
-) -> Result<ReaderWindow, StorageError> {
+) -> Result<Box<ReaderWindow>, StorageError> {
     if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
         return Err(StorageError::Unavailable);
     }
@@ -2078,7 +2078,7 @@ impl<'d> SdContentStorage<'d> {
             let header = read_reader_package_header(&mut file)?;
             let title = read_reader_package_title(&mut file, header)?;
             let paragraphs = read_reader_package_paragraphs(&mut file, header)?;
-            let window = Box::new(read_reader_package_window(&mut file, header, 0)?);
+            let window = read_reader_package_window(&mut file, header, 0)?;
             info!(
                 "content storage package open content_id={} slot={} size_bytes={} total_units={} paragraphs={} initial_window_start={} initial_window_units={}",
                 content_id.as_str(),
@@ -2108,7 +2108,7 @@ impl<'d> SdContentStorage<'d> {
             OpenedReaderPackage {
                 title,
                 total_units: header.unit_count,
-                paragraphs: paragraphs.into_boxed_slice(),
+                paragraphs,
                 window,
             }
         };
@@ -2126,7 +2126,7 @@ impl<'d> SdContentStorage<'d> {
         trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
         window_start_unit_index: u32,
-    ) -> Result<ReaderWindow, StorageError> {
+    ) -> Result<Box<ReaderWindow>, StorageError> {
         let entry = self
             .cache_index
             .find_by_content_id(&content_id)
@@ -3422,7 +3422,7 @@ fn decode_reader_package_paragraph_entry(
 fn read_reader_package_paragraphs(
     file: &mut SdFile<'_, '_>,
     header: ReaderPackageHeader,
-) -> Result<Vec<ReaderParagraphInfo>, StorageError> {
+) -> Result<Box<[ReaderParagraphInfo]>, StorageError> {
     file.seek_from_start(header.paragraph_table_offset)
         .map_err(map_sd_error)?;
     let mut paragraphs = Vec::with_capacity(header.paragraph_count as usize);
@@ -3441,7 +3441,9 @@ fn read_reader_package_paragraphs(
         paragraphs.push(paragraph);
         index += 1;
     }
-    Ok(paragraphs)
+    Ok(crate::memory_policy::external_or_global_boxed_slice(
+        paragraphs,
+    ))
 }
 
 fn font_from_byte(byte: u8) -> Result<StageFont, StorageError> {
@@ -3508,7 +3510,7 @@ fn read_reader_package_window(
     file: &mut SdFile<'_, '_>,
     header: ReaderPackageHeader,
     window_start_unit_index: u32,
-) -> Result<ReaderWindow, StorageError> {
+) -> Result<Box<ReaderWindow>, StorageError> {
     if window_start_unit_index >= header.unit_count {
         return Err(StorageError::CorruptData);
     }
@@ -3535,7 +3537,7 @@ fn read_reader_package_window(
     }
     window.start_unit_index = window_start_unit_index;
     window.unit_count = unit_count as u16;
-    Ok(window)
+    Ok(crate::memory_policy::external_or_global_box(window))
 }
 
 fn detail_locator_to_byte(locator: DetailLocator) -> u8 {

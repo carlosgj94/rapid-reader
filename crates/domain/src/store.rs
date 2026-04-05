@@ -240,7 +240,7 @@ impl Store {
         self.ui.route = UiRoute::Reader;
     }
 
-    pub fn load_reader_window(&mut self, window: crate::reader::ReaderWindow) {
+    pub fn load_reader_window(&mut self, window: Box<crate::reader::ReaderWindow>) {
         self.reader.apply_loaded_window(window);
     }
 

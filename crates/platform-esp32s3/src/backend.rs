@@ -84,10 +84,11 @@ const COLLECTION_FETCH_MAX_PAGES: usize = 32;
 const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
 const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
-// A 4 KiB staging chunk lets the backend coalesce several smaller socket reads
-// before each storage round-trip, which materially improves uncached package
-// download throughput while the payload scratch lives in PSRAM-backed buffers.
-const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 4 * 1024;
+// An 8 KiB staging chunk lets the backend stay further ahead of the SD writer
+// while the payload scratch lives in PSRAM-backed buffers. The TCP transport is
+// still 4 KiB, so this path can coalesce multiple socket reads into one staged
+// write without increasing internal SRAM pressure.
+const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 8 * 1024;
 // Package prefetch materially increases boot-time latency and was timing out on
 // real device/package responses. Keep startup focused on refresh + manifest sync.
 const STARTUP_SAVED_PREFETCH_ENABLED: bool = false;
@@ -96,8 +97,9 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const BACKEND_CA_CHAIN_PEM: &str =
     concat!(include_str!("../certs/letsencrypt_isrg_root_x1.pem"), "\0");
 const BACKEND_CMD_QUEUE_CAPACITY: usize = 4;
-// Keep the transport buffers aligned with the 4 KiB package chunk size so the
-// socket layer is not forced to drip-feed an otherwise larger streaming path.
+// Keep the transport buffers at 4 KiB for now. The package pipeline can
+// coalesce multiple socket reads into one 8 KiB staged write without pushing
+// more transport-state pressure into scarce internal SRAM.
 const BACKEND_TCP_RX_BUFFER_LEN: usize = 4 * 1024;
 const BACKEND_TCP_TX_BUFFER_LEN: usize = 4 * 1024;
 type BackendTcpClientState =

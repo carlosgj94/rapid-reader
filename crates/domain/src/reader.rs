@@ -202,7 +202,7 @@ impl ReaderSession {
         self.next_due_at_ms = None;
     }
 
-    pub fn apply_loaded_window(&mut self, window: ReaderWindow) {
+    pub fn apply_loaded_window(&mut self, window: Box<ReaderWindow>) {
         let pending_seek = self.pending_seek_unit_index;
         self.pending_window_start_unit_index = None;
 
@@ -634,11 +634,11 @@ impl ReaderSession {
         found.then_some(preview)
     }
 
-    fn write_window_slot(slot: &mut Option<Box<ReaderWindow>>, window: ReaderWindow) {
+    fn write_window_slot(slot: &mut Option<Box<ReaderWindow>>, window: Box<ReaderWindow>) {
         if let Some(existing) = slot.as_mut() {
-            **existing = window;
+            **existing = *window;
         } else {
-            *slot = Some(Box::new(window));
+            *slot = Some(window);
         }
     }
 }
@@ -852,7 +852,10 @@ mod tests {
         session.total_units = 300;
         let request = session.jump_live_next_paragraph().unwrap();
 
-        session.apply_loaded_window(make_test_window(request.window_start_unit_index, 128));
+        session.apply_loaded_window(Box::new(make_test_window(
+            request.window_start_unit_index,
+            128,
+        )));
 
         assert_eq!(session.progress.unit_index, 64);
         assert_eq!(session.progress.paragraph_index, 2);
