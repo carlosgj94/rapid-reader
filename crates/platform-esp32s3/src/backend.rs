@@ -60,6 +60,8 @@ pub(crate) const BACKEND_PORT: u16 = 443;
 const NETWORK_POLL_MS: u64 = 500;
 const RETRY_BACKOFF_MS: u64 = 10_000;
 const TRANSPORT_RETRY_ATTEMPTS: usize = 2;
+const PACKAGE_TRANSPORT_RETRY_ATTEMPTS: usize = 3;
+const PACKAGE_RETRY_RECOVERY_ATTEMPTS: usize = 2;
 const TRANSPORT_RETRY_BACKOFF_MS: u64 = 750;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
@@ -99,10 +101,11 @@ const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VE
 const BACKEND_CA_CHAIN_PEM: &str =
     concat!(include_str!("../certs/letsencrypt_isrg_root_x1.pem"), "\0");
 const BACKEND_CMD_QUEUE_CAPACITY: usize = 4;
-// Keep the transport buffers at 4 KiB for now. The package pipeline can
-// coalesce multiple socket reads into one 8 KiB staged write without pushing
-// more transport-state pressure into scarce internal SRAM.
-const BACKEND_TCP_RX_BUFFER_LEN: usize = 4 * 1024;
+// Large article fetches are now dominated by body transfer rather than SD or
+// commit/open overhead. Widen only the receive side so the TCP window can hold
+// more inbound package data without paying for a larger transmit buffer we do
+// not meaningfully use on tiny GET/refresh requests.
+const BACKEND_TCP_RX_BUFFER_LEN: usize = 16 * 1024;
 const BACKEND_TCP_TX_BUFFER_LEN: usize = 4 * 1024;
 type BackendTcpClientState =
     TcpClientState<1, BACKEND_TCP_RX_BUFFER_LEN, BACKEND_TCP_TX_BUFFER_LEN>;
@@ -1104,6 +1107,23 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
             {
                 attempt += 1;
                 info!("backend startup retry attempt={} err={:?}", attempt, err);
+                // Startup sync normally suspends the background probe task to
+                // keep the shared socket set focused on refresh + manifest
+                // fetches. If the first attempt invalidates backend-path
+                // readiness, briefly re-enable probing so the retry waits for a
+                // fresh, real connectivity check instead of blindly burning its
+                // final attempt on a still-bad path.
+                crate::internet::set_probe_suspended(false);
+                let recovery = wait_for_backend_request_path_ready(
+                    stack,
+                    TraceContext { sync_id, req_id: 0 },
+                    REFRESH_PATH,
+                    false,
+                    "startup_retry_reprobe",
+                )
+                .await;
+                crate::internet::set_probe_suspended(true);
+                recovery.map_err(RefreshError::Other)?;
                 Timer::after(Duration::from_millis(TRANSPORT_RETRY_BACKOFF_MS)).await;
             }
             other => return other,
@@ -1137,6 +1157,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
         .await
         .map_err(|_| {
+            crate::internet::invalidate_backend_path("dns_failed");
             info!("backend request dns failed path={}", REFRESH_PATH);
             log_request_heap(REFRESH_PATH, "dns failed");
             RefreshError::Other(BackendError::Dns)
@@ -1145,6 +1166,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     let remote = match remote {
         IpAddr::V4(addr) => addr,
         IpAddr::V6(_) => {
+            crate::internet::invalidate_backend_path("dns_invalid_family");
             info!("backend request dns returned ipv6 path={}", REFRESH_PATH);
             log_request_heap(REFRESH_PATH, "dns ipv6");
             return Err(RefreshError::Other(BackendError::Dns));
@@ -1164,11 +1186,13 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     )
     .await
     .map_err(|_| {
+        crate::internet::invalidate_backend_path("connect_timeout");
         info!("backend request connect timed out path={}", REFRESH_PATH);
         log_request_heap(REFRESH_PATH, "connect timeout");
         RefreshError::Other(BackendError::Connect)
     })?
     .map_err(|_| {
+        crate::internet::invalidate_backend_path("connect_failed");
         info!("backend request connect failed path={}", REFRESH_PATH);
         log_request_heap(REFRESH_PATH, "connect failed");
         RefreshError::Other(BackendError::Connect)
@@ -1221,6 +1245,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     );
     if let Err(err) = await_tls_handshake(&mut session, REFRESH_PATH).await {
         discard_failed_tls_session_resume(tls_session_cache, REFRESH_PATH, false, &refresh_metrics);
+        crate::internet::invalidate_backend_path(backend_error_label(err));
         return Err(RefreshError::Other(err));
     }
     refresh_metrics.tls_ms = elapsed_since_ms(tls_started_ms);
@@ -3532,6 +3557,7 @@ async fn fetch_and_stage_package<'a>(
 ) -> Result<content_storage::CommitAndOpenPackageResult, PackagePrepareError> {
     let path = build_package_path(request).map_err(PackagePrepareError::Other)?;
     let mut attempt = 0usize;
+    let mut recovery_wait_failures = 0usize;
 
     loop {
         let request_trace = next_request_trace(sync_id);
@@ -3548,11 +3574,12 @@ async fn fetch_and_stage_package<'a>(
         )
         .await
         {
-            if attempt + 1 < TRANSPORT_RETRY_ATTEMPTS {
-                attempt += 1;
+            if attempt > 0 && recovery_wait_failures + 1 < PACKAGE_RETRY_RECOVERY_ATTEMPTS {
+                recovery_wait_failures += 1;
                 info!(
-                    "backend package retry content_id={} attempt={} err={:?}",
+                    "backend package retry recovery content_id={} wait_attempt={} transport_attempt={} err={:?}",
                     request.content_id.as_str(),
+                    recovery_wait_failures,
                     attempt,
                     err
                 );
@@ -3561,6 +3588,7 @@ async fn fetch_and_stage_package<'a>(
             }
             return Err(PackagePrepareError::Other(err));
         }
+        recovery_wait_failures = 0;
 
         info!(
             "backend package fetch begin content_id={} remote_item_id={} revision={} collection={:?} path={} outer_attempt={}/{}",
@@ -3570,7 +3598,7 @@ async fn fetch_and_stage_package<'a>(
             request.collection,
             path.as_str(),
             attempt + 1,
-            TRANSPORT_RETRY_ATTEMPTS,
+            PACKAGE_TRANSPORT_RETRY_ATTEMPTS,
         );
         content_storage::begin_package_stage_traced(
             request_trace,
@@ -3601,7 +3629,8 @@ async fn fetch_and_stage_package<'a>(
         {
             Ok(status) => status,
             Err(err)
-                if is_transient_transport_error(err) && attempt + 1 < TRANSPORT_RETRY_ATTEMPTS =>
+                if is_transient_transport_error(err)
+                    && attempt + 1 < PACKAGE_TRANSPORT_RETRY_ATTEMPTS =>
             {
                 let _ = content_storage::abort_package_stage_traced(request_trace).await;
                 close_reusable_session(reusable_session, "package retry").await;

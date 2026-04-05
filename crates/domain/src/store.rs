@@ -135,10 +135,14 @@ impl Store {
                 if self.content.is_some() || !collection.is_empty() {
                     self.content_mut().update_boxed_collection(kind, collection);
                 }
-                match kind {
-                    CollectionKind::Saved => self.ui.saved_index = 0,
-                    CollectionKind::Inbox => self.ui.inbox_index = 0,
-                    CollectionKind::Recommendations => self.ui.recommendations_index = 0,
+                if let Some(pending) = self.pending_prepare
+                    && pending.request.collection == kind
+                    && let Some(index) =
+                        self.collection_index_for_remote_item(kind, &pending.request.remote_item_id)
+                {
+                    self.set_collection_index(kind, index);
+                } else {
+                    self.set_collection_index(kind, 0);
                 }
             }
             Event::ReaderContentOpened {
@@ -408,6 +412,30 @@ impl Store {
                 &pending.request.remote_item_id,
                 pending.previous_state,
             );
+        }
+    }
+
+    fn collection_index_for_remote_item(
+        &self,
+        kind: CollectionKind,
+        remote_item_id: &crate::text::InlineText<{ crate::content::REMOTE_ITEM_ID_MAX_BYTES }>,
+    ) -> Option<usize> {
+        let collection = self.content().collection_state(kind);
+        let mut index = 0usize;
+        while index < collection.len() {
+            if collection.items[index].remote_item_id == *remote_item_id {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn set_collection_index(&mut self, kind: CollectionKind, index: usize) {
+        match kind {
+            CollectionKind::Saved => self.ui.saved_index = index,
+            CollectionKind::Inbox => self.ui.inbox_index = index,
+            CollectionKind::Recommendations => self.ui.recommendations_index = index,
         }
     }
 
@@ -897,6 +925,66 @@ mod tests {
                 CollectionKind::Saved,
                 item,
             ))
+        );
+    }
+
+    #[test]
+    fn collection_update_keeps_pending_prepare_item_selected() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        store.storage = make_storage_with_sd();
+        store
+            .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
+            .unwrap();
+
+        let mut initial_manifest = CollectionManifestState::empty();
+        let first = make_ready_saved_item(PackageState::Cached);
+        let mut pending_item = make_ready_saved_item(PackageState::Missing);
+        pending_item.remote_item_id.set_truncated("pending-item");
+        let third = make_ready_saved_item(PackageState::Cached);
+        let _ = initial_manifest.try_push(first);
+        let _ = initial_manifest.try_push(pending_item);
+        let _ = initial_manifest.try_push(third);
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, initial_manifest);
+        store.ui.saved_index = 1;
+
+        assert_eq!(
+            store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap(),
+            Effect::Noop
+        );
+
+        let mut refreshed_manifest = CollectionManifestState::empty();
+        let refreshed_first = make_ready_saved_item(PackageState::Cached);
+        let refreshed_second = make_ready_saved_item(PackageState::Cached);
+        let mut refreshed_pending = pending_item;
+        refreshed_pending.package_state = PackageState::Missing;
+        let _ = refreshed_manifest.try_push(refreshed_first);
+        let _ = refreshed_manifest.try_push(refreshed_second);
+        let _ = refreshed_manifest.try_push(refreshed_pending);
+
+        assert_eq!(
+            store
+                .handle_event(
+                    Event::CollectionContentUpdated(
+                        CollectionKind::Saved,
+                        Box::new(refreshed_manifest),
+                    ),
+                    0,
+                )
+                .unwrap(),
+            Effect::Noop
+        );
+        assert_eq!(store.ui.saved_index, 2);
+        assert_eq!(
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .item_at(2)
+                .unwrap()
+                .package_state,
+            PackageState::Fetching
         );
     }
 

@@ -769,11 +769,20 @@ fn current_prepared_screen(
 }
 
 fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
-    prepared_screen_drives_reader_ticks(screen)
+    prepared_screen_drives_reader_ticks(screen) || prepared_screen_shows_collection_fetch(screen)
 }
 
 fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
     matches!(screen, PreparedScreen::Reader(shell) if shell.pause_modal.is_none())
+}
+
+fn prepared_screen_shows_collection_fetch(screen: &PreparedScreen) -> bool {
+    match screen {
+        PreparedScreen::Collection(shell) => {
+            shell.rows.iter().any(|row| row.loading_phase.is_some())
+        }
+        _ => false,
+    }
 }
 
 fn prepared_screen_drives_ui_ticks(screen: &PreparedScreen) -> bool {
@@ -1124,6 +1133,84 @@ mod tests {
                     },
                 ],
             }),
+        });
+
+        assert!(!prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn collection_with_fetching_row_suppresses_sleep() {
+        let screen = PreparedScreen::Collection(app_runtime::components::ContentListShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            status: app_runtime::components::StatusCluster {
+                battery_percent: 82,
+                wifi_online: true,
+            },
+            rail: app_runtime::components::VerticalRail { text: "SAVED" },
+            large_rail: true,
+            rows: [
+                app_runtime::components::ContentRow {
+                    meta: "SOURCE",
+                    title: "Previous",
+                    loading_phase: None,
+                    selected: false,
+                },
+                app_runtime::components::ContentRow {
+                    meta: "SOURCE",
+                    title: "Fetching",
+                    loading_phase: Some(2),
+                    selected: true,
+                },
+                app_runtime::components::ContentRow {
+                    meta: "SOURCE",
+                    title: "Next",
+                    loading_phase: None,
+                    selected: false,
+                },
+            ],
+            band: app_runtime::components::SelectionBand { y: 106, height: 68 },
+            help: app_runtime::components::HelpHint {
+                text: "long press_",
+            },
+        });
+
+        assert!(prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn collection_without_fetching_row_does_not_suppress_sleep() {
+        let screen = PreparedScreen::Collection(app_runtime::components::ContentListShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            status: app_runtime::components::StatusCluster {
+                battery_percent: 82,
+                wifi_online: true,
+            },
+            rail: app_runtime::components::VerticalRail { text: "SAVED" },
+            large_rail: true,
+            rows: [
+                app_runtime::components::ContentRow {
+                    meta: "SOURCE",
+                    title: "Previous",
+                    loading_phase: None,
+                    selected: false,
+                },
+                app_runtime::components::ContentRow {
+                    meta: "SOURCE",
+                    title: "Current",
+                    loading_phase: None,
+                    selected: true,
+                },
+                app_runtime::components::ContentRow {
+                    meta: "SOURCE",
+                    title: "Next",
+                    loading_phase: None,
+                    selected: false,
+                },
+            ],
+            band: app_runtime::components::SelectionBand { y: 106, height: 68 },
+            help: app_runtime::components::HelpHint {
+                text: "long press_",
+            },
         });
 
         assert!(!prepared_screen_suppresses_sleep(&screen));
