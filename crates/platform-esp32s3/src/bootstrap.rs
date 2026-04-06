@@ -410,6 +410,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         sd_spi_clock.run_hz,
         sd_spi_clock.source,
     );
+    crate::transfer_tuning::log_runtime_config();
     crate::memtrace!(
         "boot_state",
         "component" = "bootstrap",

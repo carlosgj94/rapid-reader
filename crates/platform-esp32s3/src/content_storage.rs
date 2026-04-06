@@ -55,11 +55,9 @@ const READER_PACKAGE_HEADER_LEN: usize = 32;
 const READER_PACKAGE_PARAGRAPH_ENTRY_LEN: usize = 72;
 const READER_PACKAGE_UNIT_ENTRY_LEN: usize = 40;
 const PACKAGE_COPY_BUFFER_LEN: usize = 8 * 1024;
-// Keep this aligned with the backend download chunk. The payload itself is now
-// boxed so we can raise the transfer size without exploding the storage
-// command queue's fixed internal residency.
-const STAGE_WRITE_CHUNK_LEN: usize = 8 * 1024;
-const STAGE_FLUSH_INTERVAL_BYTES: u32 = 16 * 1024;
+const STAGE_WRITE_CHUNK_LEN: usize = crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN;
+const STAGE_FLUSH_INTERVAL_BYTES: u32 =
+    crate::transfer_tuning::PACKAGE_TRANSFER_FLUSH_INTERVAL_BYTES;
 const STAGE_PROGRESS_LOG_INTERVAL_BYTES: u32 = 16 * 1024;
 const CACHE_ENTRY_CAPACITY: usize = 48;
 const CACHE_SIZE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
@@ -499,6 +497,7 @@ pub(crate) fn log_static_inventory(
         "storage_queue_capacity" = STORAGE_CMD_QUEUE_CAPACITY,
         "storage_queue_resident_bytes" = STORAGE_CMD_QUEUE_CAPACITY * size_of::<StorageCommand>(),
         "stage_write_chunk_len" = STAGE_WRITE_CHUNK_LEN,
+        "stage_write_chunk_source" = crate::transfer_tuning::PACKAGE_TRANSFER_SOURCE,
         "stage_flush_interval_bytes" = STAGE_FLUSH_INTERVAL_BYTES,
         "package_copy_buffer_len" = PACKAGE_COPY_BUFFER_LEN,
         "package_read_buffer_len" = PACKAGE_READ_BUFFER_LEN,
@@ -690,15 +689,24 @@ pub fn mount<'d>(
     {
         Ok(()) => {
             info!(
-                "content storage sd spi run hz={} source={}",
-                run_spi_hz, run_spi_source
+                "content storage sd spi run hz={} source={} transfer_chunk_len={} transfer_flush_interval_bytes={} transfer_source={}",
+                run_spi_hz,
+                run_spi_source,
+                crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN,
+                crate::transfer_tuning::PACKAGE_TRANSFER_FLUSH_INTERVAL_BYTES,
+                crate::transfer_tuning::PACKAGE_TRANSFER_SOURCE,
             );
             true
         }
         Err(err) => {
             info!(
-                "content storage sd spi speed switch failed hz={} source={} err={:?}",
-                run_spi_hz, run_spi_source, err
+                "content storage sd spi speed switch failed hz={} source={} transfer_chunk_len={} transfer_flush_interval_bytes={} transfer_source={} err={:?}",
+                run_spi_hz,
+                run_spi_source,
+                crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN,
+                crate::transfer_tuning::PACKAGE_TRANSFER_FLUSH_INTERVAL_BYTES,
+                crate::transfer_tuning::PACKAGE_TRANSFER_SOURCE,
+                err
             );
             false
         }

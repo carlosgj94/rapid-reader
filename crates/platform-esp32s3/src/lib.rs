@@ -14,3 +14,4 @@ pub mod services;
 pub mod sleep;
 pub mod storage;
 pub mod telemetry;
+pub mod transfer_tuning;

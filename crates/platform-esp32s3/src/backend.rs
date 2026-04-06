@@ -35,6 +35,7 @@ use crate::{
     content_storage,
     storage::{BACKEND_REFRESH_TOKEN_MAX_LEN, BackendCredential},
     telemetry::{TraceContext, bool_flag, collection_label, next_request_id, next_sync_id},
+    transfer_tuning,
 };
 use domain::{
     content::{
@@ -93,11 +94,7 @@ const COLLECTION_FETCH_MAX_PAGES: usize = 32;
 const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
 const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
-// An 8 KiB staging chunk lets the backend stay further ahead of the SD writer
-// while the payload scratch lives in PSRAM-backed buffers. The TCP transport is
-// still 4 KiB, so this path can coalesce multiple socket reads into one staged
-// write without increasing internal SRAM pressure.
-const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = 8 * 1024;
+const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN;
 // Package prefetch materially increases boot-time latency and was timing out on
 // real device/package responses. Keep startup focused on refresh + manifest sync.
 const STARTUP_SAVED_PREFETCH_ENABLED: bool = false;
@@ -598,6 +595,7 @@ pub(crate) fn log_static_inventory() {
         "http_stream_header_max_len" = HTTP_STREAM_HEADER_MAX_LEN,
         "http_stream_header_storage" = "external_preferred_box",
         "package_download_chunk_len" = PACKAGE_DOWNLOAD_CHUNK_LEN,
+        "package_download_chunk_source" = transfer_tuning::PACKAGE_TRANSFER_SOURCE,
         "package_download_chunk_storage" = "external_preferred_box",
         "collection_page_limit" = COLLECTION_PAGE_LIMIT,
         "collection_cursor_max_len" = COLLECTION_CURSOR_MAX_LEN,

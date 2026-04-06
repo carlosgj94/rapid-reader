@@ -216,3 +216,44 @@ finished hardware setting, and any move above `8 MHz` must be evidence-driven.
   regressions
 - SD runtime configuration is documented as a deliberate choice rather than a
   lucky value
+
+## Follow-up Experiment: Package Transfer Chunk Tuning
+
+### Why
+
+Longer soak runs are now mostly reliable, but uncached article opens are still
+slower than they should be. The current package path is stable enough that it
+is reasonable to try a more aggressive transfer profile.
+
+### Scope
+
+- keep backend package download chunking and storage stage chunking aligned
+- widen the chunk size materially beyond the original `8 KiB` baseline
+- widen stage flush cadence with the chunk so storage does fewer forced flushes
+- make the effective transfer profile explicit in boot and static-inventory
+  logs
+- keep an easy build-time override for A/B runs at even larger chunk sizes
+
+### Current Progress
+
+- Code landed: backend package streaming and storage staging now read their
+  chunk size from one shared transfer-tuning policy instead of separate raw
+  constants.
+- The current product-default transfer profile is `65536` byte chunks with a
+  derived `131072` byte stage flush interval. The initial `32768` byte pass was
+  retained only long enough to compare against the `65536` byte override.
+- A controlled build-time override path
+  (`MOTIF_PACKAGE_TRANSFER_CHUNK_LEN`) exists for deliberate higher-chunk A/B
+  runs without touching the code again.
+
+### Non-goals
+
+- no Wi-Fi retry redesign here
+- no TLS/session reuse redesign here
+- no storage format changes here
+
+### Done When
+
+- repeated article-download runs show a real end-to-end latency win
+- higher chunks do not introduce alloc or corruption regressions
+- the effective package transfer profile is obvious from the logs

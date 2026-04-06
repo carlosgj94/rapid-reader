@@ -23,6 +23,7 @@ The current firmware in `crates/platform-esp32s3/src/backend.rs` now implements:
 - refresh-session exchange against `/device/v1/auth/session/refresh`
 - paginated Saved collection refresh with bounded page size
 - streaming package fetch for uncached articles
+- shared package-transfer tuning for backend chunk size and storage staging
 - reusable access sessions plus serialized TLS session resumption
 - package retry and recovery logic that coordinates with backend-path readiness
 - direct handoff into storage staging/commit/open flows
@@ -55,10 +56,10 @@ That means backend sync is no longer dominated by the old SD/package pipeline.
 
 The main remaining failures are network-side, not storage-side:
 
-- DNS failure on device
-- occasional TLS handshake timeout
-- occasional request flush / body-read instability
-- Wi-Fi disconnects that force package-recovery paths
+- occasional startup Wi-Fi churn / disconnects
+- occasional stream interruption after a disconnect
+- package/session reuse paths that can still be slow without fully failing
+- incomplete on-device validation of backend request-side DNS fallback
 
 When these occur, backend sync can still fail an uncached article open even
 though the happy path is now fast.
@@ -85,8 +86,8 @@ That keeps persistence policy and recovery logic inside the storage boundary.
 The architecture still has important unfinished areas:
 
 - progress upload and remote reconciliation
-- explicit last-good-endpoint fallback when DNS fails
-- request-class specific timeout policy cleanly documented and tuned
+- stronger recovery after mid-stream disconnect/body-read failure
+- more evidence on higher-throughput package transfer tuning
 - compile-time TLS feature pruning
 - automated long-run soak infrastructure beyond the current manual reports
 
