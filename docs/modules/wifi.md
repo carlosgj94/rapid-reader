@@ -55,19 +55,17 @@ as equivalent to "safe to spend backend retries."
 
 ## Current Configuration Reality
 
-The current code still relies too much on driver defaults.
-
 Important current facts:
 
-- the platform constructs Wi-Fi with `esp_radio::wifi::new(..., Default::default())`
-- the effective modem power-save mode is currently `None`
-- that is true because the vendored `esp-radio` default resolves to
-  `PowerSaveMode::None`, not because Motif sets it explicitly
-- the same default config currently carries a default country code of `CN`
+- Motif now constructs Wi-Fi with an explicit driver config rather than passing
+  `Default::default()` through untouched
+- modem power-save mode is explicitly set to `None`
+- the country code is explicitly set to `ES`
 - client association still starts from `ClientConfig::default()`
 
-So power save is probably not the reason for the present instability, but the
-configuration is still too implicit for a production-quality networking stack.
+So power save is probably not the reason for the present instability, but there
+is still more driver-level policy and observability work to do before this
+looks like a production-quality networking stack.
 
 ## Known Gaps
 
@@ -75,9 +73,8 @@ Current reliability work is now concentrated here:
 
 - repeated on-device DNS failures
 - occasional Wi-Fi disconnect/reassociate churn
-- limited observability for disconnect reasons and effective driver settings
-- hidden dependency on library defaults for country code and other radio knobs
-- no last-good-endpoint fallback yet when DNS is temporarily unhealthy
+- driver-level policy is still incomplete beyond power-save and country code
+- last-good-endpoint fallback still needs field validation under real DNS wobble
 
 These are now higher priority than raw package-throughput tuning.
 

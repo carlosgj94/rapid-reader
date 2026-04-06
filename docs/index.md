@@ -55,6 +55,8 @@ The target product loop is:
 14. [Power Placeholder](modules/power.md)
 15. [Session Progress: RSVP, Theme, And Persistence](progress/2026-04-01-rsvp-session.md)
 16. [Session Progress: Network Reliability And Throughput](progress/2026-04-05-network-reliability-and-throughput.md)
+17. [Session Plan: Network And Storage Stability](progress/2026-04-06-network-and-storage-action-plan.md)
+18. [Network And Storage Tickets](progress/2026-04-06-network-and-storage-tickets.md)
 
 ## System At A Glance
 

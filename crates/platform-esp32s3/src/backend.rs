@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::net::IpAddr;
+use core::net::{IpAddr, Ipv4Addr};
 use core::{ffi::CStr, fmt::Write as _, future::Future, mem::size_of, net::SocketAddr, str};
 
 use embassy_executor::Spawner;
@@ -64,11 +64,15 @@ const PACKAGE_TRANSPORT_RETRY_ATTEMPTS: usize = 3;
 const PACKAGE_RETRY_RECOVERY_ATTEMPTS: usize = 2;
 const TRANSPORT_RETRY_BACKOFF_MS: u64 = 750;
 const CONNECT_TIMEOUT_SECS: u64 = 5;
-const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 8;
-const HTTP_BODY_TIMEOUT_SECS: u64 = 15;
-const HTTP_STREAM_BODY_TIMEOUT_SECS: u64 = 25;
-const REQUEST_NETWORK_READY_TIMEOUT_SECS: u64 = 6;
-const REQUEST_STREAMING_NETWORK_READY_TIMEOUT_SECS: u64 = 12;
+const AUTH_REFRESH_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 12;
+const AUTH_REFRESH_IO_TIMEOUT_SECS: u64 = 12;
+const AUTH_REFRESH_NETWORK_READY_TIMEOUT_SECS: u64 = 8;
+const BUFFERED_METADATA_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+const BUFFERED_METADATA_IO_TIMEOUT_SECS: u64 = 20;
+const BUFFERED_METADATA_NETWORK_READY_TIMEOUT_SECS: u64 = 6;
+const STREAMING_PACKAGE_TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 12;
+const STREAMING_PACKAGE_IO_TIMEOUT_SECS: u64 = 25;
+const STREAMING_PACKAGE_NETWORK_READY_TIMEOUT_SECS: u64 = 12;
 const PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS: u64 = 30;
 const REQUEST_NETWORK_READY_POLL_MS: u64 = 250;
 // Real device traces showed that an aggressive background `/device/v1/me`
@@ -380,6 +384,82 @@ struct ConnectedBackendSession<'a> {
     metrics: RequestMetrics,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RequestClass {
+    AuthRefresh,
+    BufferedMetadata,
+    StreamingPackage,
+}
+
+impl RequestClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AuthRefresh => "auth_refresh",
+            Self::BufferedMetadata => "buffered_metadata",
+            Self::StreamingPackage => "streaming_package",
+        }
+    }
+
+    const fn is_streaming(self) -> bool {
+        matches!(self, Self::StreamingPackage)
+    }
+
+    const fn connect_timeout_secs(self) -> u64 {
+        let _ = self;
+        CONNECT_TIMEOUT_SECS
+    }
+
+    const fn tls_handshake_timeout_secs(self) -> u64 {
+        match self {
+            Self::AuthRefresh => AUTH_REFRESH_TLS_HANDSHAKE_TIMEOUT_SECS,
+            Self::BufferedMetadata => BUFFERED_METADATA_TLS_HANDSHAKE_TIMEOUT_SECS,
+            Self::StreamingPackage => STREAMING_PACKAGE_TLS_HANDSHAKE_TIMEOUT_SECS,
+        }
+    }
+
+    const fn io_timeout_secs(self) -> u64 {
+        match self {
+            Self::AuthRefresh => AUTH_REFRESH_IO_TIMEOUT_SECS,
+            Self::BufferedMetadata => BUFFERED_METADATA_IO_TIMEOUT_SECS,
+            Self::StreamingPackage => STREAMING_PACKAGE_IO_TIMEOUT_SECS,
+        }
+    }
+
+    const fn socket_timeout_secs(self) -> u64 {
+        self.io_timeout_secs()
+    }
+
+    const fn network_ready_timeout_secs(self) -> u64 {
+        match self {
+            Self::AuthRefresh => AUTH_REFRESH_NETWORK_READY_TIMEOUT_SECS,
+            Self::BufferedMetadata => BUFFERED_METADATA_NETWORK_READY_TIMEOUT_SECS,
+            Self::StreamingPackage => STREAMING_PACKAGE_NETWORK_READY_TIMEOUT_SECS,
+        }
+    }
+
+    fn network_ready_max_timeout_secs(self, reason: &str) -> u64 {
+        if matches!(self, Self::StreamingPackage) && reason == "package_retry" {
+            PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS
+        } else {
+            self.network_ready_timeout_secs()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BackendEndpointSource {
+    Dns,
+    Cached,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ResolvedBackendRemote {
+    addr: Ipv4Addr,
+    source: BackendEndpointSource,
+    cache_age_ms: Option<u32>,
+    session_epoch: Option<u32>,
+}
+
 #[derive(Clone, Copy)]
 struct BackendRequestContext<'a> {
     stack: Stack<'static>,
@@ -404,6 +484,7 @@ struct HttpResponse<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct HttpRequest<'a> {
     trace: TraceContext,
+    class: RequestClass,
     method: &'a str,
     path: &'a str,
     content_type: Option<&'a str>,
@@ -430,6 +511,7 @@ struct StreamingHttpResponse {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct RequestMetrics {
     trace: TraceContext,
+    class: RequestClass,
     started_ms: u64,
     dns_ms: u64,
     connect_ms: u64,
@@ -451,9 +533,10 @@ struct RequestMetrics {
 }
 
 impl RequestMetrics {
-    fn new(trace: TraceContext, reused_session: bool, streaming: bool) -> Self {
+    fn new(trace: TraceContext, reused_session: bool, class: RequestClass) -> Self {
         Self {
             trace,
+            class,
             started_ms: now_ms(),
             dns_ms: 0,
             connect_ms: 0,
@@ -462,7 +545,7 @@ impl RequestMetrics {
             total_ms: 0,
             reused_session,
             tls_resume_offered: false,
-            streaming,
+            streaming: class.is_streaming(),
             header_bytes: 0,
             body_bytes: 0,
             response_bytes: 0,
@@ -522,6 +605,28 @@ pub(crate) fn log_static_inventory() {
         "stream_progress_log_interval_bytes" = STREAM_PROGRESS_LOG_INTERVAL_BYTES,
         "tcp_rx_buffer_bytes" = BACKEND_TCP_RX_BUFFER_LEN,
         "tcp_tx_buffer_bytes" = BACKEND_TCP_TX_BUFFER_LEN,
+        "auth_refresh_connect_timeout_secs" = RequestClass::AuthRefresh.connect_timeout_secs(),
+        "auth_refresh_tls_handshake_timeout_secs" =
+            RequestClass::AuthRefresh.tls_handshake_timeout_secs(),
+        "auth_refresh_io_timeout_secs" = RequestClass::AuthRefresh.io_timeout_secs(),
+        "auth_refresh_network_ready_timeout_secs" =
+            RequestClass::AuthRefresh.network_ready_timeout_secs(),
+        "buffered_metadata_connect_timeout_secs" =
+            RequestClass::BufferedMetadata.connect_timeout_secs(),
+        "buffered_metadata_tls_handshake_timeout_secs" =
+            RequestClass::BufferedMetadata.tls_handshake_timeout_secs(),
+        "buffered_metadata_io_timeout_secs" = RequestClass::BufferedMetadata.io_timeout_secs(),
+        "buffered_metadata_network_ready_timeout_secs" =
+            RequestClass::BufferedMetadata.network_ready_timeout_secs(),
+        "streaming_package_connect_timeout_secs" =
+            RequestClass::StreamingPackage.connect_timeout_secs(),
+        "streaming_package_tls_handshake_timeout_secs" =
+            RequestClass::StreamingPackage.tls_handshake_timeout_secs(),
+        "streaming_package_io_timeout_secs" = RequestClass::StreamingPackage.io_timeout_secs(),
+        "streaming_package_network_ready_timeout_secs" =
+            RequestClass::StreamingPackage.network_ready_timeout_secs(),
+        "streaming_package_network_ready_max_timeout_secs" =
+            PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS,
         "backend_cmd_queue_capacity" = BACKEND_CMD_QUEUE_CAPACITY,
     );
 }
@@ -667,7 +772,9 @@ async fn backend_task(
             info!("backend network ready ip={:?}", network.address);
             log_heap("backend network ready");
             let mut tcp_client = BackendTcpClient::new(stack, tcp_state.as_ref());
-            tcp_client.set_timeout(Some(Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS)));
+            tcp_client.set_timeout(Some(Duration::from_secs(
+                RequestClass::StreamingPackage.socket_timeout_secs(),
+            )));
 
             log_status(SyncStatus::RefreshingSession);
             crate::internet::set_probe_suspended(true);
@@ -903,6 +1010,7 @@ async fn perform_health_check(
             &mut tls_session_cache,
             HttpRequest {
                 trace: TraceContext::none(),
+                class: RequestClass::BufferedMetadata,
                 method: "GET",
                 path: HEALTH_PATH,
                 content_type: None,
@@ -975,6 +1083,7 @@ async fn perform_refresh(
         tls_session_cache,
         HttpRequest {
             trace: next_request_trace(sync_id),
+            class: RequestClass::AuthRefresh,
             method: "POST",
             path: REFRESH_PATH,
             content_type: Some("application/json"),
@@ -1024,6 +1133,7 @@ async fn perform_identity_check(
         tls_session_cache,
         HttpRequest {
             trace: next_request_trace(sync_id),
+            class: RequestClass::BufferedMetadata,
             method: "GET",
             path: ME_PATH,
             content_type: Some("application/json"),
@@ -1119,7 +1229,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
                     stack,
                     TraceContext { sync_id, req_id: 0 },
                     REFRESH_PATH,
-                    false,
+                    RequestClass::AuthRefresh,
                     "startup_retry_reprobe",
                 )
                 .await;
@@ -1150,40 +1260,37 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     );
 
     let refresh_trace = next_request_trace(sync_id);
-    let mut refresh_metrics = RequestMetrics::new(refresh_trace, false, false);
-    log_request_phase(refresh_trace, REFRESH_PATH, "open", false, 0);
-    let dns = DnsSocket::new(stack);
-    let dns_started_ms = now_ms();
-    let remote = dns
-        .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
-        .await
-        .map_err(|_| {
-            crate::internet::invalidate_backend_path("dns_failed");
-            info!("backend request dns failed path={}", REFRESH_PATH);
-            log_request_heap(REFRESH_PATH, "dns failed");
-            RefreshError::Other(BackendError::Dns)
-        })?;
-    refresh_metrics.dns_ms = elapsed_since_ms(dns_started_ms);
-    let remote = match remote {
-        IpAddr::V4(addr) => addr,
-        IpAddr::V6(_) => {
-            crate::internet::invalidate_backend_path("dns_invalid_family");
-            info!("backend request dns returned ipv6 path={}", REFRESH_PATH);
-            log_request_heap(REFRESH_PATH, "dns ipv6");
-            return Err(RefreshError::Other(BackendError::Dns));
-        }
-    };
+    let mut refresh_metrics = RequestMetrics::new(refresh_trace, false, RequestClass::AuthRefresh);
+    log_request_phase(
+        refresh_trace,
+        REFRESH_PATH,
+        RequestClass::AuthRefresh,
+        "open",
+        0,
+    );
+    let resolved_remote = resolve_backend_remote(
+        stack,
+        refresh_trace,
+        REFRESH_PATH,
+        RequestClass::AuthRefresh,
+        &mut refresh_metrics,
+    )
+    .await
+    .map_err(RefreshError::Other)?;
     let connect_started_ms = now_ms();
     log_request_phase(
         refresh_trace,
         REFRESH_PATH,
+        RequestClass::AuthRefresh,
         "dns_ok",
-        false,
         refresh_metrics.dns_ms,
     );
     let connection = with_timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        tcp_client.connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT)),
+        Duration::from_secs(RequestClass::AuthRefresh.connect_timeout_secs()),
+        tcp_client.connect(SocketAddr::new(
+            IpAddr::V4(resolved_remote.addr),
+            BACKEND_PORT,
+        )),
     )
     .await
     .map_err(|_| {
@@ -1198,20 +1305,31 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         log_request_heap(REFRESH_PATH, "connect failed");
         RefreshError::Other(BackendError::Connect)
     })?;
+    crate::internet::record_backend_endpoint(resolved_remote.addr, "request_connect_ok");
     refresh_metrics.connect_ms = elapsed_since_ms(connect_started_ms);
+    if matches!(resolved_remote.source, BackendEndpointSource::Cached) {
+        info!(
+            "backend request dns fallback succeeded path={} remote_ip={} cache_age_ms={} session_epoch={} connect_ms={}",
+            REFRESH_PATH,
+            resolved_remote.addr,
+            resolved_remote.cache_age_ms.unwrap_or_default(),
+            resolved_remote.session_epoch.unwrap_or_default(),
+            refresh_metrics.connect_ms
+        );
+    }
     log_request_phase(
         refresh_trace,
         REFRESH_PATH,
+        RequestClass::AuthRefresh,
         "connect_ok",
-        false,
         refresh_metrics.elapsed_ms(),
     );
     log_request_heap(REFRESH_PATH, "tls setup start");
     log_request_phase(
         refresh_trace,
         REFRESH_PATH,
+        RequestClass::AuthRefresh,
         "tls_setup_start",
-        false,
         refresh_metrics.elapsed_ms(),
     );
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
@@ -1231,8 +1349,8 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     log_request_phase(
         refresh_trace,
         REFRESH_PATH,
+        RequestClass::AuthRefresh,
         "tls_setup_ok",
-        false,
         refresh_metrics.elapsed_ms(),
     );
     let tls_started_ms = now_ms();
@@ -1240,11 +1358,13 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     log_request_phase(
         refresh_trace,
         REFRESH_PATH,
+        RequestClass::AuthRefresh,
         "tls_handshake_start",
-        false,
         refresh_metrics.elapsed_ms(),
     );
-    if let Err(err) = await_tls_handshake(&mut session, REFRESH_PATH).await {
+    if let Err(err) =
+        await_tls_handshake(&mut session, REFRESH_PATH, RequestClass::AuthRefresh).await
+    {
         discard_failed_tls_session_resume(tls_session_cache, REFRESH_PATH, false, &refresh_metrics);
         crate::internet::invalidate_backend_path(backend_error_label(err));
         return Err(RefreshError::Other(err));
@@ -1254,8 +1374,8 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     log_request_phase(
         refresh_trace,
         REFRESH_PATH,
+        RequestClass::AuthRefresh,
         "tls_handshake_ok",
-        false,
         refresh_metrics.elapsed_ms(),
     );
     let verification_flags = session.tls_verification_details();
@@ -1278,6 +1398,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         &mut session,
         HttpRequest {
             trace: refresh_trace,
+            class: RequestClass::AuthRefresh,
             method: "POST",
             path: REFRESH_PATH,
             content_type: Some("application/json"),
@@ -1485,7 +1606,7 @@ async fn ensure_access_session<'a>(
             stack,
             TraceContext { sync_id, req_id: 0 },
             REFRESH_PATH,
-            false,
+            RequestClass::AuthRefresh,
             if refresh_attempt == 0 {
                 "prepare_refresh"
             } else {
@@ -1920,7 +2041,9 @@ async fn send_https_request_once<'a>(
     response_buffer: &'a mut [u8],
 ) -> Result<HttpResponse<'a>, BackendError> {
     let mut tcp_client = TcpClient::new(stack, tcp_state);
-    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_BODY_TIMEOUT_SECS)));
+    tcp_client.set_timeout(Some(Duration::from_secs(
+        request.class.socket_timeout_secs(),
+    )));
     let ConnectedBackendSession {
         mut session,
         metrics,
@@ -1933,7 +2056,7 @@ async fn send_https_request_once<'a>(
         tls_session_cache,
         request.trace,
         request.path,
-        false,
+        request.class,
     )
     .await?;
     let response = send_https_request_over_session_with_metrics(
@@ -2019,7 +2142,7 @@ async fn send_https_request_reusing_session_once<'a, 'b>(
         tls_session_cache,
         request.trace,
         request.path,
-        false,
+        request.class,
     )
     .await?;
     let response = match reusable_session {
@@ -2051,7 +2174,7 @@ where
         session,
         request,
         response_buffer,
-        RequestMetrics::new(request.trace, true, false),
+        RequestMetrics::new(request.trace, true, request.class),
     )
     .await
 }
@@ -2067,6 +2190,7 @@ where
 {
     write_http_request(
         session,
+        request.class,
         request.path,
         request.method,
         request.content_type,
@@ -2078,8 +2202,8 @@ where
     log_request_phase(
         metrics.trace,
         request.path,
+        request.class,
         "request_sent",
-        metrics.streaming,
         metrics.elapsed_ms(),
     );
     let response = read_http_response(
@@ -2210,7 +2334,7 @@ async fn wait_for_backend_request_path_ready(
     stack: Stack<'static>,
     trace: TraceContext,
     path: &str,
-    streaming: bool,
+    class: RequestClass,
     reason: &'static str,
 ) -> Result<(), BackendError> {
     if is_backend_request_path_ready(stack) {
@@ -2218,18 +2342,12 @@ async fn wait_for_backend_request_path_ready(
     }
 
     let started_ms = now_ms();
-    let timeout_secs = if streaming {
-        REQUEST_STREAMING_NETWORK_READY_TIMEOUT_SECS
-    } else {
-        REQUEST_NETWORK_READY_TIMEOUT_SECS
-    };
-    let package_retry_wait = streaming && reason == "package_retry";
+    let timeout_secs = class.network_ready_timeout_secs();
+    let package_retry_wait =
+        matches!(class, RequestClass::StreamingPackage) && reason == "package_retry";
     let timeout_ms = Duration::from_secs(timeout_secs).as_millis();
-    let max_timeout_ms = if package_retry_wait {
-        Duration::from_secs(PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS).as_millis()
-    } else {
-        timeout_ms
-    };
+    let max_timeout_ms =
+        Duration::from_secs(class.network_ready_max_timeout_secs(reason)).as_millis();
     let mut logged_wait = false;
     let mut last_progress_ms = started_ms;
     let mut previous_link_up = stack.is_link_up();
@@ -2247,7 +2365,7 @@ async fn wait_for_backend_request_path_ready(
                 "backend request network ready path={} reason={} wait_ms={} network_ip={:?} backend_path_ready={}",
                 path, reason, waited_ms, network_address, backend_path_ready,
             );
-            log_request_phase(trace, path, "network_ready", streaming, waited_ms);
+            log_request_phase(trace, path, class, "network_ready", waited_ms);
             return Ok(());
         }
 
@@ -2263,7 +2381,7 @@ async fn wait_for_backend_request_path_ready(
                     "backend request network progress path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
                     path, reason, waited_ms, link_up, network_address, backend_path_ready,
                 );
-                log_request_phase(trace, path, "network_wait_progress", streaming, waited_ms);
+                log_request_phase(trace, path, class, "network_wait_progress", waited_ms);
             }
             previous_link_up = link_up;
             previous_has_ip = has_ip;
@@ -2281,7 +2399,7 @@ async fn wait_for_backend_request_path_ready(
                     network_address,
                     backend_path_ready,
                 );
-                log_request_phase(trace, path, "network_wait_timeout", streaming, waited_ms);
+                log_request_phase(trace, path, class, "network_wait_timeout", waited_ms);
                 return Err(BackendError::Connect);
             }
         } else if waited_ms >= timeout_ms {
@@ -2289,7 +2407,7 @@ async fn wait_for_backend_request_path_ready(
                 "backend request network wait timed out path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
                 path, reason, waited_ms, link_up, network_address, backend_path_ready,
             );
-            log_request_phase(trace, path, "network_wait_timeout", streaming, waited_ms);
+            log_request_phase(trace, path, class, "network_wait_timeout", waited_ms);
             return Err(BackendError::Connect);
         }
 
@@ -2298,7 +2416,7 @@ async fn wait_for_backend_request_path_ready(
                 "backend request waiting for network path={} reason={} link_up={} network_ip={:?} backend_path_ready={}",
                 path, reason, link_up, network_address, backend_path_ready,
             );
-            log_request_phase(trace, path, "network_wait_start", streaming, waited_ms);
+            log_request_phase(trace, path, class, "network_wait_start", waited_ms);
             logged_wait = true;
         }
 
@@ -2315,8 +2433,9 @@ async fn open_backend_session<'a>(
     tls_session_cache: &mut Option<SerializedClientSession>,
     trace: TraceContext,
     path: &str,
-    streaming: bool,
+    class: RequestClass,
 ) -> Result<ConnectedBackendSession<'a>, BackendError> {
+    let streaming = class.is_streaming();
     let network_address = current_network_address(stack).ok_or_else(|| {
         crate::internet::invalidate_backend_path("missing_ip");
         info!("backend request network unavailable path={}", path);
@@ -2327,39 +2446,16 @@ async fn open_backend_session<'a>(
         "backend request open path={} streaming={} network_ip={:?}",
         path, streaming, network_address
     );
-    let mut metrics = RequestMetrics::new(trace, false, streaming);
-    log_request_phase(trace, path, "open", streaming, 0);
-
-    let dns = DnsSocket::new(stack);
-    let dns_started_ms = now_ms();
-    let remote = dns
-        .get_host_by_name(BACKEND_HOST, AddrType::IPv4)
-        .await
-        .map_err(|_| {
-            crate::internet::invalidate_backend_path("dns_failed");
-            info!("backend request dns failed path={}", path);
-            log_request_heap(path, "dns failed");
-            BackendError::Dns
-        })?;
-    metrics.dns_ms = elapsed_since_ms(dns_started_ms);
-    let remote = match remote {
-        IpAddr::V4(addr) => addr,
-        IpAddr::V6(_) => {
-            crate::internet::invalidate_backend_path("dns_invalid_family");
-            info!("backend request dns returned ipv6 path={}", path);
-            log_request_heap(path, "dns ipv6");
-            return Err(BackendError::Dns);
-        }
-    };
-    info!(
-        "backend request dns ok path={} remote_ip={} dns_ms={}",
-        path, remote, metrics.dns_ms
-    );
-    log_request_phase(trace, path, "dns_ok", streaming, metrics.dns_ms);
+    let mut metrics = RequestMetrics::new(trace, false, class);
+    log_request_phase(trace, path, class, "open", 0);
+    let resolved_remote = resolve_backend_remote(stack, trace, path, class, &mut metrics).await?;
     let connect_started_ms = now_ms();
     let connection = with_timeout(
-        Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        tcp_client.connect(SocketAddr::new(IpAddr::V4(remote), BACKEND_PORT)),
+        Duration::from_secs(class.connect_timeout_secs()),
+        tcp_client.connect(SocketAddr::new(
+            IpAddr::V4(resolved_remote.addr),
+            BACKEND_PORT,
+        )),
     )
     .await
     .map_err(|_| {
@@ -2374,20 +2470,25 @@ async fn open_backend_session<'a>(
         log_request_heap(path, "connect failed");
         BackendError::Connect
     })?;
+    crate::internet::record_backend_endpoint(resolved_remote.addr, "request_connect_ok");
     metrics.connect_ms = elapsed_since_ms(connect_started_ms);
     info!(
         "backend request connect ok path={} remote_ip={} connect_ms={}",
-        path, remote, metrics.connect_ms
+        path, resolved_remote.addr, metrics.connect_ms
     );
-    log_request_phase(trace, path, "connect_ok", streaming, metrics.elapsed_ms());
+    if matches!(resolved_remote.source, BackendEndpointSource::Cached) {
+        info!(
+            "backend request dns fallback succeeded path={} remote_ip={} cache_age_ms={} session_epoch={} connect_ms={}",
+            path,
+            resolved_remote.addr,
+            resolved_remote.cache_age_ms.unwrap_or_default(),
+            resolved_remote.session_epoch.unwrap_or_default(),
+            metrics.connect_ms
+        );
+    }
+    log_request_phase(trace, path, class, "connect_ok", metrics.elapsed_ms());
     log_request_heap(path, "tls setup start");
-    log_request_phase(
-        trace,
-        path,
-        "tls_setup_start",
-        streaming,
-        metrics.elapsed_ms(),
-    );
+    log_request_phase(trace, path, class, "tls_setup_start", metrics.elapsed_ms());
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
             info!("backend request tls setup failed path={}", path);
@@ -2401,29 +2502,23 @@ async fn open_backend_session<'a>(
         &mut metrics,
     );
     log_request_heap(path, "tls setup ok");
-    log_request_phase(trace, path, "tls_setup_ok", streaming, metrics.elapsed_ms());
+    log_request_phase(trace, path, class, "tls_setup_ok", metrics.elapsed_ms());
     let tls_started_ms = now_ms();
     log_request_heap(path, "tls handshake start");
     log_request_phase(
         trace,
         path,
+        class,
         "tls_handshake_start",
-        streaming,
         metrics.elapsed_ms(),
     );
-    if let Err(err) = await_tls_handshake(&mut session, path).await {
+    if let Err(err) = await_tls_handshake(&mut session, path, class).await {
         discard_failed_tls_session_resume(tls_session_cache, path, streaming, &metrics);
         return Err(err);
     }
     metrics.tls_ms = elapsed_since_ms(tls_started_ms);
     log_request_heap(path, "tls handshake ok");
-    log_request_phase(
-        trace,
-        path,
-        "tls_handshake_ok",
-        streaming,
-        metrics.elapsed_ms(),
-    );
+    log_request_phase(trace, path, class, "tls_handshake_ok", metrics.elapsed_ms());
     let verification_flags = session.tls_verification_details();
     info!(
         "backend request tls ok path={} tls_ms={} verification_flags=0x{:08x}",
@@ -2442,6 +2537,69 @@ async fn open_backend_session<'a>(
         network_address,
         metrics,
     })
+}
+
+async fn resolve_backend_remote(
+    stack: Stack<'static>,
+    trace: TraceContext,
+    path: &str,
+    class: RequestClass,
+    metrics: &mut RequestMetrics,
+) -> Result<ResolvedBackendRemote, BackendError> {
+    let dns = DnsSocket::new(stack);
+    let dns_started_ms = now_ms();
+    let remote = dns.get_host_by_name(BACKEND_HOST, AddrType::IPv4).await;
+    metrics.dns_ms = elapsed_since_ms(dns_started_ms);
+
+    match remote {
+        Ok(IpAddr::V4(addr)) => {
+            info!(
+                "backend request dns ok path={} remote_ip={} dns_ms={}",
+                path, addr, metrics.dns_ms
+            );
+            log_request_phase(trace, path, class, "dns_ok", metrics.dns_ms);
+            Ok(ResolvedBackendRemote {
+                addr,
+                source: BackendEndpointSource::Dns,
+                cache_age_ms: None,
+                session_epoch: None,
+            })
+        }
+        Ok(IpAddr::V6(_)) => {
+            resolve_backend_remote_from_cache(trace, path, class, metrics, "dns_invalid_family")
+        }
+        Err(_) => resolve_backend_remote_from_cache(trace, path, class, metrics, "dns_failed"),
+    }
+}
+
+fn resolve_backend_remote_from_cache(
+    trace: TraceContext,
+    path: &str,
+    class: RequestClass,
+    metrics: &RequestMetrics,
+    reason: &'static str,
+) -> Result<ResolvedBackendRemote, BackendError> {
+    if let Some(cached) = crate::internet::cached_backend_endpoint() {
+        info!(
+            "backend request dns fallback path={} remote_ip={} cache_age_ms={} session_epoch={} reason={}",
+            path, cached.addr, cached.age_ms, cached.session_epoch, reason
+        );
+        log_request_phase(trace, path, class, "dns_fallback", metrics.dns_ms);
+        return Ok(ResolvedBackendRemote {
+            addr: cached.addr,
+            source: BackendEndpointSource::Cached,
+            cache_age_ms: Some(cached.age_ms),
+            session_epoch: Some(cached.session_epoch),
+        });
+    }
+
+    crate::internet::invalidate_backend_path(reason);
+    info!(
+        "backend request dns failed path={} reason={} cache=miss",
+        path, reason
+    );
+    log_request_heap(path, "dns failed");
+    Err(BackendError::Dns)
 }
 
 async fn close_backend_tls_session<T>(session: &mut Session<'_, T>, reason: &str)
@@ -2492,8 +2650,9 @@ async fn ensure_reusable_session<'a>(
     tls_session_cache: &mut Option<SerializedClientSession>,
     trace: TraceContext,
     path: &str,
-    streaming: bool,
+    class: RequestClass,
 ) -> Result<RequestMetrics, BackendError> {
+    let streaming = class.is_streaming();
     let now_ms = now_ms();
     match reusable_session.as_ref() {
         Some(session) if session.is_usable_on(stack, now_ms, streaming) => {
@@ -2504,7 +2663,7 @@ async fn ensure_reusable_session<'a>(
                 now_ms.saturating_sub(session.last_used_ms),
                 session.network_address,
             );
-            return Ok(RequestMetrics::new(trace, true, streaming));
+            return Ok(RequestMetrics::new(trace, true, class));
         }
         Some(session) => {
             let link_up = stack.is_link_up();
@@ -2542,7 +2701,7 @@ async fn ensure_reusable_session<'a>(
         tls_session_cache,
         trace,
         path,
-        streaming,
+        class,
     )
     .await?;
     *reusable_session = Some(ReusableBackendSession {
@@ -2741,7 +2900,12 @@ fn map_logged_session_error(path: &str, stage: &str, error: SessionError) -> Bac
     }
 }
 
-fn log_request_timeout(path: &str, stage: &str, error: BackendError) -> BackendError {
+fn log_request_timeout(
+    path: &str,
+    class: RequestClass,
+    stage: &str,
+    error: BackendError,
+) -> BackendError {
     if is_transient_transport_error(error) {
         let reason = match error {
             BackendError::Dns => "dns_timeout",
@@ -2752,7 +2916,12 @@ fn log_request_timeout(path: &str, stage: &str, error: BackendError) -> BackendE
         };
         crate::internet::invalidate_backend_path(reason);
     }
-    info!("backend request {} timed out path={}", stage, path);
+    info!(
+        "backend request {} timed out path={} class={}",
+        stage,
+        path,
+        class.label()
+    );
     log_request_heap(path, stage);
     error
 }
@@ -2760,27 +2929,34 @@ fn log_request_timeout(path: &str, stage: &str, error: BackendError) -> BackendE
 async fn await_tls_handshake<T>(
     session: &mut Session<'_, T>,
     path: &str,
+    class: RequestClass,
 ) -> Result<(), BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
 {
     with_timeout(
-        Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+        Duration::from_secs(class.tls_handshake_timeout_secs()),
         session.connect(),
     )
     .await
-    .map_err(|_| log_request_timeout(path, "handshake", BackendError::Tls))?
+    .map_err(|_| log_request_timeout(path, class, "handshake", BackendError::Tls))?
     .map_err(|err| map_logged_session_error(path, "handshake", err))
 }
 
-async fn await_body_io_timeout<T, F>(path: &str, stage: &str, future: F) -> Result<T, BackendError>
+async fn await_body_io_timeout<T, F>(
+    path: &str,
+    class: RequestClass,
+    stage: &str,
+    future: F,
+) -> Result<T, BackendError>
 where
     F: Future<Output = Result<T, SessionError>>,
 {
     await_body_io_timeout_for(
         path,
+        class,
         stage,
-        Duration::from_secs(HTTP_BODY_TIMEOUT_SECS),
+        Duration::from_secs(class.io_timeout_secs()),
         future,
     )
     .await
@@ -2788,6 +2964,7 @@ where
 
 async fn await_body_io_timeout_for<T, F>(
     path: &str,
+    class: RequestClass,
     stage: &str,
     timeout: Duration,
     future: F,
@@ -2797,12 +2974,14 @@ where
 {
     with_timeout(timeout, future)
         .await
-        .map_err(|_| log_request_timeout(path, stage, BackendError::Io))?
+        .map_err(|_| log_request_timeout(path, class, stage, BackendError::Io))?
         .map_err(|err| map_logged_session_error(path, stage, err))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_http_request<T>(
     session: &mut Session<'_, T>,
+    class: RequestClass,
     path: &str,
     method: &str,
     content_type: Option<&str>,
@@ -2815,54 +2994,63 @@ where
 {
     await_body_io_timeout(
         path,
+        class,
         "write method",
         AsyncWrite07::write_all(session, method.as_bytes()),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write separator",
         AsyncWrite07::write_all(session, b" "),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write path",
         AsyncWrite07::write_all(session, path.as_bytes()),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write request line",
         AsyncWrite07::write_all(session, b" HTTP/1.1\r\nHost: "),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write host",
         AsyncWrite07::write_all(session, BACKEND_HOST.as_bytes()),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write user agent header",
         AsyncWrite07::write_all(session, b"\r\nUser-Agent: "),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write user agent",
         AsyncWrite07::write_all(session, USER_AGENT.as_bytes()),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write connection header",
         AsyncWrite07::write_all(session, b"\r\nAccept: application/json\r\nConnection: "),
     )
     .await?;
     await_body_io_timeout(
         path,
+        class,
         "write connection value",
         AsyncWrite07::write_all(
             session,
@@ -2878,18 +3066,21 @@ where
     if let Some(token) = bearer_token {
         await_body_io_timeout(
             path,
+            class,
             "write auth header",
             AsyncWrite07::write_all(session, b"Authorization: Bearer "),
         )
         .await?;
         await_body_io_timeout(
             path,
+            class,
             "write auth token",
             AsyncWrite07::write_all(session, token.as_bytes()),
         )
         .await?;
         await_body_io_timeout(
             path,
+            class,
             "write auth line ending",
             AsyncWrite07::write_all(session, b"\r\n"),
         )
@@ -2900,18 +3091,21 @@ where
         if let Some(content_type) = content_type {
             await_body_io_timeout(
                 path,
+                class,
                 "write content type header",
                 AsyncWrite07::write_all(session, b"Content-Type: "),
             )
             .await?;
             await_body_io_timeout(
                 path,
+                class,
                 "write content type",
                 AsyncWrite07::write_all(session, content_type.as_bytes()),
             )
             .await?;
             await_body_io_timeout(
                 path,
+                class,
                 "write content type line ending",
                 AsyncWrite07::write_all(session, b"\r\n"),
             )
@@ -2922,18 +3116,21 @@ where
         write!(&mut content_length, "{}", body.len()).map_err(|_| BackendError::InvalidResponse)?;
         await_body_io_timeout(
             path,
+            class,
             "write content length header",
             AsyncWrite07::write_all(session, b"Content-Length: "),
         )
         .await?;
         await_body_io_timeout(
             path,
+            class,
             "write content length",
             AsyncWrite07::write_all(session, content_length.as_bytes()),
         )
         .await?;
         await_body_io_timeout(
             path,
+            class,
             "write content length line ending",
             AsyncWrite07::write_all(session, b"\r\n"),
         )
@@ -2942,16 +3139,23 @@ where
 
     await_body_io_timeout(
         path,
+        class,
         "write header terminator",
         AsyncWrite07::write_all(session, b"\r\n"),
     )
     .await?;
 
     if !body.is_empty() {
-        await_body_io_timeout(path, "write body", AsyncWrite07::write_all(session, body)).await?;
+        await_body_io_timeout(
+            path,
+            class,
+            "write body",
+            AsyncWrite07::write_all(session, body),
+        )
+        .await?;
     }
 
-    await_body_io_timeout(path, "flush", AsyncWrite07::flush(session)).await?;
+    await_body_io_timeout(path, class, "flush", AsyncWrite07::flush(session)).await?;
     Ok(())
 }
 
@@ -2976,6 +3180,7 @@ where
 
         let read = match await_body_io_timeout(
             path,
+            metrics.class,
             "response read",
             AsyncRead07::read(session, &mut response_buffer[total..]),
         )
@@ -3038,6 +3243,7 @@ where
                 "sync_id" = metrics.trace.sync_id,
                 "req_id" = metrics.trace.req_id,
                 "path" = path,
+                "request_class" = metrics.class.label(),
                 "streaming" = bool_flag(metrics.streaming),
                 "header_bytes" = metadata.body_start,
                 "initial_body_bytes" = total.saturating_sub(metadata.body_start),
@@ -3387,6 +3593,7 @@ async fn perform_collection_fetch_paginated(
             tls_session_cache,
             HttpRequest {
                 trace: request_trace,
+                class: RequestClass::BufferedMetadata,
                 method: "GET",
                 path: path.as_str(),
                 content_type: Some("application/json"),
@@ -3469,6 +3676,7 @@ where
             session,
             HttpRequest {
                 trace: request_trace,
+                class: RequestClass::BufferedMetadata,
                 method: "GET",
                 path: path.as_str(),
                 content_type: Some("application/json"),
@@ -3608,7 +3816,7 @@ async fn fetch_and_stage_package<'a>(
             stack,
             request_trace,
             path.as_str(),
-            true,
+            RequestClass::StreamingPackage,
             if attempt == 0 {
                 "package_fetch"
             } else {
@@ -3660,6 +3868,7 @@ async fn fetch_and_stage_package<'a>(
             tls_session_cache,
             HttpRequest {
                 trace: request_trace,
+                class: RequestClass::StreamingPackage,
                 method: "GET",
                 path: path.as_str(),
                 content_type: Some("application/json"),
@@ -3748,6 +3957,7 @@ where
         session,
         HttpRequest {
             trace: request_trace,
+            class: RequestClass::StreamingPackage,
             method: "GET",
             path: path.as_str(),
             content_type: Some("application/json"),
@@ -3804,7 +4014,9 @@ async fn stream_https_response_body_to_storage(
     let mut header_buffer = allocate_stream_header_buffer(request.path)?;
     let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     let mut tcp_client = TcpClient::new(stack, tcp_state);
-    tcp_client.set_timeout(Some(Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS)));
+    tcp_client.set_timeout(Some(Duration::from_secs(
+        request.class.socket_timeout_secs(),
+    )));
     let ConnectedBackendSession {
         mut session,
         mut metrics,
@@ -3817,11 +4029,12 @@ async fn stream_https_response_body_to_storage(
         tls_session_cache,
         request.trace,
         request.path,
-        true,
+        request.class,
     )
     .await?;
     write_http_request(
         &mut session,
+        request.class,
         request.path,
         request.method,
         request.content_type,
@@ -3917,7 +4130,7 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
         tls_session_cache,
         request.trace,
         request.path,
-        true,
+        request.class,
     )
     .await?;
     info!(
@@ -3954,7 +4167,7 @@ where
     stream_https_response_body_to_storage_over_session_with_metrics(
         session,
         request,
-        RequestMetrics::new(request.trace, true, true),
+        RequestMetrics::new(request.trace, true, request.class),
         header_buffer.as_mut_slice(),
         chunk_buffer.as_mut_slice(),
     )
@@ -3974,6 +4187,7 @@ where
 {
     write_http_request(
         session,
+        request.class,
         request.path,
         request.method,
         request.content_type,
@@ -3985,8 +4199,8 @@ where
     log_request_phase(
         metrics.trace,
         request.path,
+        request.class,
         "request_sent",
-        metrics.streaming,
         metrics.elapsed_ms(),
     );
 
@@ -4037,6 +4251,7 @@ where
 
         let read = await_body_io_timeout(
             path,
+            metrics.class,
             "stream response header read",
             AsyncRead07::read(session, &mut header[header_len..]),
         )
@@ -4073,6 +4288,7 @@ where
             "sync_id" = metrics.trace.sync_id,
             "req_id" = metrics.trace.req_id,
             "path" = path,
+            "request_class" = metrics.class.label(),
             "streaming" = 1,
             "header_bytes" = metadata.body_start,
             "initial_body_bytes" = initial_body_len,
@@ -4117,7 +4333,7 @@ where
                     }
                     streamed_body_bytes = initial_body_len;
                     log_stream_progress_if_needed(
-                        metrics.trace,
+                        metrics,
                         path,
                         &mut next_progress_log,
                         streamed_body_bytes,
@@ -4131,8 +4347,9 @@ where
                     let read_len = remaining.min(chunk.len().saturating_sub(buffered_chunk_len));
                     let read = await_body_io_timeout_for(
                         path,
+                        metrics.class,
                         "stream response body read",
-                        Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS),
+                        Duration::from_secs(metrics.class.io_timeout_secs()),
                         AsyncRead07::read(
                             session,
                             &mut chunk[buffered_chunk_len..buffered_chunk_len + read_len],
@@ -4146,7 +4363,7 @@ where
                     streamed_body_bytes = streamed_body_bytes.saturating_add(read);
                     remaining -= read;
                     log_stream_progress_if_needed(
-                        metrics.trace,
+                        metrics,
                         path,
                         &mut next_progress_log,
                         streamed_body_bytes,
@@ -4160,7 +4377,7 @@ where
                 }
                 flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
                 log_stream_complete(
-                    metrics.trace,
+                    metrics,
                     path,
                     streamed_body_bytes,
                     Some(content_length),
@@ -4184,7 +4401,7 @@ where
                     }
                     streamed_body_bytes = initial_body_len;
                     log_stream_progress_if_needed(
-                        metrics.trace,
+                        metrics,
                         path,
                         &mut next_progress_log,
                         streamed_body_bytes,
@@ -4204,8 +4421,9 @@ where
         }
         let read = await_body_io_timeout_for(
             path,
+            metrics.class,
             "stream response body read",
-            Duration::from_secs(HTTP_STREAM_BODY_TIMEOUT_SECS),
+            Duration::from_secs(metrics.class.io_timeout_secs()),
             AsyncRead07::read(session, &mut chunk[buffered_chunk_len..]),
         )
         .await?;
@@ -4215,7 +4433,7 @@ where
         buffered_chunk_len += read;
         streamed_body_bytes = streamed_body_bytes.saturating_add(read);
         log_stream_progress_if_needed(
-            metrics.trace,
+            metrics,
             path,
             &mut next_progress_log,
             streamed_body_bytes,
@@ -4228,7 +4446,7 @@ where
     metrics.body_bytes = streamed_body_bytes;
     metrics.response_bytes = metrics.header_bytes.saturating_add(streamed_body_bytes);
     log_stream_complete(
-        metrics.trace,
+        metrics,
         path,
         streamed_body_bytes,
         None,
@@ -5242,8 +5460,8 @@ fn elapsed_since_ms(started_ms: u64) -> u64 {
 fn log_request_phase(
     trace: TraceContext,
     path: &str,
+    class: RequestClass,
     phase: &str,
-    streaming: bool,
     elapsed_ms: u64,
 ) {
     crate::memtrace!(
@@ -5253,8 +5471,9 @@ fn log_request_phase(
         "sync_id" = trace.sync_id,
         "req_id" = trace.req_id,
         "path" = path,
+        "request_class" = class.label(),
         "phase" = phase,
-        "streaming" = bool_flag(streaming),
+        "streaming" = bool_flag(class.is_streaming()),
         "elapsed_ms" = elapsed_ms,
     );
 }
@@ -5300,7 +5519,7 @@ fn is_reusable_session_age_usable(last_used_ms: u64, now_ms: u64, streaming: boo
 }
 
 fn log_stream_progress_if_needed(
-    trace: TraceContext,
+    metrics: &RequestMetrics,
     path: &str,
     next_progress_log: &mut usize,
     received_bytes: usize,
@@ -5327,9 +5546,10 @@ fn log_stream_progress_if_needed(
         "request_stream_progress",
         "component" = "backend",
         "at_ms" = now_ms(),
-        "sync_id" = trace.sync_id,
-        "req_id" = trace.req_id,
+        "sync_id" = metrics.trace.sync_id,
+        "req_id" = metrics.trace.req_id,
         "path" = path,
+        "request_class" = metrics.class.label(),
         "received_bytes" = received_bytes,
         "total_bytes_known" = bool_flag(total_bytes.is_some()),
         "total_bytes" = total_bytes.unwrap_or(0),
@@ -5344,7 +5564,7 @@ fn log_stream_progress_if_needed(
 }
 
 fn log_stream_complete(
-    trace: TraceContext,
+    metrics: &RequestMetrics,
     path: &str,
     received_bytes: usize,
     total_bytes: Option<usize>,
@@ -5366,9 +5586,10 @@ fn log_stream_complete(
         "request_stream_complete",
         "component" = "backend",
         "at_ms" = now_ms(),
-        "sync_id" = trace.sync_id,
-        "req_id" = trace.req_id,
+        "sync_id" = metrics.trace.sync_id,
+        "req_id" = metrics.trace.req_id,
         "path" = path,
+        "request_class" = metrics.class.label(),
         "received_bytes" = received_bytes,
         "total_bytes_known" = bool_flag(total_bytes.is_some()),
         "total_bytes" = total_bytes.unwrap_or(0),
@@ -5380,7 +5601,8 @@ fn log_stream_complete(
 fn log_request_timing(request: HttpRequest<'_>, status: u16, metrics: &RequestMetrics) {
     crate::internet::mark_backend_path_ready("backend_request");
     info!(
-        "backend request timing method={} path={} status={} reused={} resumed={} streaming={} dns_ms={} connect_ms={} tls_ms={} first_byte_ms={} total_ms={}",
+        "backend request timing class={} method={} path={} status={} reused={} resumed={} streaming={} dns_ms={} connect_ms={} tls_ms={} first_byte_ms={} total_ms={}",
+        metrics.class.label(),
         request.method,
         request.path,
         status,
@@ -5401,6 +5623,7 @@ fn log_request_timing(request: HttpRequest<'_>, status: u16, metrics: &RequestMe
         "req_id" = request.trace.req_id,
         "method" = request.method,
         "path" = request.path,
+        "request_class" = metrics.class.label(),
         "status" = status,
         "reused" = bool_flag(metrics.reused_session),
         "tls_resume_offered" = bool_flag(metrics.tls_resume_offered),

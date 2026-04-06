@@ -87,3 +87,8 @@ The next work should prioritize reliability over more throughput tuning:
 
 That is the work needed to move the current networking path from a capable
 prototype to a more production-grade embedded client.
+
+The follow-up execution backlog is documented in
+[Session Plan: Network And Storage Stability](2026-04-06-network-and-storage-action-plan.md)
+and
+[Network And Storage Tickets](2026-04-06-network-and-storage-tickets.md).

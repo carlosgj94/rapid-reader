@@ -769,7 +769,9 @@ fn current_prepared_screen(
 }
 
 fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
-    prepared_screen_drives_reader_ticks(screen) || prepared_screen_shows_collection_fetch(screen)
+    prepared_screen_drives_reader_ticks(screen)
+        || prepared_screen_shows_collection_fetch(screen)
+        || prepared_screen_shows_dashboard_sync(screen)
 }
 
 fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
@@ -783,6 +785,10 @@ fn prepared_screen_shows_collection_fetch(screen: &PreparedScreen) -> bool {
         }
         _ => false,
     }
+}
+
+fn prepared_screen_shows_dashboard_sync(screen: &PreparedScreen) -> bool {
+    matches!(screen, PreparedScreen::Dashboard(shell) if shell.sync_indicator.is_some())
 }
 
 fn prepared_screen_drives_ui_ticks(screen: &PreparedScreen) -> bool {
@@ -1052,6 +1058,38 @@ mod tests {
     use super::*;
     use domain::sleep::{SleepConfig, WakeReason};
 
+    fn dashboard_shell(
+        sync_indicator: Option<app_runtime::components::SyncIndicator>,
+    ) -> app_runtime::components::DashboardShell {
+        app_runtime::components::DashboardShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            status: app_runtime::components::StatusCluster {
+                battery_percent: 82,
+                wifi_online: true,
+            },
+            sync_indicator,
+            rail: app_runtime::components::VerticalRail { text: "HOME" },
+            items: [
+                app_runtime::components::DashboardItem {
+                    label: "INBOX",
+                    live_dot: false,
+                    selected: false,
+                },
+                app_runtime::components::DashboardItem {
+                    label: "SAVED",
+                    live_dot: true,
+                    selected: true,
+                },
+                app_runtime::components::DashboardItem {
+                    label: "FOR YOU",
+                    live_dot: false,
+                    selected: false,
+                },
+            ],
+            band: app_runtime::components::SelectionBand { y: 106, height: 68 },
+        }
+    }
+
     #[test]
     fn requested_sleep_uses_immediate_deadline() {
         let mut model = SleepModel::new(SleepConfig::new(30_000));
@@ -1134,6 +1172,25 @@ mod tests {
                 ],
             }),
         });
+
+        assert!(!prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn dashboard_with_sync_indicator_suppresses_sleep() {
+        let screen = PreparedScreen::Dashboard(dashboard_shell(Some(
+            app_runtime::components::SyncIndicator {
+                label: "syncing...",
+                spinner_phase: 2,
+            },
+        )));
+
+        assert!(prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn dashboard_without_sync_indicator_does_not_suppress_sleep() {
+        let screen = PreparedScreen::Dashboard(dashboard_shell(None));
 
         assert!(!prepared_screen_suppresses_sleep(&screen));
     }
