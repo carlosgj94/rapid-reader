@@ -238,11 +238,11 @@ pub fn select_reader(store: &Store) -> ReaderScreenModel {
         pause_actions: matches!(store.reader.mode, ReaderMode::Paused).then_some([
             PauseActionModel {
                 label: "LONG PRESS ->",
-                action: "GO BACK",
+                action: "PARAGRAPH VIEW",
             },
             PauseActionModel {
                 label: "SHORT PRESS ->",
-                action: "PARAGRAPH VIEW",
+                action: "RESUME RSVP",
             },
             PauseActionModel {
                 label: "ROTATE ->",

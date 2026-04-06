@@ -472,10 +472,10 @@ impl Store {
                     return self.persist_settings_effect();
                 }
                 UiCommand::Confirm => {
-                    self.reader.open_paragraph_navigation();
+                    self.reader.resume();
                 }
                 UiCommand::Back => {
-                    self.reader.resume();
+                    self.reader.open_paragraph_navigation();
                 }
                 UiCommand::Noop => {}
             },
@@ -1092,12 +1092,26 @@ mod tests {
     }
 
     #[test]
-    fn paused_reader_confirm_opens_paragraph_navigation() {
+    fn paused_reader_confirm_resumes_live_session() {
         let mut store = Store::new();
         store.ui.route = UiRoute::Reader;
         store.reader.pause();
 
         store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert!(matches!(
+            store.reader.mode,
+            crate::reader::ReaderMode::Normal
+        ));
+    }
+
+    #[test]
+    fn paused_reader_back_opens_paragraph_navigation() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Reader;
+        store.reader.pause();
+
+        store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
 
         assert!(matches!(
             store.reader.mode,
