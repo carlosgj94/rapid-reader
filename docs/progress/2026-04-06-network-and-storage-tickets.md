@@ -149,6 +149,20 @@ trace reading.
 - define a repeatable soak-run protocol for manual sessions
 - make the report output easy to compare across tickets
 
+### Current Progress
+
+- Code landed: `scripts/memtrace_report.py` now parses both `MEMTRACE` rows and
+  high-signal plain log lines, emits `sli.csv`, `request-class-summary.csv`,
+  and `log-events.csv`, and adds reliability / request-class sections to the
+  Markdown summary.
+- The report now summarizes startup retries, Wi-Fi disconnects, DNS fallback
+  attempts and hard failures, TLS handshake timeouts, flush/body-read
+  timeouts, package success ratio, per-class attempt/success counts, and
+  median / p95 successful request latency by request class.
+- Manual soak protocol captured in
+  [2026-04-06-network-soak-protocol.md](2026-04-06-network-soak-protocol.md)
+  so repeated runs use the same capture and report commands.
+
 ### Non-goals
 
 - no firmware tuning here unless reporting requires a new event field
@@ -177,6 +191,17 @@ finished hardware setting, and any move above `8 MHz` must be evidence-driven.
 - only after a clean repeated run set, do one controlled A/B test at a higher
   runtime clock such as `12 MHz`
 - keep the higher clock only if it is stable and yields a real end-to-end win
+
+### Current Progress
+
+- Code landed: the SD runtime clock is now an explicit product-default policy
+  instead of an unlabeled raw constant, storage static-inventory and boot mount
+  telemetry now emit the init/runtime clock and source, and a controlled
+  build-time override path (`MOTIF_SD_SPI_RUN_HZ`) exists for later `12 MHz`
+  A/B runs.
+- Still pending: repeated on-device stability runs at the retained `8 MHz`
+  setting, then one evidence-driven higher-clock experiment only if `8 MHz`
+  stays clean.
 
 ### Non-goals
 

@@ -164,7 +164,11 @@ Current implemented behavior includes:
   on commit
 - immediate open-after-commit for uncached article prepares
 - runtime SD SPI that initializes conservatively at `400 kHz` and switches to
-  `8 MHz` after mount
+  a product-default `8 MHz` after mount
+- boot/storage telemetry that records the SD init clock, runtime clock, and the
+  source of that runtime choice
+- a controlled build-time override path (`MOTIF_SD_SPI_RUN_HZ`) for deliberate
+  higher-clock experiments without changing the product default
 
 Current package/stage buffers are intentionally much larger than the original
 baseline:

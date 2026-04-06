@@ -4,15 +4,71 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import re
+import statistics
 import subprocess
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
 INT_RE = re.compile(r"^-?\d+$")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 MEMTRACE_PREFIX = "MEMTRACE "
+REQUEST_CLASS_ORDER = ["auth_refresh", "buffered_metadata", "streaming_package"]
+
+STARTUP_RETRY_RE = re.compile(
+    r"backend startup retry attempt=(?P<attempt>\d+) err=(?P<err>\S+)"
+)
+WIFI_DISCONNECT_RE = re.compile(
+    r"internet wifi event=StaDisconnected ssid_len=(?P<ssid_len>\d+) reason=(?P<reason>-?\d+) rssi=(?P<rssi>-?\d+)"
+)
+BACKEND_DNS_FALLBACK_RE = re.compile(
+    r"backend request dns fallback path=(?P<path>\S+) remote_ip=(?P<remote_ip>\S+) cache_age_ms=(?P<cache_age_ms>\d+) session_epoch=(?P<session_epoch>\d+) reason=(?P<reason>\S+)"
+)
+BACKEND_DNS_FALLBACK_SUCCESS_RE = re.compile(
+    r"backend request dns fallback succeeded path=(?P<path>\S+) remote_ip=(?P<remote_ip>\S+) cache_age_ms=(?P<cache_age_ms>\d+) session_epoch=(?P<session_epoch>\d+) connect_ms=(?P<connect_ms>\d+)"
+)
+BACKEND_DNS_FAILURE_RE = re.compile(
+    r"backend request dns failed path=(?P<path>\S+) reason=(?P<reason>\S+) cache=miss"
+)
+PROBE_DNS_FALLBACK_RE = re.compile(
+    r"internet probe dns fallback host=(?P<host>\S+) cached_ip=(?P<remote_ip>\S+) cache_age_ms=(?P<cache_age_ms>\d+) session_epoch=(?P<session_epoch>\d+) reason=(?P<reason>\S+)"
+)
+PROBE_DNS_FALLBACK_MISS_RE = re.compile(
+    r"internet probe dns fallback miss host=(?P<host>\S+) reason=(?P<reason>\S+)"
+)
+REQUEST_TIMEOUT_RE = re.compile(
+    r"backend request (?P<stage>.+?) timed out path=(?P<path>\S+)(?: class=(?P<request_class>\S+))?(?: .*)?$"
+)
+SD_SPEED_SWITCH_FAILURE_RE = re.compile(
+    r"content storage sd spi speed switch failed hz=(?P<hz>\d+) source=(?P<source>\S+) err=(?P<err>.+)$"
+)
+SD_COMMIT_FAILURE_RE = re.compile(
+    r"content storage stage commit failed content_id=(?P<content_id>\S+) slot=(?P<slot>\S+) target=(?P<target>\S+) err=(?P<err>.+)$"
+)
+SD_MOUNT_FAILURE_RES = [
+    re.compile(r"content storage mount failed: (?P<reason>.+)$"),
+    re.compile(r"content storage layout init failed: (?P<reason>.+)$"),
+    re.compile(r"content storage layout recovery failed: (?P<reason>.+)$"),
+    re.compile(r"content storage state load failed: (?P<reason>.+)$"),
+    re.compile(r"content storage state recovery failed: (?P<reason>.+)$"),
+    re.compile(r"content storage failed to spawn task$"),
+]
+SD_OPEN_FAILURE_RES = [
+    re.compile(
+        r"content storage open failed collection=(?P<collection>\S+) content_id=(?P<content_id>\S+) err=(?P<err>.+)$"
+    ),
+    re.compile(
+        r"content storage cached open timing failed content_id=(?P<content_id>\S+) total_ms=(?P<total_ms>\d+) err=(?P<err>.+)$"
+    ),
+    re.compile(
+        r"content storage commit\+open timing failed content_id=(?P<content_id>\S+) total_ms=(?P<total_ms>\d+) err=(?P<err>.+)$"
+    ),
+    re.compile(
+        r"content storage cached content parse failed content_id=(?P<content_id>\S+) slot=(?P<slot>\S+) bytes_read=(?P<bytes_read>\d+) crc32=0x(?P<crc32>[0-9a-fA-F]+) err=(?P<err>.+)$"
+    ),
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,10 +97,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def coerce(value: str):
+def coerce(value: str | None):
+    if value is None:
+        return ""
     if INT_RE.match(value):
         return int(value)
     return value
+
+
+def sanitize_line(line: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", line).strip()
 
 
 def backfill_heap_fields(fields: dict[str, object]) -> dict[str, object]:
@@ -96,7 +158,7 @@ def backfill_heap_fields(fields: dict[str, object]) -> dict[str, object]:
 
 
 def parse_memtrace_line(line: str) -> dict[str, object] | None:
-    line = ANSI_ESCAPE_RE.sub("", line)
+    line = sanitize_line(line)
     if MEMTRACE_PREFIX not in line:
         return None
     payload = line.split(MEMTRACE_PREFIX, 1)[1].strip()
@@ -132,6 +194,300 @@ def max_int(rows: list[dict[str, object]], key: str) -> int:
 def min_int(rows: list[dict[str, object]], key: str) -> int | None:
     values = [int(row[key]) for row in rows if isinstance(row.get(key), int)]
     return min(values) if values else None
+
+
+def maybe_int(value: object) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def percentile_nearest_rank(values: list[int], percentile: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[min(rank - 1, len(ordered) - 1)]
+
+
+def format_number(value: int | float | None) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:.1f}"
+    return str(int(value))
+
+
+def format_ratio(successes: int, attempts: int) -> str:
+    if attempts <= 0:
+        return "0/0 (0.0%)"
+    return f"{successes}/{attempts} ({(successes * 100.0 / attempts):.1f}%)"
+
+
+def ordered_request_classes(classes: set[str]) -> list[str]:
+    ordered = [label for label in REQUEST_CLASS_ORDER if label in classes]
+    ordered.extend(sorted(classes - set(REQUEST_CLASS_ORDER)))
+    return ordered
+
+
+def build_log_event(
+    event: str, line_no: int, line: str, groups: dict[str, str]
+) -> dict[str, object]:
+    row: dict[str, object] = {
+        "event": event,
+        "line_no": line_no,
+        "line": line,
+    }
+    for key, value in groups.items():
+        row[key] = coerce(value)
+    if event == "request_timeout":
+        stage = str(row.get("stage", "")).strip()
+        bucket = "other"
+        if stage == "handshake":
+            bucket = "tls_handshake"
+        elif stage == "flush":
+            bucket = "flush"
+        elif "body read" in stage:
+            bucket = "body_read"
+        elif stage == "network wait":
+            bucket = "network_wait"
+        row["timeout_bucket"] = bucket
+    return row
+
+
+def build_log_rows(lines: list[str]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+
+    for line_no, line in enumerate(lines, start=1):
+        if not line:
+            continue
+
+        match = STARTUP_RETRY_RE.search(line)
+        if match:
+            rows.append(build_log_event("startup_retry", line_no, line, match.groupdict()))
+            continue
+
+        match = WIFI_DISCONNECT_RE.search(line)
+        if match:
+            rows.append(build_log_event("wifi_disconnect", line_no, line, match.groupdict()))
+            continue
+
+        match = BACKEND_DNS_FALLBACK_SUCCESS_RE.search(line)
+        if match:
+            rows.append(
+                build_log_event("backend_dns_fallback_success", line_no, line, match.groupdict())
+            )
+            continue
+
+        match = BACKEND_DNS_FALLBACK_RE.search(line)
+        if match:
+            rows.append(build_log_event("backend_dns_fallback", line_no, line, match.groupdict()))
+            continue
+
+        match = BACKEND_DNS_FAILURE_RE.search(line)
+        if match:
+            rows.append(build_log_event("backend_dns_failure", line_no, line, match.groupdict()))
+            continue
+
+        match = PROBE_DNS_FALLBACK_RE.search(line)
+        if match:
+            rows.append(build_log_event("probe_dns_fallback", line_no, line, match.groupdict()))
+            continue
+
+        match = PROBE_DNS_FALLBACK_MISS_RE.search(line)
+        if match:
+            rows.append(
+                build_log_event("probe_dns_fallback_miss", line_no, line, match.groupdict())
+            )
+            continue
+
+        match = REQUEST_TIMEOUT_RE.search(line)
+        if match:
+            rows.append(build_log_event("request_timeout", line_no, line, match.groupdict()))
+            continue
+
+        match = SD_SPEED_SWITCH_FAILURE_RE.search(line)
+        if match:
+            rows.append(
+                build_log_event("sd_speed_switch_failure", line_no, line, match.groupdict())
+            )
+            continue
+
+        match = SD_COMMIT_FAILURE_RE.search(line)
+        if match:
+            rows.append(build_log_event("sd_commit_failure", line_no, line, match.groupdict()))
+            continue
+
+        matched = False
+        for pattern in SD_MOUNT_FAILURE_RES:
+            match = pattern.search(line)
+            if match:
+                rows.append(build_log_event("sd_mount_failure", line_no, line, match.groupdict()))
+                matched = True
+                break
+        if matched:
+            continue
+
+        for pattern in SD_OPEN_FAILURE_RES:
+            match = pattern.search(line)
+            if match:
+                rows.append(build_log_event("sd_open_failure", line_no, line, match.groupdict()))
+                matched = True
+                break
+        if matched:
+            continue
+
+    return rows
+
+
+def build_request_class_rows(
+    events: list[dict[str, object]], requests: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    attempts_by_class: Counter[str] = Counter()
+    successes_by_class: Counter[str] = Counter()
+    latencies_by_class: defaultdict[str, list[int]] = defaultdict(list)
+
+    for event in events:
+        if event.get("kind") != "request_phase" or event.get("phase") != "open":
+            continue
+        request_class = str(event.get("request_class", "unknown"))
+        attempts_by_class[request_class] += 1
+
+    for request in requests:
+        request_class = str(request.get("request_class", "unknown"))
+        status = int(request.get("status", 0))
+        if 200 <= status < 300:
+            successes_by_class[request_class] += 1
+            total_ms = maybe_int(request.get("total_ms"))
+            if total_ms is not None:
+                latencies_by_class[request_class].append(total_ms)
+
+    classes = ordered_request_classes(
+        set(attempts_by_class) | set(successes_by_class) | set(latencies_by_class)
+    )
+    rows: list[dict[str, object]] = []
+    for request_class in classes:
+        attempts = max(attempts_by_class[request_class], successes_by_class[request_class])
+        successes = successes_by_class[request_class]
+        latencies = latencies_by_class.get(request_class, [])
+        median_ms = statistics.median(latencies) if latencies else None
+        p95_ms = percentile_nearest_rank(latencies, 0.95)
+        rows.append(
+            {
+                "request_class": request_class,
+                "attempts": attempts,
+                "successes": successes,
+                "failures": max(attempts - successes, 0),
+                "success_ratio_pct": round((successes * 100.0 / attempts), 1)
+                if attempts > 0
+                else 0.0,
+                "median_total_ms": median_ms,
+                "p95_total_ms": p95_ms,
+            }
+        )
+    return rows
+
+
+def build_sli_row(
+    logfile: Path,
+    log_rows: list[dict[str, object]],
+    request_class_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    event_counts = Counter(str(row.get("event", "")) for row in log_rows)
+    timeout_counts = Counter(
+        str(row.get("timeout_bucket", "other"))
+        for row in log_rows
+        if row.get("event") == "request_timeout"
+    )
+    package_row = next(
+        (
+            row
+            for row in request_class_rows
+            if row.get("request_class") == "streaming_package"
+        ),
+        None,
+    )
+    dns_failure_count = event_counts["backend_dns_failure"] + sum(
+        1
+        for row in log_rows
+        if row.get("event") == "probe_dns_fallback_miss"
+        and row.get("reason") == "dns_failed"
+    )
+
+    sli_row: dict[str, object] = {
+        "run_id": logfile.stem,
+        "logfile": logfile.name,
+        "startup_retry_count": event_counts["startup_retry"],
+        "wifi_disconnect_count": event_counts["wifi_disconnect"],
+        "dns_failure_count": dns_failure_count,
+        "dns_fallback_count": event_counts["backend_dns_fallback"]
+        + event_counts["probe_dns_fallback"],
+        "dns_fallback_success_count": event_counts["backend_dns_fallback_success"],
+        "tls_handshake_timeout_count": timeout_counts["tls_handshake"],
+        "flush_timeout_count": timeout_counts["flush"],
+        "body_read_timeout_count": timeout_counts["body_read"],
+        "flush_body_read_timeout_count": timeout_counts["flush"]
+        + timeout_counts["body_read"],
+        "sd_mount_failure_count": event_counts["sd_mount_failure"],
+        "sd_commit_failure_count": event_counts["sd_commit_failure"],
+        "sd_open_failure_count": event_counts["sd_open_failure"],
+        "sd_speed_switch_failure_count": event_counts["sd_speed_switch_failure"],
+        "package_attempts": int(package_row.get("attempts", 0)) if package_row else 0,
+        "package_successes": int(package_row.get("successes", 0)) if package_row else 0,
+        "package_success_ratio_pct": float(package_row.get("success_ratio_pct", 0.0))
+        if package_row
+        else 0.0,
+    }
+
+    for row in request_class_rows:
+        request_class = str(row.get("request_class", "unknown"))
+        sli_row[f"{request_class}_attempts"] = row.get("attempts", 0)
+        sli_row[f"{request_class}_successes"] = row.get("successes", 0)
+        sli_row[f"{request_class}_failures"] = row.get("failures", 0)
+        sli_row[f"{request_class}_success_ratio_pct"] = row.get("success_ratio_pct", 0.0)
+        sli_row[f"{request_class}_median_total_ms"] = row.get("median_total_ms")
+        sli_row[f"{request_class}_p95_total_ms"] = row.get("p95_total_ms")
+
+    return sli_row
+
+
+def summarize_reliability(
+    sli_row: dict[str, object],
+) -> list[str]:
+    return [
+        f"Startup retries: {sli_row['startup_retry_count']}",
+        f"Wi-Fi disconnects: {sli_row['wifi_disconnect_count']}",
+        f"DNS hard failures: {sli_row['dns_failure_count']}",
+        f"DNS fallback attempts: {sli_row['dns_fallback_count']}",
+        f"DNS fallback successes: {sli_row['dns_fallback_success_count']}",
+        f"TLS handshake timeouts: {sli_row['tls_handshake_timeout_count']}",
+        f"Flush timeouts: {sli_row['flush_timeout_count']}",
+        f"Body-read timeouts: {sli_row['body_read_timeout_count']}",
+        f"Package success ratio: {format_ratio(int(sli_row['package_successes']), int(sli_row['package_attempts']))}",
+        f"SD mount failures: {sli_row['sd_mount_failure_count']}",
+        f"SD commit failures: {sli_row['sd_commit_failure_count']}",
+        f"SD open failures: {sli_row['sd_open_failure_count']}",
+        f"SD speed-switch failures: {sli_row['sd_speed_switch_failure_count']}",
+    ]
+
+
+def summarize_request_classes(request_class_rows: list[dict[str, object]]) -> list[str]:
+    if not request_class_rows:
+        return ["No request-class rows found."]
+
+    header = "| class | attempts | successes | success % | median ms | p95 ms |"
+    separator = "|---|---:|---:|---:|---:|---:|"
+    lines = [header, separator]
+    for row in request_class_rows:
+        lines.append(
+            "| {request_class} | {attempts} | {successes} | {success_ratio_pct:.1f} | {median_total_ms} | {p95_total_ms} |".format(
+                request_class=row.get("request_class", "unknown"),
+                attempts=row.get("attempts", 0),
+                successes=row.get("successes", 0),
+                success_ratio_pct=float(row.get("success_ratio_pct", 0.0)),
+                median_total_ms=format_number(row.get("median_total_ms")),
+                p95_total_ms=format_number(row.get("p95_total_ms")),
+            )
+        )
+    return lines
 
 
 def summarize_requests(requests: list[dict[str, object]]) -> list[str]:
@@ -523,8 +879,11 @@ def build_static_report(
 def build_summary(
     out_path: Path,
     events: list[dict[str, object]],
+    log_rows: list[dict[str, object]],
     heap_rows: list[dict[str, object]],
     requests: list[dict[str, object]],
+    request_class_rows: list[dict[str, object]],
+    sli_row: dict[str, object],
     articles: list[dict[str, object]],
     storage_rows: list[dict[str, object]],
 ) -> None:
@@ -535,13 +894,21 @@ def build_summary(
         or event.get("status", 0) not in (0, 200)
         and event.get("kind") == "request_complete"
     ]
-    lines = ["# Memtrace Summary", ""]
+    lines = ["# Motif Run Summary", ""]
     lines.append("## Overview")
     lines.append(f"- Total MEMTRACE events: {len(events)}")
+    lines.append(f"- Total matched log events: {len(log_rows)}")
     lines.append(f"- Total heap rows: {len(heap_rows)}")
     lines.append(f"- Total requests: {len(requests)}")
     lines.append(f"- Total article rows: {len(articles)}")
     lines.append(f"- Failure-like events: {len(failures)}")
+    lines.append("")
+    lines.append("## Reliability")
+    for line in summarize_reliability(sli_row):
+        lines.append(f"- {line}")
+    lines.append("")
+    lines.append("## Request Classes")
+    lines.extend(summarize_request_classes(request_class_rows))
     lines.append("")
     lines.append("## Heap")
     for line in summarize_heap(events):
@@ -558,6 +925,14 @@ def build_summary(
     lines.append("## Storage")
     for line in summarize_storage(storage_rows):
         lines.append(f"- {line}")
+    lines.append("")
+    lines.append("## SLI Snapshot")
+    lines.append(
+        f"- Package success ratio: {format_ratio(int(sli_row.get('package_successes', 0)), int(sli_row.get('package_attempts', 0)))}"
+    )
+    lines.append(
+        f"- Request classes captured: {', '.join(row.get('request_class', 'unknown') for row in request_class_rows) or '-'}"
+    )
     out_path.write_text("\n".join(lines) + "\n")
 
 
@@ -566,26 +941,39 @@ def main() -> None:
     ensure_dir(args.out_dir)
 
     events = []
-    for line in args.logfile.read_text(errors="replace").splitlines():
+    sanitized_lines = [
+        sanitize_line(line)
+        for line in args.logfile.read_text(errors="replace").splitlines()
+    ]
+    for line in sanitized_lines:
         parsed = parse_memtrace_line(line)
         if parsed is not None:
             events.append(parsed)
     events.sort(key=lambda row: int(row.get("event_id", 0)))
 
+    log_rows = build_log_rows(sanitized_lines)
     heap_rows = build_heap_rows(events)
     requests = [row for row in events if row.get("kind") == "request_complete"]
+    request_class_rows = build_request_class_rows(events, requests)
+    sli_row = build_sli_row(args.logfile, log_rows, request_class_rows)
     articles = build_article_rows(events)
     storage_rows = build_storage_rows(events)
 
+    write_csv(args.out_dir / "log-events.csv", log_rows)
     write_csv(args.out_dir / "heap.csv", heap_rows)
     write_csv(args.out_dir / "requests.csv", requests)
+    write_csv(args.out_dir / "request-class-summary.csv", request_class_rows)
+    write_csv(args.out_dir / "sli.csv", [sli_row])
     write_csv(args.out_dir / "articles.csv", articles)
     write_csv(args.out_dir / "storage.csv", storage_rows)
     build_summary(
         args.out_dir / "summary.md",
         events,
+        log_rows,
         heap_rows,
         requests,
+        request_class_rows,
+        sli_row,
         articles,
         storage_rows,
     )

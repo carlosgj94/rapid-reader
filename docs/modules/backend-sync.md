@@ -88,7 +88,7 @@ The architecture still has important unfinished areas:
 - explicit last-good-endpoint fallback when DNS fails
 - request-class specific timeout policy cleanly documented and tuned
 - compile-time TLS feature pruning
-- long-run soak metrics and service-level reliability reporting
+- automated long-run soak infrastructure beyond the current manual reports
 
 Those are now the next frontier for turning the current implementation from a
 working prototype into a more production-grade network client.

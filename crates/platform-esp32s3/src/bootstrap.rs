@@ -50,7 +50,8 @@ use crate::{
 
 const DISPLAY_SPI_HZ: u32 = 2_000_000;
 const SD_SPI_INIT_HZ: u32 = 400_000;
-const SD_SPI_RUN_HZ: u32 = 8_000_000;
+const SD_SPI_PRODUCT_RUN_HZ: u32 = 8_000_000;
+const SD_SPI_RUN_HZ_OVERRIDE_ENV: &str = "MOTIF_SD_SPI_RUN_HZ";
 const INPUT_POLL_MS: u64 = 2;
 const READER_TICK_MS: u64 = 20;
 const RECLAIMED_INTERNAL_HEAP_BYTES: usize = 64 * 1024;
@@ -72,6 +73,13 @@ static PENDING_UI_TICK: AtomicBool = AtomicBool::new(false);
 static PENDING_READER_TICK: AtomicBool = AtomicBool::new(false);
 static DROPPED_UI_TICKS: AtomicU32 = AtomicU32::new(0);
 static DROPPED_READER_TICKS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SdSpiClockConfig {
+    init_hz: u32,
+    run_hz: u32,
+    source: &'static str,
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct TimedEvent {
@@ -129,6 +137,54 @@ async fn app_task(snapshot: BootstrapSnapshot) {
             last_update = next_update;
         }
     }
+}
+
+fn default_sd_spi_clock_config() -> SdSpiClockConfig {
+    SdSpiClockConfig {
+        init_hz: SD_SPI_INIT_HZ,
+        run_hz: SD_SPI_PRODUCT_RUN_HZ,
+        source: "product_default",
+    }
+}
+
+fn resolve_sd_spi_clock_config_from(
+    override_raw: Option<&str>,
+) -> (SdSpiClockConfig, Option<&str>) {
+    match override_raw {
+        Some(raw) => match raw.parse::<u32>().ok().filter(|hz| *hz > 0) {
+            Some(run_hz) => (
+                SdSpiClockConfig {
+                    init_hz: SD_SPI_INIT_HZ,
+                    run_hz,
+                    source: "build_override",
+                },
+                None,
+            ),
+            None => (default_sd_spi_clock_config(), Some(raw)),
+        },
+        None => (default_sd_spi_clock_config(), None),
+    }
+}
+
+fn resolve_sd_spi_clock_config() -> SdSpiClockConfig {
+    let (config, invalid_raw) =
+        resolve_sd_spi_clock_config_from(option_env!("MOTIF_SD_SPI_RUN_HZ"));
+
+    if let Some(raw) = invalid_raw {
+        info!(
+            "sd spi runtime override invalid env={} raw={} defaulting_to={}",
+            SD_SPI_RUN_HZ_OVERRIDE_ENV, raw, SD_SPI_PRODUCT_RUN_HZ
+        );
+    } else if let Some(raw) = option_env!("MOTIF_SD_SPI_RUN_HZ")
+        && config.source == "build_override"
+    {
+        info!(
+            "sd spi runtime override accepted env={} raw={} run_hz={}",
+            SD_SPI_RUN_HZ_OVERRIDE_ENV, raw, config.run_hz
+        );
+    }
+
+    config
 }
 
 fn prioritize_non_tick_event(
@@ -347,8 +403,13 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     log_heap("after heap init");
     log_static_inventory();
     crate::memory_policy::log_policy_inventory();
+    let sd_spi_clock = resolve_sd_spi_clock_config();
     backend::log_static_inventory();
-    content_storage::log_static_inventory();
+    content_storage::log_static_inventory(
+        sd_spi_clock.init_hz,
+        sd_spi_clock.run_hz,
+        sd_spi_clock.source,
+    );
     crate::memtrace!(
         "boot_state",
         "component" = "bootstrap",
@@ -381,7 +442,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         }
     };
     let sd_spi_config = esp_hal::spi::master::Config::default()
-        .with_frequency(Rate::from_hz(SD_SPI_INIT_HZ))
+        .with_frequency(Rate::from_hz(sd_spi_clock.init_hz))
         .with_mode(esp_hal::spi::Mode::_0);
     let sd_spi = Spi::new(peripherals.SPI3, sd_spi_config)
         .unwrap()
@@ -389,7 +450,8 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         .with_mosi(peripherals.GPIO40)
         .with_miso(peripherals.GPIO41);
     let sd_cs = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
-    let content_mount = content_storage::mount(sd_spi, sd_cs, SD_SPI_RUN_HZ);
+    let content_mount =
+        content_storage::mount(sd_spi, sd_cs, sd_spi_clock.run_hz, sd_spi_clock.source);
     let mut storage_health = storage.health_snapshot().with_sd_card(
         content_mount.sd_card_ready,
         content_mount.sd_total_bytes,
@@ -411,6 +473,10 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         "sd_card_ready" = bool_flag(content_mount.sd_card_ready),
         "sd_total_bytes" = content_mount.sd_total_bytes,
         "sd_free_bytes" = content_mount.sd_free_bytes,
+        "sd_spi_init_hz" = sd_spi_clock.init_hz,
+        "sd_spi_run_hz" = content_mount.sd_run_hz,
+        "sd_spi_source" = content_mount.sd_run_hz_source,
+        "sd_spi_speed_switch_ok" = bool_flag(content_mount.sd_speed_switch_ok),
         "last_recovery" = storage_health.last_recovery as u8,
     );
 
@@ -488,7 +554,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         info!("display clear failed: {:?}", err);
     }
 
-    log_gpio_contract(&board);
+    log_gpio_contract(&board, sd_spi_clock);
 
     let mut committed_frame = FrameBuffer::new();
     let mut working_frame = FrameBuffer::new();
@@ -958,7 +1024,7 @@ where
     enter_deep_sleep_with_button(sleep, rtc, wake_button);
 }
 
-fn log_gpio_contract(board: &BoardConfig) {
+fn log_gpio_contract(board: &BoardConfig, sd_spi_clock: SdSpiClockConfig) {
     info!(
         "display gpio clk={} di={} cs={} disp={} emd={}",
         board.display_clk_gpio,
@@ -971,7 +1037,10 @@ fn log_gpio_contract(board: &BoardConfig) {
         "sd gpio cs={} sck={} mosi={} miso={}",
         board.sd_cs_gpio, board.sd_sck_gpio, board.sd_mosi_gpio, board.sd_miso_gpio
     );
-    info!("sd spi hz init={} run={}", SD_SPI_INIT_HZ, SD_SPI_RUN_HZ);
+    info!(
+        "sd spi hz init={} run={} source={}",
+        sd_spi_clock.init_hz, sd_spi_clock.run_hz, sd_spi_clock.source
+    );
     info!(
         "encoder gpio clk={} dt={} sw={}",
         board.encoder_clk_gpio, board.encoder_dt_gpio, board.encoder_sw_gpio
@@ -1096,6 +1165,44 @@ mod tests {
         model.request_sleep();
 
         assert!(next_sleep_deadline(&model, false) <= Instant::now());
+    }
+
+    #[test]
+    fn sd_spi_clock_defaults_to_product_value() {
+        let (config, invalid_raw) = resolve_sd_spi_clock_config_from(None);
+
+        assert_eq!(
+            config,
+            SdSpiClockConfig {
+                init_hz: SD_SPI_INIT_HZ,
+                run_hz: SD_SPI_PRODUCT_RUN_HZ,
+                source: "product_default",
+            }
+        );
+        assert_eq!(invalid_raw, None);
+    }
+
+    #[test]
+    fn sd_spi_clock_accepts_valid_override() {
+        let (config, invalid_raw) = resolve_sd_spi_clock_config_from(Some("12000000"));
+
+        assert_eq!(
+            config,
+            SdSpiClockConfig {
+                init_hz: SD_SPI_INIT_HZ,
+                run_hz: 12_000_000,
+                source: "build_override",
+            }
+        );
+        assert_eq!(invalid_raw, None);
+    }
+
+    #[test]
+    fn sd_spi_clock_rejects_invalid_override() {
+        let (config, invalid_raw) = resolve_sd_spi_clock_config_from(Some("oops"));
+
+        assert_eq!(config, default_sd_spi_clock_config());
+        assert_eq!(invalid_raw, Some("oops"));
     }
 
     #[test]

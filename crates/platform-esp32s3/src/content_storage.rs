@@ -113,6 +113,9 @@ pub struct ContentStorageMount<'d> {
     pub sd_card_ready: bool,
     pub sd_total_bytes: u64,
     pub sd_free_bytes: u64,
+    pub sd_run_hz: u32,
+    pub sd_run_hz_source: &'static str,
+    pub sd_speed_switch_ok: bool,
     pub last_recovery: StorageRecoveryStatus,
 }
 
@@ -474,7 +477,11 @@ struct StorageSpaceMetrics {
     cache_budget_remaining: u64,
 }
 
-pub(crate) fn log_static_inventory() {
+pub(crate) fn log_static_inventory(
+    sd_spi_init_hz: u32,
+    sd_spi_run_hz: u32,
+    sd_spi_run_hz_source: &'static str,
+) {
     crate::memtrace!(
         "static_inventory",
         "component" = "storage",
@@ -495,6 +502,9 @@ pub(crate) fn log_static_inventory() {
         "stage_flush_interval_bytes" = STAGE_FLUSH_INTERVAL_BYTES,
         "package_copy_buffer_len" = PACKAGE_COPY_BUFFER_LEN,
         "package_read_buffer_len" = PACKAGE_READ_BUFFER_LEN,
+        "sd_spi_init_hz" = sd_spi_init_hz,
+        "sd_spi_run_hz" = sd_spi_run_hz,
+        "sd_spi_run_hz_source" = sd_spi_run_hz_source,
         "cache_entry_capacity" = CACHE_ENTRY_CAPACITY,
         "cache_size_budget_bytes" = CACHE_SIZE_BUDGET_BYTES,
         "max_parsed_block_text_bytes" = MAX_PARSED_BLOCK_TEXT_BYTES,
@@ -632,7 +642,12 @@ fn fetch_max(cell: &AtomicUsize, candidate: usize) -> usize {
     current
 }
 
-pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStorageMount<'d> {
+pub fn mount<'d>(
+    spi: SdBus<'d>,
+    cs: Output<'d>,
+    run_spi_hz: u32,
+    run_spi_source: &'static str,
+) -> ContentStorageMount<'d> {
     let device = match ExclusiveDevice::new_no_delay(spi, cs) {
         Ok(device) => device,
         Err(_) => {
@@ -642,6 +657,9 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
                 sd_card_ready: false,
                 sd_total_bytes: 0,
                 sd_free_bytes: 0,
+                sd_run_hz: run_spi_hz,
+                sd_run_hz_source: run_spi_source,
+                sd_speed_switch_ok: false,
                 last_recovery: StorageRecoveryStatus::Failed,
             };
         }
@@ -658,6 +676,9 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
                 sd_card_ready: false,
                 sd_total_bytes: 0,
                 sd_free_bytes: 0,
+                sd_run_hz: run_spi_hz,
+                sd_run_hz_source: run_spi_source,
+                sd_speed_switch_ok: false,
                 last_recovery: StorageRecoveryStatus::Failed,
             };
         }
@@ -665,13 +686,23 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
     let run_spi_config = esp_hal::spi::master::Config::default()
         .with_frequency(Rate::from_hz(run_spi_hz))
         .with_mode(esp_hal::spi::Mode::_0);
-    match card.spi(|device| device.bus_mut().apply_config(&run_spi_config)) {
-        Ok(()) => info!("content storage sd spi run hz={}", run_spi_hz),
-        Err(err) => info!(
-            "content storage sd spi speed switch failed hz={} err={:?}",
-            run_spi_hz, err
-        ),
-    }
+    let sd_speed_switch_ok = match card.spi(|device| device.bus_mut().apply_config(&run_spi_config))
+    {
+        Ok(()) => {
+            info!(
+                "content storage sd spi run hz={} source={}",
+                run_spi_hz, run_spi_source
+            );
+            true
+        }
+        Err(err) => {
+            info!(
+                "content storage sd spi speed switch failed hz={} source={} err={:?}",
+                run_spi_hz, run_spi_source, err
+            );
+            false
+        }
+    };
 
     let volume_mgr = VolumeManager::<_, _, MAX_DIRS, MAX_FILES, MAX_VOLUMES>::new_with_limits(
         card,
@@ -710,6 +741,9 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
                         sd_card_ready: false,
                         sd_total_bytes: total_bytes,
                         sd_free_bytes: 0,
+                        sd_run_hz: run_spi_hz,
+                        sd_run_hz_source: run_spi_source,
+                        sd_speed_switch_ok,
                         last_recovery: StorageRecoveryStatus::Failed,
                     };
                 }
@@ -720,6 +754,9 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
                 sd_card_ready: false,
                 sd_total_bytes: total_bytes,
                 sd_free_bytes: 0,
+                sd_run_hz: run_spi_hz,
+                sd_run_hz_source: run_spi_source,
+                sd_speed_switch_ok,
                 last_recovery: StorageRecoveryStatus::Failed,
             };
         }
@@ -742,6 +779,9 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
                         sd_card_ready: false,
                         sd_total_bytes: total_bytes,
                         sd_free_bytes: 0,
+                        sd_run_hz: run_spi_hz,
+                        sd_run_hz_source: run_spi_source,
+                        sd_speed_switch_ok,
                         last_recovery: StorageRecoveryStatus::Failed,
                     };
                 }
@@ -763,6 +803,9 @@ pub fn mount<'d>(spi: SdBus<'d>, cs: Output<'d>, run_spi_hz: u32) -> ContentStor
         sd_card_ready: true,
         sd_total_bytes: total_bytes,
         sd_free_bytes,
+        sd_run_hz: run_spi_hz,
+        sd_run_hz_source: run_spi_source,
+        sd_speed_switch_ok,
         last_recovery,
     }
 }
