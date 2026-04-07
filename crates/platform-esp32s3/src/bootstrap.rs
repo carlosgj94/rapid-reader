@@ -843,12 +843,21 @@ fn current_prepared_screen(
 
 fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
     prepared_screen_drives_reader_ticks(screen)
+        || prepared_screen_shows_reader_loading(screen)
         || prepared_screen_shows_collection_fetch(screen)
         || prepared_screen_shows_dashboard_sync(screen)
 }
 
 fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
-    matches!(screen, PreparedScreen::Reader(shell) if shell.pause_modal.is_none())
+    matches!(screen, PreparedScreen::Reader(shell) if shell.modal.is_none())
+}
+
+fn prepared_screen_shows_reader_loading(screen: &PreparedScreen) -> bool {
+    matches!(
+        screen,
+        PreparedScreen::Reader(shell)
+            if matches!(shell.modal, Some(app_runtime::components::ReaderModal::Loading(_)))
+    )
 }
 
 fn reader_ticks_are_active(
@@ -1146,12 +1155,12 @@ mod tests {
     use domain::sleep::{SleepConfig, WakeReason};
 
     fn reader_shell(
-        pause_modal: Option<app_runtime::components::PauseModal>,
+        modal: Option<app_runtime::components::ReaderModal>,
     ) -> app_runtime::components::ReaderShell {
         app_runtime::components::ReaderShell {
             appearance: domain::settings::AppearanceMode::Light,
             stage: app_runtime::components::RsvpStage {
-                title: "TEST",
+                title: domain::text::InlineText::from_slice("TEST"),
                 wpm: 260,
                 left_word: domain::text::InlineText::new(),
                 right_word: domain::text::InlineText::new(),
@@ -1160,7 +1169,7 @@ mod tests {
                 progress_width: 0,
             },
             badge: None,
-            pause_modal,
+            modal,
         }
     }
 

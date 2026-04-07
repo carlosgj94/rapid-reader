@@ -3,8 +3,8 @@ use core::{convert::Infallible, fmt::Write};
 use app_runtime::{
     AnimationDescriptor, MotionDirection, PreparedScreen, Screen, ScreenUpdate, TransitionPlan,
     components::{
-        ContentListShell, ContentRow, DashboardShell, ParagraphNavigationShell, PauseModal,
-        ReaderShell, SettingsShell, TopicPreferenceGrid,
+        ContentListShell, ContentRow, DashboardShell, LoadingModal, ParagraphNavigationShell,
+        PauseModal, ReaderModal, ReaderShell, SettingsShell, TopicPreferenceGrid,
     },
 };
 use domain::formatter::StageFont;
@@ -976,12 +976,14 @@ fn draw_collection_loading_spinner(
 fn draw_reader(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
     draw_reader_base(frame, shell, step, total_steps);
 
-    if let Some(modal) = shell.pause_modal {
-        draw_pause_modal(frame, &modal, step, total_steps);
+    if let Some(modal) = shell.modal {
+        draw_reader_modal(frame, &modal, step, total_steps);
     }
 }
 
 fn draw_reader_base(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, total_steps: u8) {
+    let loading_modal_visible = matches!(shell.modal, Some(ReaderModal::Loading(_)));
+
     draw_text_ellipsized(
         frame,
         shell.stage.title.as_str(),
@@ -991,6 +993,10 @@ fn draw_reader_base(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, tota
         Alignment::Left,
         READER_TITLE_MAX_WIDTH_PX,
     );
+
+    if loading_modal_visible {
+        return;
+    }
 
     let stage_ready = step.saturating_mul(2) >= total_steps;
     if stage_ready {
@@ -1049,8 +1055,15 @@ fn draw_reader_base(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, tota
     );
 }
 
-fn draw_pause_modal(frame: &mut FrameBuffer, modal: &PauseModal, step: u8, total_steps: u8) {
-    draw_pause_modal_transition(frame, modal, step, total_steps, true);
+fn draw_reader_modal(frame: &mut FrameBuffer, modal: &ReaderModal, step: u8, total_steps: u8) {
+    match modal {
+        ReaderModal::Pause(modal) => {
+            draw_pause_modal_transition(frame, modal, step, total_steps, true)
+        }
+        ReaderModal::Loading(modal) => {
+            draw_loading_modal_transition(frame, modal, step, total_steps, true)
+        }
+    }
 }
 
 fn draw_reader_modal_transition(
@@ -1063,14 +1076,17 @@ fn draw_reader_modal_transition(
 ) {
     draw_reader_base(frame, to, 1, 1);
 
-    let modal = if revealing {
-        to.pause_modal
-    } else {
-        from.pause_modal
-    };
+    let modal = if revealing { to.modal } else { from.modal };
 
     if let Some(modal) = modal {
-        draw_pause_modal_transition(frame, &modal, step, total_steps, revealing);
+        match modal {
+            ReaderModal::Pause(modal) => {
+                draw_pause_modal_transition(frame, &modal, step, total_steps, revealing)
+            }
+            ReaderModal::Loading(modal) => {
+                draw_loading_modal_transition(frame, &modal, step, total_steps, revealing)
+            }
+        }
     }
 }
 
@@ -1202,6 +1218,112 @@ fn draw_pause_modal_row(
         },
         clip,
     );
+}
+
+fn draw_loading_modal_transition(
+    frame: &mut FrameBuffer,
+    modal: &LoadingModal,
+    step: u8,
+    total_steps: u8,
+    revealing: bool,
+) {
+    let phase = if revealing {
+        step
+    } else {
+        total_steps.saturating_sub(step).saturating_add(1)
+    };
+    let content_phase = if revealing {
+        phase
+    } else {
+        total_steps.saturating_sub(step)
+    };
+
+    if !revealing && content_phase == 0 {
+        return;
+    }
+
+    let width = lerp_u32(
+        PAUSE_MODAL_MIN_WIDTH,
+        PAUSE_MODAL_MAX_WIDTH,
+        phase,
+        total_steps,
+    );
+    let height = lerp_u32(
+        PAUSE_MODAL_MIN_HEIGHT,
+        PAUSE_MODAL_MAX_HEIGHT,
+        phase,
+        total_steps,
+    );
+    let x = PAUSE_MODAL_CENTER_X - (width as i32 / 2);
+    let y = PAUSE_MODAL_CENTER_Y - (height as i32 / 2);
+    let clip = ClipRect {
+        x,
+        y,
+        width: width as i32,
+        height: height as i32,
+    };
+    let content_offset = ((total_steps.saturating_sub(content_phase) as i32)
+        * PAUSE_MODAL_CONTENT_OFFSET_PX)
+        / total_steps.max(1) as i32;
+    let divider_width = lerp_u32(0, width.saturating_sub(32), content_phase, total_steps) as i32;
+    let bar_width = modal.progress_width.min(width.saturating_sub(72) as u16) as i32;
+    let bar_x = PAUSE_MODAL_CENTER_X - ((width as i32 - 72) / 2);
+
+    fill_rect(frame, x, y, width as i32, height as i32, BinaryColor::On);
+    stroke_rect(frame, x, y, width as i32, height as i32, BinaryColor::Off);
+
+    draw_text_ellipsized_clipped(
+        frame,
+        modal.title,
+        ui_font_title(),
+        ClippedTextSpec {
+            position: Point::new(PAUSE_MODAL_CENTER_X, y + 18 + content_offset),
+            color: BinaryColor::Off,
+            alignment: Alignment::Center,
+            max_width_px: width as i32 - 32,
+        },
+        clip,
+    );
+
+    if divider_width > 0 {
+        fill_rect(
+            frame,
+            PAUSE_MODAL_CENTER_X - (divider_width / 2),
+            y + 48,
+            divider_width,
+            1,
+            BinaryColor::Off,
+        );
+    }
+
+    if content_phase >= 1 {
+        draw_text_ellipsized_clipped(
+            frame,
+            modal.detail.as_str(),
+            ui_font_small(),
+            ClippedTextSpec {
+                position: Point::new(PAUSE_MODAL_CENTER_X, y + 72 + content_offset),
+                color: BinaryColor::Off,
+                alignment: Alignment::Center,
+                max_width_px: width as i32 - 40,
+            },
+            clip,
+        );
+    }
+
+    if content_phase >= 2 {
+        stroke_rect(
+            frame,
+            bar_x,
+            y + 102,
+            width as i32 - 72,
+            16,
+            BinaryColor::Off,
+        );
+        if bar_width > 0 {
+            fill_rect(frame, bar_x + 4, y + 106, bar_width, 8, BinaryColor::Off);
+        }
+    }
 }
 
 fn draw_stage_token(frame: &mut FrameBuffer, left: &str, right: &str, font: StageFont) {

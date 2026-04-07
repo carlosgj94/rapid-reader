@@ -95,6 +95,19 @@ pub struct PauseModal {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LoadingModal {
+    pub title: &'static str,
+    pub detail: domain::text::InlineText<24>,
+    pub progress_width: u16,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReaderModal {
+    Pause(PauseModal),
+    Loading(LoadingModal),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RsvpStage {
     pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub wpm: u16,
@@ -110,7 +123,7 @@ pub struct ReaderShell {
     pub appearance: AppearanceMode,
     pub stage: RsvpStage,
     pub badge: Option<ModeBadge>,
-    pub pause_modal: Option<PauseModal>,
+    pub modal: Option<ReaderModal>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -301,22 +314,31 @@ fn compose_reader(model: ReaderScreenModel) -> ReaderShell {
             progress_width: model.progress_width,
         },
         badge: model.show_chat_badge.then_some(ModeBadge { label: "CHAT" }),
-        pause_modal: model.pause_actions.map(|actions| PauseModal {
-            title: "PAUSED",
-            rows: [
-                PauseModalRow {
-                    label: actions[0].label,
-                    action: actions[0].action,
-                },
-                PauseModalRow {
-                    label: actions[1].label,
-                    action: actions[1].action,
-                },
-                PauseModalRow {
-                    label: actions[2].label,
-                    action: actions[2].action,
-                },
-            ],
+        modal: model.modal.map(|modal| match modal {
+            domain::selectors::ReaderModalModel::Pause(actions) => ReaderModal::Pause(PauseModal {
+                title: "PAUSED",
+                rows: [
+                    PauseModalRow {
+                        label: actions[0].label,
+                        action: actions[0].action,
+                    },
+                    PauseModalRow {
+                        label: actions[1].label,
+                        action: actions[1].action,
+                    },
+                    PauseModalRow {
+                        label: actions[2].label,
+                        action: actions[2].action,
+                    },
+                ],
+            }),
+            domain::selectors::ReaderModalModel::Loading(loading) => {
+                ReaderModal::Loading(LoadingModal {
+                    title: loading.phase,
+                    detail: loading.detail,
+                    progress_width: loading.progress_width,
+                })
+            }
         }),
     }
 }

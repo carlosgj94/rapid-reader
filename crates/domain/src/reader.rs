@@ -3,7 +3,10 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use crate::{
-    content::{ArticleId, CONTENT_ID_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind},
+    content::{
+        ArticleId, CONTENT_ID_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
+        PrepareContentProgress,
+    },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, ReadingDocument, ReadingUnit},
     settings::{DEFAULT_READING_SPEED_WPM, MIN_READING_SPEED_WPM, READING_SPEED_STEP_WPM},
     text::InlineText,
@@ -27,6 +30,7 @@ pub enum ReaderMode {
     Chat,
     Paused,
     ParagraphNavigation,
+    LoadingContent,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -82,6 +86,7 @@ pub struct ReaderSession {
     pub effective_wpm: u16,
     speed_ramp_start_wpm: u16,
     speed_ramp_started_at_ms: u64,
+    prepare_progress: PrepareContentProgress,
 }
 
 impl ReaderWindow {
@@ -141,7 +146,38 @@ impl ReaderSession {
             effective_wpm: DEFAULT_READING_SPEED_WPM,
             speed_ramp_start_wpm: 0,
             speed_ramp_started_at_ms: SPEED_RAMP_IDLE_AT_MS,
+            prepare_progress: PrepareContentProgress::connecting(),
         }
+    }
+
+    pub fn begin_content_loading(
+        &mut self,
+        collection: CollectionKind,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    ) {
+        self.active_collection = collection;
+        self.active_content_id = content_id;
+        self.title = title;
+        self.active_window = None;
+        self.prefetched_window = None;
+        self.paragraphs = None;
+        self.total_units = 0;
+        self.pending_window_start_unit_index = None;
+        self.pending_seek_unit_index = None;
+        self.progress = ReaderProgress {
+            unit_index: 0,
+            paragraph_index: 1,
+            total_paragraphs: 1,
+            completion_percent: 0,
+        };
+        self.mode = ReaderMode::LoadingContent;
+        self.resume_mode = ReaderMode::Normal;
+        self.chat_available = false;
+        self.next_due_at_ms = None;
+        self.prepare_progress = PrepareContentProgress::connecting();
+        self.clear_speed_ramp();
+        self.effective_wpm = DEFAULT_READING_SPEED_WPM;
     }
 
     pub fn open_article(
@@ -215,6 +251,7 @@ impl ReaderSession {
         self.resume_mode = ReaderMode::Normal;
         self.chat_available = chat_available;
         self.next_due_at_ms = None;
+        self.prepare_progress = PrepareContentProgress::connecting();
         self.arm_speed_ramp(target_wpm);
     }
 
@@ -265,6 +302,7 @@ impl ReaderSession {
         self.next_due_at_ms = None;
         self.clear_speed_ramp();
         self.effective_wpm = DEFAULT_READING_SPEED_WPM;
+        self.prepare_progress = PrepareContentProgress::connecting();
     }
 
     pub fn clear_pending_window_request(&mut self) {
@@ -460,6 +498,16 @@ impl ReaderSession {
             target_wpm
         } else {
             quantize_display_wpm(self.effective_wpm, target_wpm)
+        }
+    }
+
+    pub const fn prepare_progress(&self) -> PrepareContentProgress {
+        self.prepare_progress
+    }
+
+    pub fn update_prepare_progress(&mut self, progress: PrepareContentProgress) {
+        if matches!(self.mode, ReaderMode::LoadingContent) {
+            self.prepare_progress = progress;
         }
     }
 

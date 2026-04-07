@@ -105,15 +105,13 @@ fn plan_transition(
             Screen::Reader,
             PreparedScreen::Reader(old),
             PreparedScreen::Reader(new),
-        ) if old.pause_modal.is_none() && new.pause_modal.is_some() => {
-            T::new(A::ModalReveal, 3, 55)
-        }
+        ) if old.modal.is_none() && new.modal.is_some() => T::new(A::ModalReveal, 3, 55),
         (
             Screen::Reader,
             Screen::Reader,
             PreparedScreen::Reader(old),
             PreparedScreen::Reader(new),
-        ) if old.pause_modal.is_some() && new.pause_modal.is_none() => T::new(A::ModalHide, 3, 55),
+        ) if old.modal.is_some() && new.modal.is_none() => T::new(A::ModalHide, 3, 55),
         (
             Screen::ParagraphNavigation,
             Screen::ParagraphNavigation,

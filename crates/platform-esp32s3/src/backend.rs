@@ -49,8 +49,8 @@ use domain::{
     content::{
         CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestItem,
         CollectionManifestState, DetailLocator, MANIFEST_ITEM_CAPACITY, PackageState,
-        PrepareContentRequest, RECOMMENDATION_SERVE_ID_MAX_BYTES, REMOTE_ITEM_ID_MAX_BYTES,
-        RemoteContentStatus,
+        PrepareContentPhase, PrepareContentProgress, PrepareContentRequest,
+        RECOMMENDATION_SERVE_ID_MAX_BYTES, REMOTE_ITEM_ID_MAX_BYTES, RemoteContentStatus,
     },
     runtime::Event,
     text::InlineText,
@@ -107,6 +107,10 @@ const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
 const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN;
 const PACKAGE_STORAGE_HANDOFF_CHUNK_LEN: usize =
     transfer_tuning::PACKAGE_TRANSFER_STORAGE_HANDOFF_CHUNK_LEN;
+const PREPARE_PROGRESS_DOWNLOAD_STEP_BYTES: usize = 24 * 1024;
+const PREPARE_PROGRESS_MIN_DOWNLOAD_STEPS: u16 = 3;
+const PREPARE_PROGRESS_MAX_DOWNLOAD_STEPS: u16 = 8;
+const PREPARE_PROGRESS_FIXED_STEPS: u16 = 3;
 // Package prefetch materially increases boot-time latency and was timing out on
 // real device/package responses. Keep startup focused on refresh + manifest sync.
 const STARTUP_SAVED_PREFETCH_ENABLED: bool = false;
@@ -515,6 +519,86 @@ struct HttpResponseMetadata {
 struct StreamingHttpResponse {
     status: u16,
     connection_reusable: bool,
+    prepare_progress: Option<PrepareProgressState>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PrepareProgressState {
+    download_steps: u16,
+    total_steps: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrepareProgressReporter {
+    content_id: InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>,
+    download_steps: u16,
+    total_steps: u16,
+    last_progress: PrepareContentProgress,
+}
+
+impl PrepareProgressReporter {
+    fn new(content_id: InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>) -> Self {
+        Self {
+            content_id,
+            download_steps: PREPARE_PROGRESS_MIN_DOWNLOAD_STEPS,
+            total_steps: PREPARE_PROGRESS_MIN_DOWNLOAD_STEPS + PREPARE_PROGRESS_FIXED_STEPS,
+            last_progress: PrepareContentProgress::connecting(),
+        }
+    }
+
+    fn begin_download(&mut self, total_bytes: Option<usize>) {
+        if let Some(total_bytes) = total_bytes {
+            self.download_steps = prepare_download_step_count(total_bytes);
+            self.total_steps = self.download_steps + PREPARE_PROGRESS_FIXED_STEPS;
+        }
+
+        self.publish(PrepareContentProgress {
+            phase: PrepareContentPhase::Downloading,
+            completed_steps: 1,
+            total_steps: self.total_steps,
+        });
+    }
+
+    fn publish_download_progress(&mut self, received_bytes: usize, total_bytes: Option<usize>) {
+        let completed_download_steps = match total_bytes {
+            Some(total_bytes) if total_bytes > 0 => {
+                let scaled = ((received_bytes as u64 * self.download_steps as u64)
+                    / total_bytes as u64) as u16;
+                if received_bytes > 0 { scaled.max(1) } else { 0 }
+            }
+            _ => ((received_bytes / PREPARE_PROGRESS_DOWNLOAD_STEP_BYTES) as u16)
+                .min(self.download_steps)
+                .max(u16::from(received_bytes > 0)),
+        };
+
+        self.publish(PrepareContentProgress {
+            phase: PrepareContentPhase::Downloading,
+            completed_steps: 1 + completed_download_steps.min(self.download_steps),
+            total_steps: self.total_steps,
+        });
+    }
+
+    fn publish(&mut self, progress: PrepareContentProgress) {
+        if progress == self.last_progress {
+            return;
+        }
+
+        self.last_progress = progress;
+        publish_event(
+            Event::ContentPrepareProgress {
+                content_id: self.content_id,
+                progress,
+            },
+            now_ms(),
+        );
+    }
+
+    const fn state(&self) -> PrepareProgressState {
+        PrepareProgressState {
+            download_steps: self.download_steps,
+            total_steps: self.total_steps,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3891,7 +3975,7 @@ async fn fetch_and_stage_package<'a>(
         .await
         .map_err(map_storage_prepare_error)?;
 
-        let status = match stream_https_response_body_to_storage_reusing_session(
+        let response = match stream_https_response_body_to_storage_reusing_session(
             stack,
             tls,
             ca_chain,
@@ -3908,10 +3992,11 @@ async fn fetch_and_stage_package<'a>(
                 body: b"",
                 connection_close: false,
             },
+            Some(request.content_id),
         )
         .await
         {
-            Ok(status) => status,
+            Ok(response) => response,
             Err(err)
                 if is_transient_transport_error(err)
                     && attempt + 1 < PACKAGE_TRANSPORT_RETRY_ATTEMPTS =>
@@ -3934,19 +4019,32 @@ async fn fetch_and_stage_package<'a>(
             }
         };
 
-        if status == 409 {
+        if response.status == 409 {
             let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::PendingRemote);
         }
-        if (400..500).contains(&status) {
+        if (400..500).contains(&response.status) {
             let _ = content_storage::abort_package_stage_traced(request_trace).await;
-            return Err(PackagePrepareError::Rejected(status));
+            return Err(PackagePrepareError::Rejected(response.status));
         }
-        if status != 200 {
+        if response.status != 200 {
             let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
         }
 
+        if let Some(progress_state) = response.prepare_progress {
+            publish_event(
+                Event::ContentPrepareProgress {
+                    content_id: request.content_id,
+                    progress: PrepareContentProgress {
+                        phase: PrepareContentPhase::Caching,
+                        completed_steps: 1 + progress_state.download_steps,
+                        total_steps: progress_state.total_steps,
+                    },
+                },
+                now_ms(),
+            );
+        }
         let result = content_storage::commit_package_stage_and_open_cached_reader_package_traced(
             request_trace,
             request.collection,
@@ -3955,6 +4053,19 @@ async fn fetch_and_stage_package<'a>(
         )
         .await
         .map_err(map_storage_prepare_error)?;
+        if let Some(progress_state) = response.prepare_progress {
+            publish_event(
+                Event::ContentPrepareProgress {
+                    content_id: request.content_id,
+                    progress: PrepareContentProgress {
+                        phase: PrepareContentPhase::Opening,
+                        completed_steps: 2 + progress_state.download_steps,
+                        total_steps: progress_state.total_steps,
+                    },
+                },
+                now_ms(),
+            );
+        }
 
         if manifest_item_state(&result.snapshot, &request.remote_item_id)
             == Some(PackageState::PendingRemote)
@@ -3985,7 +4096,7 @@ where
     .await
     .map_err(map_storage_prepare_error)?;
 
-    let status = match stream_https_response_body_to_storage_over_session(
+    let response = match stream_https_response_body_to_storage_over_session(
         session,
         HttpRequest {
             trace: request_trace,
@@ -3997,25 +4108,26 @@ where
             body: b"",
             connection_close: false,
         },
+        None,
     )
     .await
     {
-        Ok(status) => status,
+        Ok(response) => response,
         Err(err) => {
             let _ = content_storage::abort_package_stage_traced(request_trace).await;
             return Err(PackagePrepareError::Other(err));
         }
     };
 
-    if status == 409 {
+    if response.status == 409 {
         let _ = content_storage::abort_package_stage_traced(request_trace).await;
         return Err(PackagePrepareError::PendingRemote);
     }
-    if (400..500).contains(&status) {
+    if (400..500).contains(&response.status) {
         let _ = content_storage::abort_package_stage_traced(request_trace).await;
-        return Err(PackagePrepareError::Rejected(status));
+        return Err(PackagePrepareError::Rejected(response.status));
     }
-    if status != 200 {
+    if response.status != 200 {
         let _ = content_storage::abort_package_stage_traced(request_trace).await;
         return Err(PackagePrepareError::Other(BackendError::InvalidResponse));
     }
@@ -4042,7 +4154,8 @@ async fn stream_https_response_body_to_storage(
     tcp_state: &BackendTcpClientState,
     tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
-) -> Result<u16, BackendError> {
+    prepare_progress_content_id: Option<InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>>,
+) -> Result<StreamingHttpResponse, BackendError> {
     let mut header_buffer = allocate_stream_header_buffer(request.path)?;
     let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     let mut tcp_client = TcpClient::new(stack, tcp_state);
@@ -4083,6 +4196,7 @@ async fn stream_https_response_body_to_storage(
         &mut metrics,
         header_buffer.as_mut_slice(),
         chunk_buffer.as_mut_slice(),
+        prepare_progress_content_id,
     )
     .await;
     close_backend_tls_session(&mut session, "stream request").await;
@@ -4091,7 +4205,7 @@ async fn stream_https_response_body_to_storage(
         Ok(response) => {
             metrics.finish();
             log_request_timing(request, response.status, &metrics);
-            Ok(response.status)
+            Ok(response)
         }
         Err(err) => {
             log_request_heap(request.path, "stream failed");
@@ -4100,6 +4214,7 @@ async fn stream_https_response_body_to_storage(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_https_response_body_to_storage_reusing_session<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
@@ -4108,7 +4223,8 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
     tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
-) -> Result<u16, BackendError> {
+    prepare_progress_content_id: Option<InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>>,
+) -> Result<StreamingHttpResponse, BackendError> {
     let first_attempt = stream_https_response_body_to_storage_reusing_session_once(
         stack,
         tls,
@@ -4117,6 +4233,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
         reusable_session,
         tls_session_cache,
         request,
+        prepare_progress_content_id,
     )
     .await;
     match first_attempt {
@@ -4135,6 +4252,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
                 reusable_session,
                 tls_session_cache,
                 request,
+                prepare_progress_content_id,
             )
             .await
         }
@@ -4142,6 +4260,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
@@ -4150,7 +4269,8 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
     reusable_session: &mut Option<ReusableBackendSession<'a>>,
     tls_session_cache: &mut Option<SerializedClientSession>,
     request: HttpRequest<'_>,
-) -> Result<u16, BackendError> {
+    prepare_progress_content_id: Option<InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>>,
+) -> Result<StreamingHttpResponse, BackendError> {
     let mut header_buffer = allocate_stream_header_buffer(request.path)?;
     let mut chunk_buffer = allocate_stream_chunk_buffer(request.path)?;
     let metrics = ensure_reusable_session(
@@ -4177,6 +4297,7 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
                 metrics,
                 header_buffer.as_mut_slice(),
                 chunk_buffer.as_mut_slice(),
+                prepare_progress_content_id,
             )
             .await
         }
@@ -4184,13 +4305,14 @@ async fn stream_https_response_body_to_storage_reusing_session_once<'a>(
     };
 
     update_reusable_session_after_streaming_request(reusable_session, request, &response).await;
-    response.map(|response| response.status)
+    response
 }
 
 async fn stream_https_response_body_to_storage_over_session<T>(
     session: &mut Session<'_, T>,
     request: HttpRequest<'_>,
-) -> Result<u16, BackendError>
+    prepare_progress_content_id: Option<InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>>,
+) -> Result<StreamingHttpResponse, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
 {
@@ -4202,9 +4324,9 @@ where
         RequestMetrics::new(request.trace, true, request.class),
         header_buffer.as_mut_slice(),
         chunk_buffer.as_mut_slice(),
+        prepare_progress_content_id,
     )
     .await
-    .map(|response| response.status)
 }
 
 async fn stream_https_response_body_to_storage_over_session_with_metrics<T>(
@@ -4213,6 +4335,7 @@ async fn stream_https_response_body_to_storage_over_session_with_metrics<T>(
     mut metrics: RequestMetrics,
     header: &mut [u8],
     chunk: &mut [u8],
+    prepare_progress_content_id: Option<InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>>,
 ) -> Result<StreamingHttpResponse, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -4243,6 +4366,7 @@ where
         &mut metrics,
         header,
         chunk,
+        prepare_progress_content_id,
     )
     .await;
     match response {
@@ -4265,6 +4389,7 @@ async fn read_streaming_http_response_to_storage<T>(
     metrics: &mut RequestMetrics,
     header: &mut [u8],
     chunk: &mut [u8],
+    prepare_progress_content_id: Option<InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>>,
 ) -> Result<StreamingHttpResponse, BackendError>
 where
     T: AsyncRead07 + AsyncWrite07,
@@ -4273,6 +4398,7 @@ where
     let mut streamed_body_bytes = 0usize;
     let mut buffered_chunk_len = 0usize;
     let mut next_progress_log = STREAM_PROGRESS_LOG_INTERVAL_BYTES;
+    let mut prepare_progress = prepare_progress_content_id.map(PrepareProgressReporter::new);
     metrics.stream_header_capacity = header.len();
     metrics.stream_header_headroom = header.len();
 
@@ -4344,11 +4470,17 @@ where
             return Ok(StreamingHttpResponse {
                 status: metadata.status,
                 connection_reusable: false,
+                prepare_progress: prepare_progress
+                    .as_ref()
+                    .map(PrepareProgressReporter::state),
             });
         }
 
         match metadata.content_length {
             Some(content_length) => {
+                if let Some(progress) = prepare_progress.as_mut() {
+                    progress.begin_download(Some(content_length));
+                }
                 if initial_body_len > content_length {
                     return Err(BackendError::InvalidResponse);
                 }
@@ -4377,6 +4509,10 @@ where
                         Some(content_length),
                         metrics.elapsed_ms(),
                     );
+                    if let Some(progress) = prepare_progress.as_mut() {
+                        progress
+                            .publish_download_progress(streamed_body_bytes, Some(content_length));
+                    }
                 }
 
                 let mut remaining = content_length - initial_body_len;
@@ -4407,6 +4543,10 @@ where
                         Some(content_length),
                         metrics.elapsed_ms(),
                     );
+                    if let Some(progress) = prepare_progress.as_mut() {
+                        progress
+                            .publish_download_progress(streamed_body_bytes, Some(content_length));
+                    }
                     drain_buffered_package_chunks(
                         metrics.trace,
                         chunk,
@@ -4427,9 +4567,15 @@ where
                 return Ok(StreamingHttpResponse {
                     status: 200,
                     connection_reusable: response_reusable,
+                    prepare_progress: prepare_progress
+                        .as_ref()
+                        .map(PrepareProgressReporter::state),
                 });
             }
             None if connection_close => {
+                if let Some(progress) = prepare_progress.as_mut() {
+                    progress.begin_download(None);
+                }
                 metrics.header_bytes = metadata.body_start;
                 metrics.stream_header_headroom = header.len().saturating_sub(header_len);
                 if initial_body_len > 0 {
@@ -4451,6 +4597,9 @@ where
                         None,
                         metrics.elapsed_ms(),
                     );
+                    if let Some(progress) = prepare_progress.as_mut() {
+                        progress.publish_download_progress(streamed_body_bytes, None);
+                    }
                 }
                 break;
             }
@@ -4492,6 +4641,9 @@ where
             None,
             metrics.elapsed_ms(),
         );
+        if let Some(progress) = prepare_progress.as_mut() {
+            progress.publish_download_progress(streamed_body_bytes, None);
+        }
         drain_buffered_package_chunks(
             metrics.trace,
             chunk,
@@ -4515,6 +4667,9 @@ where
     Ok(StreamingHttpResponse {
         status: 200,
         connection_reusable: false,
+        prepare_progress: prepare_progress
+            .as_ref()
+            .map(PrepareProgressReporter::state),
     })
 }
 
@@ -5673,6 +5828,17 @@ fn log_stream_progress_if_needed(
 
     while received_bytes >= *next_progress_log {
         *next_progress_log = next_progress_log.saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
+    }
+}
+
+const fn prepare_download_step_count(total_bytes: usize) -> u16 {
+    let raw_steps = total_bytes.div_ceil(PREPARE_PROGRESS_DOWNLOAD_STEP_BYTES) as u16;
+    if raw_steps < PREPARE_PROGRESS_MIN_DOWNLOAD_STEPS {
+        PREPARE_PROGRESS_MIN_DOWNLOAD_STEPS
+    } else if raw_steps > PREPARE_PROGRESS_MAX_DOWNLOAD_STEPS {
+        PREPARE_PROGRESS_MAX_DOWNLOAD_STEPS
+    } else {
+        raw_steps
     }
 }
 

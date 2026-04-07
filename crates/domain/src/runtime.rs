@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use crate::{
     content::{
         CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestState, PackageState,
-        PrepareContentRequest, REMOTE_ITEM_ID_MAX_BYTES,
+        PrepareContentProgress, PrepareContentRequest, REMOTE_ITEM_ID_MAX_BYTES,
     },
     device::DeviceState,
     input::InputGesture,
@@ -83,6 +83,10 @@ pub enum Event {
         collection: CollectionKind,
         remote_item_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
         package_state: PackageState,
+    },
+    ContentPrepareProgress {
+        content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
+        progress: PrepareContentProgress,
     },
     UiTick(u64),
     ReaderTick(u64),

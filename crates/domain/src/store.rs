@@ -31,6 +31,8 @@ pub type DispatchResult = Result<Effect, DispatchError>;
 struct PendingPrepare {
     request: PrepareContentRequest,
     previous_state: PackageState,
+    auto_open_reader: bool,
+    dispatched: bool,
 }
 
 #[derive(Debug)]
@@ -111,7 +113,7 @@ impl Store {
             }
             Event::NetworkStatusChanged(status) => {
                 self.network.status = status;
-                if let Some(request) = self.take_pending_prepare_if_dispatchable() {
+                if let Some(request) = self.dispatchable_pending_prepare_request() {
                     return Ok(Effect::PrepareContent(request));
                 }
             }
@@ -119,13 +121,17 @@ impl Store {
                 self.backend_sync.set_status(status);
                 if matches!(status, SyncStatus::AuthFailed | SyncStatus::Disabled) {
                     self.restore_pending_prepare();
-                } else if let Some(request) = self.take_pending_prepare_if_dispatchable() {
+                } else if let Some(request) = self.dispatchable_pending_prepare_request() {
                     return Ok(Effect::PrepareContent(request));
                 }
             }
             Event::CollectionContentUpdated(kind, mut collection) => {
                 if let Some(pending) = self.pending_prepare
                     && pending.request.collection == kind
+                    && collection_package_state_for_remote_item(
+                        &collection,
+                        &pending.request.remote_item_id,
+                    ) != Some(PackageState::Cached)
                 {
                     let _ = collection.update_package_state(
                         &pending.request.remote_item_id,
@@ -153,14 +159,27 @@ impl Store {
                 paragraphs,
                 window,
             } => {
-                self.open_cached_content(
-                    collection,
-                    content_id,
-                    title,
-                    total_units,
-                    paragraphs,
-                    window,
-                );
+                let should_open = self.pending_prepare.as_ref().is_some_and(|pending| {
+                    pending.request.collection == collection
+                        && pending.request.content_id == content_id
+                        && pending.auto_open_reader
+                });
+
+                if should_open {
+                    self.open_cached_content(
+                        collection,
+                        content_id,
+                        title,
+                        total_units,
+                        paragraphs,
+                        window,
+                    );
+                } else if self.pending_prepare.as_ref().is_some_and(|pending| {
+                    pending.request.collection == collection
+                        && pending.request.content_id == content_id
+                }) {
+                    self.pending_prepare = None;
+                }
             }
             Event::ContentPackageStateChanged {
                 collection,
@@ -178,7 +197,25 @@ impl Store {
                             && pending.request.remote_item_id == remote_item_id
                     })
                 {
+                    if matches!(self.reader.mode, crate::reader::ReaderMode::LoadingContent)
+                        && self
+                            .pending_prepare
+                            .is_some_and(|pending| pending.auto_open_reader)
+                    {
+                        self.ui.route = UiRoute::Collection(collection);
+                        self.reader.unload_document();
+                    }
                     self.pending_prepare = None;
+                }
+            }
+            Event::ContentPrepareProgress {
+                content_id,
+                progress,
+            } => {
+                if self.pending_prepare.as_ref().is_some_and(|pending| {
+                    pending.request.content_id == content_id && pending.auto_open_reader
+                }) {
+                    self.reader.update_prepare_progress(progress);
                 }
             }
             Event::UiTick(tick_ms) => {
@@ -349,9 +386,6 @@ impl Store {
                     &request.remote_item_id,
                     PackageState::Fetching,
                 );
-                if self.can_dispatch_prepare_now() {
-                    return Effect::PrepareContent(request);
-                }
                 if matches!(
                     self.backend_sync.status,
                     SyncStatus::AuthFailed | SyncStatus::Disabled
@@ -366,10 +400,19 @@ impl Store {
                         CollectionConfirmIgnoredReason::BackendUnavailable,
                     );
                 }
+                let dispatch_now = self.can_dispatch_prepare_now();
                 self.pending_prepare = Some(PendingPrepare {
                     request,
                     previous_state: item.package_state,
+                    auto_open_reader: true,
+                    dispatched: dispatch_now,
                 });
+                self.reader
+                    .begin_content_loading(kind, request.content_id, item.title);
+                self.ui.route = UiRoute::Reader;
+                if dispatch_now {
+                    return Effect::PrepareContent(request);
+                }
                 return Effect::Noop;
             }
             UiCommand::Back => {
@@ -399,11 +442,18 @@ impl Store {
             && self.network.status == NetworkStatus::Online
     }
 
-    fn take_pending_prepare_if_dispatchable(&mut self) -> Option<PrepareContentRequest> {
-        if self.can_dispatch_prepare_now() {
-            return self.pending_prepare.take().map(|pending| pending.request);
+    fn dispatchable_pending_prepare_request(&mut self) -> Option<PrepareContentRequest> {
+        if !self.can_dispatch_prepare_now() {
+            return None;
         }
-        None
+
+        let pending = self.pending_prepare.as_mut()?;
+        if pending.dispatched {
+            return None;
+        }
+
+        pending.dispatched = true;
+        Some(pending.request)
     }
 
     fn restore_pending_prepare(&mut self) {
@@ -413,6 +463,13 @@ impl Store {
                 &pending.request.remote_item_id,
                 pending.previous_state,
             );
+            if pending.auto_open_reader
+                && matches!(self.reader.mode, crate::reader::ReaderMode::LoadingContent)
+                && self.reader.active_content_id == pending.request.content_id
+            {
+                self.ui.route = UiRoute::Collection(pending.request.collection);
+                self.reader.unload_document();
+            }
         }
     }
 
@@ -499,6 +556,19 @@ impl Store {
                 }
                 UiCommand::Back => self.reader.close_paragraph_navigation(),
                 UiCommand::Noop => {}
+            },
+            crate::reader::ReaderMode::LoadingContent => match command {
+                UiCommand::Back => {
+                    if let Some(pending) = self.pending_prepare.as_mut() {
+                        pending.auto_open_reader = false;
+                    }
+                    self.ui.route = UiRoute::Collection(self.reader.active_collection);
+                    self.reader.unload_document();
+                }
+                UiCommand::FocusPrevious
+                | UiCommand::FocusNext
+                | UiCommand::Confirm
+                | UiCommand::Noop => {}
             },
         }
 
@@ -636,6 +706,21 @@ const fn ignored_reason_for_manifest_item(
             CollectionConfirmIgnoredReason::NotReady
         }
     }
+}
+
+fn collection_package_state_for_remote_item(
+    collection: &crate::content::CollectionManifestState,
+    remote_item_id: &crate::text::InlineText<{ crate::content::REMOTE_ITEM_ID_MAX_BYTES }>,
+) -> Option<PackageState> {
+    let mut index = 0usize;
+    while index < collection.len() {
+        if collection.items[index].remote_item_id == *remote_item_id {
+            return Some(collection.items[index].package_state);
+        }
+        index += 1;
+    }
+
+    None
 }
 
 #[cfg(test)]

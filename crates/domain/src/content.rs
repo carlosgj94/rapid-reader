@@ -442,6 +442,63 @@ impl PrepareContentRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum PrepareContentPhase {
+    #[default]
+    Connecting,
+    Downloading,
+    Caching,
+    Opening,
+}
+
+impl PrepareContentPhase {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connecting => "CONNECTING",
+            Self::Downloading => "DOWNLOADING",
+            Self::Caching => "CACHING",
+            Self::Opening => "OPENING",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PrepareContentProgress {
+    pub phase: PrepareContentPhase,
+    pub completed_steps: u16,
+    pub total_steps: u16,
+}
+
+impl PrepareContentProgress {
+    pub const fn connecting() -> Self {
+        Self {
+            phase: PrepareContentPhase::Connecting,
+            completed_steps: 0,
+            total_steps: 4,
+        }
+    }
+
+    pub const fn progress_width_px(self, max_width_px: u16) -> u16 {
+        if self.total_steps == 0 {
+            return 0;
+        }
+
+        let completed_steps = if self.completed_steps > self.total_steps {
+            self.total_steps
+        } else {
+            self.completed_steps
+        };
+
+        ((max_width_px as u32 * completed_steps as u32) / self.total_steps as u32) as u16
+    }
+}
+
+impl Default for PrepareContentProgress {
+    fn default() -> Self {
+        Self::connecting()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ArticleDocument {
     pub source: SourceKind,
