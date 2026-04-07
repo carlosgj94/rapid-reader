@@ -222,6 +222,11 @@ impl Store {
                 if matches!(self.ui.route, UiRoute::Dashboard | UiRoute::Collection(_)) {
                     self.backend_sync.advance_spinner();
                 }
+                if matches!(self.ui.route, UiRoute::Reader)
+                    && matches!(self.reader.mode, crate::reader::ReaderMode::LoadingContent)
+                {
+                    self.reader.advance_prepare_animation();
+                }
                 if matches!(self.settings.refresh_state, RefreshState::Refreshing) {
                     let started = self.settings.refresh_started_at_ms.unwrap_or(tick_ms);
                     if tick_ms.saturating_sub(started) >= REFRESH_LOADING_DURATION_MS {

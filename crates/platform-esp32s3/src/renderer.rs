@@ -1266,7 +1266,9 @@ fn draw_loading_modal_transition(
         * PAUSE_MODAL_CONTENT_OFFSET_PX)
         / total_steps.max(1) as i32;
     let divider_width = lerp_u32(0, width.saturating_sub(32), content_phase, total_steps) as i32;
-    let bar_width = modal.progress_width.min(width.saturating_sub(72) as u16) as i32;
+    let track_width = width.saturating_sub(72) as i32;
+    let track_inner_width = track_width.saturating_sub(8);
+    let bar_width = modal.progress_width.min(track_inner_width as u16) as i32;
     let bar_x = PAUSE_MODAL_CENTER_X - ((width as i32 - 72) / 2);
 
     fill_rect(frame, x, y, width as i32, height as i32, BinaryColor::On);
@@ -1297,32 +1299,71 @@ fn draw_loading_modal_transition(
     }
 
     if content_phase >= 1 {
-        draw_text_ellipsized_clipped(
-            frame,
-            modal.detail.as_str(),
-            ui_font_small(),
-            ClippedTextSpec {
-                position: Point::new(PAUSE_MODAL_CENTER_X, y + 72 + content_offset),
-                color: BinaryColor::Off,
-                alignment: Alignment::Center,
-                max_width_px: width as i32 - 40,
-            },
-            clip,
-        );
-    }
-
-    if content_phase >= 2 {
         stroke_rect(
             frame,
             bar_x,
-            y + 102,
-            width as i32 - 72,
+            y + 82 + content_offset,
+            track_width,
             16,
             BinaryColor::Off,
         );
         if bar_width > 0 {
-            fill_rect(frame, bar_x + 4, y + 106, bar_width, 8, BinaryColor::Off);
+            draw_barberpole_fill(
+                frame,
+                bar_x + 4,
+                y + 86 + content_offset,
+                bar_width,
+                8,
+                modal.stripe_phase,
+                clip,
+            );
         }
+    }
+}
+
+fn draw_barberpole_fill(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    stripe_phase: u8,
+    clip: ClipRect,
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let fill_clip = ClipRect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let clipped = intersect_clip_rects(clip, fill_clip);
+    fill_rect_clipped(frame, x, y, width, height, BinaryColor::Off, clipped);
+
+    let stripe_spacing = 10;
+    let stripe_width = 3;
+    let phase_offset = ((stripe_phase % 8) as i32) * 2;
+    let mut stripe_origin = -height - phase_offset;
+    while stripe_origin < width + height {
+        let mut offset = 0;
+        while offset < height + stripe_width {
+            let stripe_x = x + stripe_origin + offset;
+            let stripe_y = y + height - 1 - offset;
+            fill_rect_clipped(
+                frame,
+                stripe_x,
+                stripe_y,
+                stripe_width,
+                1,
+                BinaryColor::On,
+                clipped,
+            );
+            offset += 1;
+        }
+        stripe_origin += stripe_spacing;
     }
 }
 
@@ -2231,6 +2272,24 @@ fn fill_rect_clipped(
     }
 
     fill_rect(frame, left, top, right - left, bottom - top, color);
+}
+
+fn intersect_clip_rects(a: ClipRect, b: ClipRect) -> Option<ClipRect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+
+    if right <= left || bottom <= top {
+        return None;
+    }
+
+    Some(ClipRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
 }
 
 fn stroke_rect(

@@ -97,8 +97,8 @@ pub struct PauseModal {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct LoadingModal {
     pub title: &'static str,
-    pub detail: domain::text::InlineText<24>,
     pub progress_width: u16,
+    pub stripe_phase: u8,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -334,9 +334,9 @@ fn compose_reader(model: ReaderScreenModel) -> ReaderShell {
             }),
             domain::selectors::ReaderModalModel::Loading(loading) => {
                 ReaderModal::Loading(LoadingModal {
-                    title: loading.phase,
-                    detail: loading.detail,
+                    title: "LOADING",
                     progress_width: loading.progress_width,
+                    stripe_phase: loading.stripe_phase,
                 })
             }
         }),

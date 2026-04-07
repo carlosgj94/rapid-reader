@@ -887,6 +887,10 @@ fn prepared_screen_shows_dashboard_sync(screen: &PreparedScreen) -> bool {
 fn prepared_screen_drives_ui_ticks(screen: &PreparedScreen) -> bool {
     match screen {
         PreparedScreen::Dashboard(_) => true,
+        PreparedScreen::Reader(shell) => matches!(
+            shell.modal,
+            Some(app_runtime::components::ReaderModal::Loading(_))
+        ),
         PreparedScreen::Settings(shell) => {
             matches!(shell.mode, domain::ui::SettingsMode::RefreshLoading)
         }

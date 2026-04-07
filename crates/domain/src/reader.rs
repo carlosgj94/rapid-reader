@@ -20,6 +20,9 @@ const SPEED_RAMP_START_NUMERATOR: u16 = 2;
 const SPEED_RAMP_START_DENOMINATOR: u16 = 3;
 const SPEED_RAMP_IDLE_AT_MS: u64 = u64::MAX;
 const SPEED_RAMP_PENDING_AT_MS: u64 = u64::MAX - 1;
+const PREPARE_PROGRESS_PERMILLE_MAX: u16 = 1_000;
+const PREPARE_PROGRESS_ANIMATION_MIN_STEP_PERMILLE: u16 = 28;
+const PREPARE_PROGRESS_STRIPE_PHASES: u8 = 8;
 
 const EMPTY_READER_WINDOW: ReaderWindow = ReaderWindow::empty();
 
@@ -87,6 +90,8 @@ pub struct ReaderSession {
     speed_ramp_start_wpm: u16,
     speed_ramp_started_at_ms: u64,
     prepare_progress: PrepareContentProgress,
+    prepare_display_progress_permille: u16,
+    prepare_stripe_phase: u8,
 }
 
 impl ReaderWindow {
@@ -147,6 +152,8 @@ impl ReaderSession {
             speed_ramp_start_wpm: 0,
             speed_ramp_started_at_ms: SPEED_RAMP_IDLE_AT_MS,
             prepare_progress: PrepareContentProgress::connecting(),
+            prepare_display_progress_permille: 0,
+            prepare_stripe_phase: 0,
         }
     }
 
@@ -176,6 +183,8 @@ impl ReaderSession {
         self.chat_available = false;
         self.next_due_at_ms = None;
         self.prepare_progress = PrepareContentProgress::connecting();
+        self.prepare_display_progress_permille = 0;
+        self.prepare_stripe_phase = 0;
         self.clear_speed_ramp();
         self.effective_wpm = DEFAULT_READING_SPEED_WPM;
     }
@@ -252,6 +261,8 @@ impl ReaderSession {
         self.chat_available = chat_available;
         self.next_due_at_ms = None;
         self.prepare_progress = PrepareContentProgress::connecting();
+        self.prepare_display_progress_permille = 0;
+        self.prepare_stripe_phase = 0;
         self.arm_speed_ramp(target_wpm);
     }
 
@@ -303,6 +314,8 @@ impl ReaderSession {
         self.clear_speed_ramp();
         self.effective_wpm = DEFAULT_READING_SPEED_WPM;
         self.prepare_progress = PrepareContentProgress::connecting();
+        self.prepare_display_progress_permille = 0;
+        self.prepare_stripe_phase = 0;
     }
 
     pub fn clear_pending_window_request(&mut self) {
@@ -508,7 +521,50 @@ impl ReaderSession {
     pub fn update_prepare_progress(&mut self, progress: PrepareContentProgress) {
         if matches!(self.mode, ReaderMode::LoadingContent) {
             self.prepare_progress = progress;
+            let target = prepare_progress_permille(progress);
+            if target < self.prepare_display_progress_permille {
+                self.prepare_display_progress_permille = target;
+            }
         }
+    }
+
+    pub fn advance_prepare_animation(&mut self) {
+        if !matches!(self.mode, ReaderMode::LoadingContent) {
+            self.prepare_display_progress_permille =
+                prepare_progress_permille(self.prepare_progress);
+            self.prepare_stripe_phase = 0;
+            return;
+        }
+
+        self.prepare_stripe_phase =
+            (self.prepare_stripe_phase + 1) % PREPARE_PROGRESS_STRIPE_PHASES.max(1);
+
+        let target = prepare_progress_permille(self.prepare_progress);
+        if self.prepare_display_progress_permille >= target {
+            self.prepare_display_progress_permille = target;
+            return;
+        }
+
+        let delta = target.saturating_sub(self.prepare_display_progress_permille);
+        let eased_step = delta / 3;
+        let step = if eased_step > PREPARE_PROGRESS_ANIMATION_MIN_STEP_PERMILLE {
+            eased_step
+        } else {
+            PREPARE_PROGRESS_ANIMATION_MIN_STEP_PERMILLE
+        };
+        self.prepare_display_progress_permille = self
+            .prepare_display_progress_permille
+            .saturating_add(step)
+            .min(target);
+    }
+
+    pub const fn prepare_display_progress_width_px(&self, max_width_px: u16) -> u16 {
+        ((max_width_px as u32 * self.prepare_display_progress_permille as u32)
+            / PREPARE_PROGRESS_PERMILLE_MAX as u32) as u16
+    }
+
+    pub const fn prepare_stripe_phase(&self) -> u8 {
+        self.prepare_stripe_phase
     }
 
     pub fn current_unit(&self) -> &ReadingUnit {
@@ -836,6 +892,21 @@ const fn quantize_display_wpm(wpm: u16, target_wpm: u16) -> u16 {
     } else {
         target_wpm
     }
+}
+
+const fn prepare_progress_permille(progress: PrepareContentProgress) -> u16 {
+    if progress.total_steps == 0 {
+        return 0;
+    }
+
+    let completed_steps = if progress.completed_steps > progress.total_steps {
+        progress.total_steps
+    } else {
+        progress.completed_steps
+    };
+
+    ((completed_steps as u32 * PREPARE_PROGRESS_PERMILLE_MAX as u32) / progress.total_steps as u32)
+        as u16
 }
 
 impl Default for ReaderSession {

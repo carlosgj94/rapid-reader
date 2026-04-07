@@ -1,7 +1,7 @@
 use crate::{
     content::{
         CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestItem,
-        CollectionManifestState, ContentState, PackageState, PrepareContentProgress,
+        CollectionManifestState, ContentState, PackageState,
     },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     network::NetworkStatus,
@@ -73,9 +73,8 @@ pub struct PauseActionModel {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ReaderLoadingModel {
-    pub phase: &'static str,
-    pub detail: InlineText<24>,
     pub progress_width: u16,
+    pub stripe_phase: u8,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -270,43 +269,16 @@ fn reader_modal_model(store: &Store) -> Option<ReaderModalModel> {
                 action: "ADJUST RSVP SPEED",
             },
         ])),
-        ReaderMode::LoadingContent => Some(ReaderModalModel::Loading(loading_modal_model(
-            store.reader.prepare_progress(),
-        ))),
+        ReaderMode::LoadingContent => Some(ReaderModalModel::Loading(loading_modal_model(store))),
         _ => None,
     }
 }
 
-fn loading_modal_model(progress: PrepareContentProgress) -> ReaderLoadingModel {
+fn loading_modal_model(store: &Store) -> ReaderLoadingModel {
     ReaderLoadingModel {
-        phase: progress.phase.label(),
-        detail: prepare_detail_label(progress),
-        progress_width: progress.progress_width_px(214),
+        progress_width: store.reader.prepare_display_progress_width_px(214),
+        stripe_phase: store.reader.prepare_stripe_phase(),
     }
-}
-
-fn prepare_detail_label(progress: PrepareContentProgress) -> InlineText<24> {
-    let mut detail = InlineText::new();
-    let current_step = if progress.total_steps == 0 {
-        0
-    } else {
-        progress
-            .completed_steps
-            .saturating_add(1)
-            .min(progress.total_steps)
-    };
-    let _ = detail.try_push_str("STEP ");
-    push_u16(&mut detail, current_step);
-    let _ = detail.try_push_str(" OF ");
-    push_u16(&mut detail, progress.total_steps);
-    detail
-}
-
-fn push_u16<const N: usize>(target: &mut InlineText<N>, value: u16) {
-    if value >= 10 {
-        push_u16(target, value / 10);
-    }
-    let _ = target.try_push_char(char::from(b'0' + (value % 10) as u8));
 }
 
 pub fn select_paragraph_navigation(store: &Store) -> ParagraphNavigationModel {
