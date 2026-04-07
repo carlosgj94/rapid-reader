@@ -240,6 +240,7 @@ impl Store {
             paragraphs,
             window,
             false,
+            self.settings.reading_speed_wpm,
         );
         self.ui.route = UiRoute::Reader;
     }
@@ -443,12 +444,18 @@ impl Store {
         match self.reader.mode {
             crate::reader::ReaderMode::Normal | crate::reader::ReaderMode::Chat => match command {
                 UiCommand::FocusPrevious => {
-                    if let Some(request) = self.reader.jump_live_previous_paragraph() {
+                    if let Some(request) = self
+                        .reader
+                        .jump_live_previous_paragraph(self.settings.reading_speed_wpm)
+                    {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
                 UiCommand::FocusNext => {
-                    if let Some(request) = self.reader.jump_live_next_paragraph() {
+                    if let Some(request) = self
+                        .reader
+                        .jump_live_next_paragraph(self.settings.reading_speed_wpm)
+                    {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
@@ -472,7 +479,7 @@ impl Store {
                     return self.persist_settings_effect();
                 }
                 UiCommand::Confirm => {
-                    self.reader.resume();
+                    self.reader.resume(self.settings.reading_speed_wpm);
                 }
                 UiCommand::Back => {
                     self.reader.open_paragraph_navigation();
@@ -483,7 +490,10 @@ impl Store {
                 UiCommand::FocusPrevious => self.reader.move_paragraph(true),
                 UiCommand::FocusNext => self.reader.move_paragraph(false),
                 UiCommand::Confirm => {
-                    if let Some(request) = self.reader.commit_paragraph_navigation() {
+                    if let Some(request) = self
+                        .reader
+                        .commit_paragraph_navigation(self.settings.reading_speed_wpm)
+                    {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
@@ -1132,6 +1142,7 @@ mod tests {
     #[test]
     fn paused_reader_confirm_resumes_live_session() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         store.ui.route = UiRoute::Reader;
         store.reader.pause();
 
@@ -1141,6 +1152,10 @@ mod tests {
             store.reader.mode,
             crate::reader::ReaderMode::Normal
         ));
+        assert!(
+            store.reader.display_wpm(store.settings.reading_speed_wpm)
+                < store.settings.reading_speed_wpm
+        );
     }
 
     #[test]
@@ -1160,6 +1175,7 @@ mod tests {
     #[test]
     fn reader_back_unloads_document_before_returning_to_collection() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         let article = store.content().article_at(CollectionKind::Saved, 0);
         let document = format_article_document(&article_document_from_script(
             article.source,
@@ -1171,6 +1187,7 @@ mod tests {
             crate::text::InlineText::from_slice(article.reader_title),
             alloc::boxed::Box::new(document),
             article.has_chat,
+            store.settings.reading_speed_wpm,
         );
         store.ui.route = UiRoute::Reader;
 
@@ -1199,6 +1216,7 @@ mod tests {
     #[test]
     fn reader_tick_advances_live_rsvp_session() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         let article = store.content().article_at(CollectionKind::Inbox, 0);
         let document = format_article_document(&article_document_from_script(
             article.source,
@@ -1210,6 +1228,7 @@ mod tests {
             crate::text::InlineText::from_slice(article.reader_title),
             alloc::boxed::Box::new(document),
             article.has_chat,
+            store.settings.reading_speed_wpm,
         );
         store.ui.route = UiRoute::Reader;
         let before = store.reader.progress.unit_index;
@@ -1224,6 +1243,7 @@ mod tests {
     #[test]
     fn active_reader_tick_keeps_sleep_awake() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         let article = store.content().article_at(CollectionKind::Inbox, 0);
         let document = format_article_document(&article_document_from_script(
             article.source,
@@ -1235,6 +1255,7 @@ mod tests {
             crate::text::InlineText::from_slice(article.reader_title),
             alloc::boxed::Box::new(document),
             article.has_chat,
+            store.settings.reading_speed_wpm,
         );
         store.ui.route = UiRoute::Reader;
         store.sleep.last_activity_ms = 10;
@@ -1247,6 +1268,7 @@ mod tests {
     #[test]
     fn paused_reader_tick_does_not_refresh_sleep_timer() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         let article = store.content().article_at(CollectionKind::Inbox, 0);
         let document = format_article_document(&article_document_from_script(
             article.source,
@@ -1258,6 +1280,7 @@ mod tests {
             crate::text::InlineText::from_slice(article.reader_title),
             alloc::boxed::Box::new(document),
             article.has_chat,
+            store.settings.reading_speed_wpm,
         );
         store.ui.route = UiRoute::Reader;
         store.reader.pause();
@@ -1271,6 +1294,7 @@ mod tests {
     #[test]
     fn live_reader_scroll_back_jumps_to_current_paragraph_start() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
@@ -1306,11 +1330,16 @@ mod tests {
         assert_eq!(store.reader.progress.unit_index, 10);
         assert_eq!(store.reader.progress.paragraph_index, 2);
         assert_eq!(store.reader.next_due_at_ms, None);
+        assert!(
+            store.reader.display_wpm(store.settings.reading_speed_wpm)
+                < store.settings.reading_speed_wpm
+        );
     }
 
     #[test]
     fn live_reader_scroll_forward_requests_reader_window_for_next_paragraph() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
@@ -1340,6 +1369,10 @@ mod tests {
             })
         );
         assert_eq!(store.reader.progress.unit_index, 0);
+        assert!(
+            store.reader.display_wpm(store.settings.reading_speed_wpm)
+                < store.settings.reading_speed_wpm
+        );
     }
 
     #[test]

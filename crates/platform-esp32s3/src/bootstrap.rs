@@ -459,7 +459,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         .with_mosi(peripherals.GPIO40)
         .with_miso(peripherals.GPIO41);
     let sd_cs = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
-    let content_mount =
+    let mut content_mount =
         content_storage::mount(sd_spi, sd_cs, sd_spi_clock.run_hz, sd_spi_clock.source);
     let mut storage_health = storage.health_snapshot().with_sd_card(
         content_mount.sd_card_ready,
@@ -496,7 +496,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         BootState::ColdBoot
     };
     let bootstrap_content =
-        content_storage::bootstrap_content_state(content_mount.storage.as_deref());
+        content_storage::bootstrap_content_state(content_mount.storage.as_deref_mut());
     let snapshot = BootstrapSnapshot::new(
         DeviceState {
             pairing: backend::initial_pairing_state(backend_credential),
@@ -619,9 +619,7 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
                             }
                         }
                         Either::Second(_) => {
-                            if current_prepared_screen(animation, committed_update)
-                                .is_some_and(|screen| prepared_screen_drives_reader_ticks(&screen))
-                            {
+                            if reader_ticks_are_active(animation, committed_update) {
                                 publish_event(Event::ReaderTick(now_ms), now_ms);
                             }
                         }
@@ -851,6 +849,17 @@ fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
 
 fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
     matches!(screen, PreparedScreen::Reader(shell) if shell.pause_modal.is_none())
+}
+
+fn reader_ticks_are_active(
+    animation: Option<AnimationPlayback>,
+    committed_update: Option<ScreenUpdate>,
+) -> bool {
+    if animation.is_some() {
+        return false;
+    }
+
+    committed_update.is_some_and(|update| prepared_screen_drives_reader_ticks(&update.prepared))
 }
 
 fn prepared_screen_shows_collection_fetch(screen: &PreparedScreen) -> bool {
@@ -1136,6 +1145,25 @@ mod tests {
     use super::*;
     use domain::sleep::{SleepConfig, WakeReason};
 
+    fn reader_shell(
+        pause_modal: Option<app_runtime::components::PauseModal>,
+    ) -> app_runtime::components::ReaderShell {
+        app_runtime::components::ReaderShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            stage: app_runtime::components::RsvpStage {
+                title: "TEST",
+                wpm: 260,
+                left_word: domain::text::InlineText::new(),
+                right_word: domain::text::InlineText::new(),
+                preview: domain::text::InlineText::new(),
+                font: domain::formatter::StageFont::Large,
+                progress_width: 0,
+            },
+            badge: None,
+            pause_modal,
+        }
+    }
+
     fn dashboard_shell(
         sync_indicator: Option<app_runtime::components::SyncIndicator>,
     ) -> app_runtime::components::DashboardShell {
@@ -1238,39 +1266,15 @@ mod tests {
 
     #[test]
     fn prepared_reader_without_modal_suppresses_sleep() {
-        let screen = PreparedScreen::Reader(app_runtime::components::ReaderShell {
-            appearance: domain::settings::AppearanceMode::Light,
-            stage: app_runtime::components::RsvpStage {
-                title: "TEST",
-                wpm: 260,
-                left_word: domain::text::InlineText::new(),
-                right_word: domain::text::InlineText::new(),
-                preview: domain::text::InlineText::new(),
-                font: domain::formatter::StageFont::Large,
-                progress_width: 0,
-            },
-            badge: None,
-            pause_modal: None,
-        });
+        let screen = PreparedScreen::Reader(reader_shell(None));
 
         assert!(prepared_screen_suppresses_sleep(&screen));
     }
 
     #[test]
     fn paused_reader_does_not_suppress_sleep() {
-        let screen = PreparedScreen::Reader(app_runtime::components::ReaderShell {
-            appearance: domain::settings::AppearanceMode::Light,
-            stage: app_runtime::components::RsvpStage {
-                title: "TEST",
-                wpm: 260,
-                left_word: domain::text::InlineText::new(),
-                right_word: domain::text::InlineText::new(),
-                preview: domain::text::InlineText::new(),
-                font: domain::formatter::StageFont::Large,
-                progress_width: 0,
-            },
-            badge: None,
-            pause_modal: Some(app_runtime::components::PauseModal {
+        let screen =
+            PreparedScreen::Reader(reader_shell(Some(app_runtime::components::PauseModal {
                 title: "PAUSED",
                 rows: [
                     app_runtime::components::PauseModalRow {
@@ -1286,10 +1290,109 @@ mod tests {
                         action: "C",
                     },
                 ],
-            }),
-        });
+            })));
 
         assert!(!prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn committed_reader_without_animation_drives_reader_ticks() {
+        let committed = ScreenUpdate {
+            screen: Screen::Reader,
+            prepared: PreparedScreen::Reader(reader_shell(None)),
+            transition: TransitionPlan::none(),
+        };
+
+        assert!(reader_ticks_are_active(None, Some(committed)));
+    }
+
+    #[test]
+    fn reader_enter_animation_blocks_reader_ticks_until_commit() {
+        let committed = ScreenUpdate {
+            screen: Screen::Saved,
+            prepared: PreparedScreen::Collection(app_runtime::components::ContentListShell {
+                appearance: domain::settings::AppearanceMode::Light,
+                status: app_runtime::components::StatusCluster {
+                    battery_percent: 82,
+                    wifi_online: true,
+                },
+                rail: app_runtime::components::VerticalRail { text: "SAVED" },
+                large_rail: true,
+                rows: [
+                    app_runtime::components::ContentRow {
+                        meta: "A",
+                        title: "A",
+                        loading_phase: None,
+                        selected: false,
+                    },
+                    app_runtime::components::ContentRow {
+                        meta: "B",
+                        title: "B",
+                        loading_phase: None,
+                        selected: true,
+                    },
+                    app_runtime::components::ContentRow {
+                        meta: "C",
+                        title: "C",
+                        loading_phase: None,
+                        selected: false,
+                    },
+                ],
+                band: app_runtime::components::SelectionBand { y: 106, height: 68 },
+                help: app_runtime::components::HelpHint { text: "BACK" },
+            }),
+            transition: TransitionPlan::none(),
+        };
+        let animation = AnimationPlayback::new(
+            committed.prepared,
+            ScreenUpdate {
+                screen: Screen::Reader,
+                prepared: PreparedScreen::Reader(reader_shell(None)),
+                transition: TransitionPlan::new(
+                    app_runtime::AnimationDescriptor::ReaderEnter,
+                    3,
+                    50,
+                ),
+            },
+        );
+
+        assert!(!reader_ticks_are_active(Some(animation), Some(committed)));
+    }
+
+    #[test]
+    fn modal_hide_animation_blocks_reader_ticks_until_commit() {
+        let paused = reader_shell(Some(app_runtime::components::PauseModal {
+            title: "PAUSED",
+            rows: [
+                app_runtime::components::PauseModalRow {
+                    label: "A",
+                    action: "A",
+                },
+                app_runtime::components::PauseModalRow {
+                    label: "B",
+                    action: "B",
+                },
+                app_runtime::components::PauseModalRow {
+                    label: "C",
+                    action: "C",
+                },
+            ],
+        }));
+        let committed = ScreenUpdate {
+            screen: Screen::Reader,
+            prepared: PreparedScreen::Reader(paused),
+            transition: TransitionPlan::none(),
+        };
+        let animation = AnimationPlayback::new(
+            committed.prepared,
+            ScreenUpdate {
+                screen: Screen::Reader,
+                prepared: PreparedScreen::Reader(reader_shell(None)),
+                transition: TransitionPlan::new(app_runtime::AnimationDescriptor::ModalHide, 3, 55),
+            },
+        );
+
+        assert!(!reader_ticks_are_active(Some(animation), Some(committed)));
     }
 
     #[test]

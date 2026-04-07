@@ -845,16 +845,17 @@ pub fn install(spawner: Spawner, storage: Option<Box<SdContentStorage<'static>>>
 }
 
 pub(crate) fn bootstrap_content_state(
-    storage: Option<&SdContentStorage<'_>>,
+    storage: Option<&mut SdContentStorage<'_>>,
 ) -> Option<Box<ContentState>> {
-    let saved = storage
-        .and_then(|storage| storage.snapshots[collection_index(CollectionKind::Saved)].as_deref())
-        .copied()
-        .filter(|snapshot| !snapshot.is_empty())?;
+    let (saved, source) = storage?.bootstrap_saved_snapshot();
+    if saved.is_empty() {
+        return None;
+    }
 
     info!(
-        "content storage bootstrap saved snapshot item_count={}",
-        saved.len()
+        "content storage bootstrap saved snapshot item_count={} source={}",
+        saved.len(),
+        source,
     );
 
     Some(Box::new(ContentState {
@@ -1450,6 +1451,23 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
 }
 
 impl<'d> SdContentStorage<'d> {
+    fn bootstrap_saved_snapshot(&mut self) -> (CollectionManifestState, &'static str) {
+        if let Some(saved) = self.snapshots[collection_index(CollectionKind::Saved)]
+            .as_deref()
+            .copied()
+            .filter(|snapshot| !snapshot.is_empty())
+        {
+            return (saved, "manifest_snapshot");
+        }
+
+        let rebuilt = self.rebuild_saved_snapshot_from_cache();
+        if rebuilt.is_empty() {
+            (rebuilt, "none")
+        } else {
+            (rebuilt, "cache_index")
+        }
+    }
+
     fn snapshot(&self, kind: CollectionKind) -> CollectionManifestState {
         self.snapshots[collection_index(kind)]
             .as_deref()
@@ -1469,6 +1487,22 @@ impl<'d> SdContentStorage<'d> {
         } else {
             Some(Box::new(snapshot))
         };
+    }
+
+    fn rebuild_saved_snapshot_from_cache(&mut self) -> CollectionManifestState {
+        let entries = saved_cache_entries_for_bootstrap(&self.cache_index);
+        let mut snapshot = CollectionManifestState::empty();
+
+        for entry in entries {
+            let Ok(title) = self.read_cached_package_title(entry) else {
+                continue;
+            };
+            if !snapshot.try_push(minimal_saved_manifest_item(entry, title)) {
+                break;
+            }
+        }
+
+        snapshot
     }
 
     fn initialize_layout(&mut self) -> Result<(), StorageError> {
@@ -2184,6 +2218,37 @@ impl<'d> SdContentStorage<'d> {
         }
 
         Ok(opened)
+    }
+
+    fn read_cached_package_title(
+        &mut self,
+        entry: CacheEntry,
+    ) -> Result<InlineText<CONTENT_TITLE_MAX_BYTES>, StorageError> {
+        let meta = self.read_package_meta(entry.slot_id)?;
+        if meta.remote_revision != entry.remote_revision {
+            return Err(StorageError::CorruptData);
+        }
+
+        let volume = self
+            .volume_mgr
+            .open_volume(VolumeIdx(0))
+            .map_err(map_sd_error)?;
+        let root = volume.open_root_dir().map_err(map_sd_error)?;
+        let motif = root.open_dir(ROOT_DIR_NAME).map_err(map_sd_error)?;
+        let v1 = motif.open_dir(VERSION_DIR_NAME).map_err(map_sd_error)?;
+        let pkg_dir = v1.open_dir(PACKAGE_DIR_NAME).map_err(map_sd_error)?;
+        let mut file = pkg_dir
+            .open_file_in_dir(
+                package_payload_file_name(entry.slot_id).as_str(),
+                Mode::ReadOnly,
+            )
+            .map_err(map_sd_error)?;
+        if file.length() != meta.size_bytes {
+            return Err(StorageError::CorruptData);
+        }
+
+        let header = read_reader_package_header(&mut file)?;
+        read_reader_package_title(&mut file, header)
     }
 
     fn load_reader_window(
@@ -2981,6 +3046,44 @@ fn manifest_file_name(kind: CollectionKind) -> &'static str {
         CollectionKind::Inbox => INBOX_MANIFEST_FILE_NAME,
         CollectionKind::Recommendations => RECOMMENDATION_MANIFEST_FILE_NAME,
     }
+}
+
+fn saved_cache_entries_for_bootstrap(cache_index: &CacheIndex) -> Vec<CacheEntry> {
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < cache_index.len() {
+        let entry = cache_index.entries[index];
+        if !entry.is_empty() && entry.collection_flags & collection_flag(CollectionKind::Saved) != 0
+        {
+            entries.push(entry);
+        }
+        index += 1;
+    }
+
+    entries.sort_unstable_by(|left, right| {
+        right
+            .last_touch_seq
+            .cmp(&left.last_touch_seq)
+            .then(left.slot_id.cmp(&right.slot_id))
+    });
+    entries.truncate(MANIFEST_ITEM_CAPACITY);
+    entries
+}
+
+fn minimal_saved_manifest_item(
+    entry: CacheEntry,
+    title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+) -> CollectionManifestItem {
+    let mut item = CollectionManifestItem::empty();
+    item.remote_item_id.set_truncated(entry.content_id.as_str());
+    item.content_id = entry.content_id;
+    item.detail_locator = DetailLocator::Content;
+    item.meta.set_truncated("ON DEVICE");
+    item.title = title;
+    item.remote_revision = entry.remote_revision;
+    item.remote_status = RemoteContentStatus::Ready;
+    item.package_state = PackageState::Cached;
+    item
 }
 
 fn package_payload_file_name(slot_id: u8) -> heapless::String<12> {
@@ -4456,6 +4559,78 @@ mod tests {
         let decoded = decode_cache_index(&encoded[..encoded_len]).unwrap();
 
         assert_eq!(decoded, index);
+    }
+
+    #[test]
+    fn bootstrap_saved_cache_entries_prefer_recent_saved_items() {
+        let mut index = CacheIndex::empty();
+        let mut saved_older_id = InlineText::new();
+        saved_older_id.set_truncated("saved-older");
+        let mut saved_newer_id = InlineText::new();
+        saved_newer_id.set_truncated("saved-newer");
+        let mut inbox_id = InlineText::new();
+        inbox_id.set_truncated("inbox");
+
+        index.entries[0] = CacheEntry {
+            slot_id: 1,
+            content_id: saved_older_id,
+            remote_revision: 1,
+            size_bytes: 1,
+            crc32: 1,
+            last_touch_seq: 2,
+            collection_flags: collection_flag(CollectionKind::Saved),
+        };
+        index.entries[1] = CacheEntry {
+            slot_id: 2,
+            content_id: inbox_id,
+            remote_revision: 1,
+            size_bytes: 1,
+            crc32: 1,
+            last_touch_seq: 9,
+            collection_flags: collection_flag(CollectionKind::Inbox),
+        };
+        index.entries[2] = CacheEntry {
+            slot_id: 3,
+            content_id: saved_newer_id,
+            remote_revision: 1,
+            size_bytes: 1,
+            crc32: 1,
+            last_touch_seq: 7,
+            collection_flags: collection_flag(CollectionKind::Saved),
+        };
+        index.len = 3;
+
+        let entries = saved_cache_entries_for_bootstrap(&index);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content_id.as_str(), "saved-newer");
+        assert_eq!(entries[1].content_id.as_str(), "saved-older");
+    }
+
+    #[test]
+    fn minimal_saved_manifest_item_is_cached_and_content_addressable() {
+        let mut content_id = InlineText::new();
+        content_id.set_truncated("content-42");
+        let title = InlineText::from_slice("Cached title");
+        let item = minimal_saved_manifest_item(
+            CacheEntry {
+                slot_id: 1,
+                content_id,
+                remote_revision: 42,
+                size_bytes: 2048,
+                crc32: 7,
+                last_touch_seq: 3,
+                collection_flags: collection_flag(CollectionKind::Saved),
+            },
+            title,
+        );
+
+        assert_eq!(item.remote_item_id.as_str(), "content-42");
+        assert_eq!(item.content_id.as_str(), "content-42");
+        assert_eq!(item.detail_locator, DetailLocator::Content);
+        assert_eq!(item.package_state, PackageState::Cached);
+        assert_eq!(item.remote_status, RemoteContentStatus::Ready);
+        assert_eq!(item.title.as_str(), "Cached title");
     }
 
     #[test]

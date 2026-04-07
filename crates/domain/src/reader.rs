@@ -5,12 +5,18 @@ use alloc::boxed::Box;
 use crate::{
     content::{ArticleId, CONTENT_ID_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind},
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, ReadingDocument, ReadingUnit},
+    settings::{DEFAULT_READING_SPEED_WPM, MIN_READING_SPEED_WPM, READING_SPEED_STEP_WPM},
     text::InlineText,
 };
 
 pub const READER_WINDOW_MAX_UNITS: usize = 128;
 const READER_WINDOW_OVERLAP_UNITS: u32 = 32;
 const READER_WINDOW_PREFETCH_THRESHOLD_UNITS: u32 = 24;
+const SPEED_RAMP_DURATION_MS: u64 = 10_000;
+const SPEED_RAMP_START_NUMERATOR: u16 = 2;
+const SPEED_RAMP_START_DENOMINATOR: u16 = 3;
+const SPEED_RAMP_IDLE_AT_MS: u64 = u64::MAX;
+const SPEED_RAMP_PENDING_AT_MS: u64 = u64::MAX - 1;
 
 const EMPTY_READER_WINDOW: ReaderWindow = ReaderWindow::empty();
 
@@ -73,6 +79,9 @@ pub struct ReaderSession {
     pub resume_mode: ReaderMode,
     pub chat_available: bool,
     pub next_due_at_ms: Option<u64>,
+    pub effective_wpm: u16,
+    speed_ramp_start_wpm: u16,
+    speed_ramp_started_at_ms: u64,
 }
 
 impl ReaderWindow {
@@ -129,6 +138,9 @@ impl ReaderSession {
             resume_mode: ReaderMode::Normal,
             chat_available: true,
             next_due_at_ms: None,
+            effective_wpm: DEFAULT_READING_SPEED_WPM,
+            speed_ramp_start_wpm: 0,
+            speed_ramp_started_at_ms: SPEED_RAMP_IDLE_AT_MS,
         }
     }
 
@@ -139,6 +151,7 @@ impl ReaderSession {
         title: InlineText<CONTENT_TITLE_MAX_BYTES>,
         document: Box<ReadingDocument>,
         chat_available: bool,
+        target_wpm: u16,
     ) {
         let paragraph_count = document.paragraph_count as usize;
         let mut paragraphs = alloc::vec::Vec::with_capacity(paragraph_count);
@@ -169,6 +182,7 @@ impl ReaderSession {
             paragraphs.into_boxed_slice(),
             window,
             chat_available,
+            target_wpm,
         );
     }
 
@@ -183,6 +197,7 @@ impl ReaderSession {
         paragraphs: Box<[ReaderParagraphInfo]>,
         window: Box<ReaderWindow>,
         chat_available: bool,
+        target_wpm: u16,
     ) {
         self.active_collection = collection;
         self.active_article = article;
@@ -200,6 +215,7 @@ impl ReaderSession {
         self.resume_mode = ReaderMode::Normal;
         self.chat_available = chat_available;
         self.next_due_at_ms = None;
+        self.arm_speed_ramp(target_wpm);
     }
 
     pub fn apply_loaded_window(&mut self, window: Box<ReaderWindow>) {
@@ -247,13 +263,19 @@ impl ReaderSession {
         self.mode = ReaderMode::Normal;
         self.resume_mode = ReaderMode::Normal;
         self.next_due_at_ms = None;
+        self.clear_speed_ramp();
+        self.effective_wpm = DEFAULT_READING_SPEED_WPM;
     }
 
     pub fn clear_pending_window_request(&mut self) {
+        let had_pending_seek = self.pending_seek_unit_index.is_some();
         self.pending_window_start_unit_index = None;
         self.pending_seek_unit_index = None;
         self.prefetched_window = None;
         self.next_due_at_ms = None;
+        if had_pending_seek {
+            self.clear_speed_ramp();
+        }
     }
 
     pub fn show_normal(&mut self) {
@@ -275,13 +297,15 @@ impl ReaderSession {
             self.resume_mode = self.mode;
             self.mode = ReaderMode::Paused;
             self.next_due_at_ms = None;
+            self.clear_speed_ramp();
         }
     }
 
-    pub fn resume(&mut self) {
+    pub fn resume(&mut self, target_wpm: u16) {
         if matches!(self.mode, ReaderMode::Paused) {
             self.mode = self.resume_mode;
             self.next_due_at_ms = None;
+            self.arm_speed_ramp(target_wpm);
         }
     }
 
@@ -298,13 +322,19 @@ impl ReaderSession {
         }
     }
 
-    pub fn commit_paragraph_navigation(&mut self) -> Option<ReaderWindowLoadRequest> {
+    pub fn commit_paragraph_navigation(
+        &mut self,
+        target_wpm: u16,
+    ) -> Option<ReaderWindowLoadRequest> {
         if !matches!(self.mode, ReaderMode::ParagraphNavigation) {
             return None;
         }
 
         self.mode = self.resume_mode;
-        self.seek_to_unit(self.paragraph_start(self.progress.paragraph_index))
+        self.seek_to_unit(
+            self.paragraph_start(self.progress.paragraph_index),
+            target_wpm,
+        )
     }
 
     pub fn move_paragraph(&mut self, previous: bool) {
@@ -324,31 +354,40 @@ impl ReaderSession {
         };
     }
 
-    pub fn jump_live_previous_paragraph(&mut self) -> Option<ReaderWindowLoadRequest> {
+    pub fn jump_live_previous_paragraph(
+        &mut self,
+        target_wpm: u16,
+    ) -> Option<ReaderWindowLoadRequest> {
         if !self.is_active_reading() {
             return None;
         }
 
         let current_start = self.paragraph_start(self.progress.paragraph_index);
         if self.progress.unit_index > current_start {
-            return self.seek_to_unit(current_start);
+            return self.seek_to_unit(current_start, target_wpm);
         }
 
         if self.progress.paragraph_index > 1 {
-            return self.seek_to_unit(self.paragraph_start(self.progress.paragraph_index - 1));
+            return self.seek_to_unit(
+                self.paragraph_start(self.progress.paragraph_index - 1),
+                target_wpm,
+            );
         }
 
         None
     }
 
-    pub fn jump_live_next_paragraph(&mut self) -> Option<ReaderWindowLoadRequest> {
+    pub fn jump_live_next_paragraph(&mut self, target_wpm: u16) -> Option<ReaderWindowLoadRequest> {
         if !self.is_active_reading()
             || self.progress.paragraph_index >= self.progress.total_paragraphs.max(1)
         {
             return None;
         }
 
-        self.seek_to_unit(self.paragraph_start(self.progress.paragraph_index + 1))
+        self.seek_to_unit(
+            self.paragraph_start(self.progress.paragraph_index + 1),
+            target_wpm,
+        )
     }
 
     pub const fn is_active_reading(&self) -> bool {
@@ -361,10 +400,15 @@ impl ReaderSession {
             return outcome;
         }
 
+        if self.pending_seek_unit_index.is_some() {
+            return outcome;
+        }
+
+        self.refresh_effective_wpm(now_ms, wpm);
         let current = self.current_unit();
         let next_due = self
             .next_due_at_ms
-            .unwrap_or_else(|| now_ms.saturating_add(current.dwell_ms(wpm) as u64));
+            .unwrap_or_else(|| now_ms.saturating_add(current.dwell_ms(self.effective_wpm) as u64));
 
         if self.next_due_at_ms.is_none() {
             self.next_due_at_ms = Some(next_due);
@@ -380,6 +424,8 @@ impl ReaderSession {
         if self.progress.unit_index.saturating_add(1) >= self.total_units.max(1) {
             self.next_due_at_ms = None;
             self.progress.completion_percent = 100;
+            self.clear_speed_ramp();
+            self.effective_wpm = wpm;
             return outcome;
         }
 
@@ -401,10 +447,20 @@ impl ReaderSession {
 
         self.progress.unit_index = next_unit_index;
         self.sync_progress();
-        self.next_due_at_ms = Some(now_ms.saturating_add(self.current_unit().dwell_ms(wpm) as u64));
+        self.refresh_effective_wpm(now_ms, wpm);
+        self.next_due_at_ms =
+            Some(now_ms.saturating_add(self.current_unit().dwell_ms(self.effective_wpm) as u64));
         outcome.advanced = true;
         outcome.load_request = self.maybe_request_prefetch();
         outcome
+    }
+
+    pub fn display_wpm(&self, target_wpm: u16) -> u16 {
+        if self.speed_ramp_started_at_ms == SPEED_RAMP_IDLE_AT_MS {
+            target_wpm
+        } else {
+            quantize_display_wpm(self.effective_wpm, target_wpm)
+        }
     }
 
     pub fn current_unit(&self) -> &ReadingUnit {
@@ -558,7 +614,11 @@ impl ReaderSession {
         })
     }
 
-    fn seek_to_unit(&mut self, target_unit_index: u32) -> Option<ReaderWindowLoadRequest> {
+    fn seek_to_unit(
+        &mut self,
+        target_unit_index: u32,
+        target_wpm: u16,
+    ) -> Option<ReaderWindowLoadRequest> {
         if self.total_units == 0 {
             return None;
         }
@@ -574,6 +634,7 @@ impl ReaderSession {
             self.pending_seek_unit_index = None;
             self.progress.unit_index = target_unit_index;
             self.sync_progress();
+            self.arm_speed_ramp(target_wpm);
             return None;
         }
 
@@ -586,11 +647,19 @@ impl ReaderSession {
             self.pending_seek_unit_index = None;
             self.progress.unit_index = target_unit_index;
             self.sync_progress();
+            self.arm_speed_ramp(target_wpm);
             return None;
         }
 
         self.pending_seek_unit_index = Some(target_unit_index);
-        self.load_request_for_window_start(self.window_start_for_unit(target_unit_index))
+        let request =
+            self.load_request_for_window_start(self.window_start_for_unit(target_unit_index));
+        if request.is_some() {
+            self.arm_speed_ramp(target_wpm);
+        } else {
+            self.pending_seek_unit_index = None;
+        }
+        request
     }
 
     fn window_start_for_unit(&self, unit_index: u32) -> u32 {
@@ -640,6 +709,84 @@ impl ReaderSession {
         } else {
             *slot = Some(window);
         }
+    }
+
+    fn arm_speed_ramp(&mut self, target_wpm: u16) {
+        let start_wpm = ramp_start_wpm(target_wpm);
+        self.next_due_at_ms = None;
+        self.speed_ramp_start_wpm = start_wpm;
+        self.effective_wpm = start_wpm;
+        self.speed_ramp_started_at_ms = if start_wpm < target_wpm {
+            SPEED_RAMP_PENDING_AT_MS
+        } else {
+            SPEED_RAMP_IDLE_AT_MS
+        };
+    }
+
+    fn clear_speed_ramp(&mut self) {
+        self.speed_ramp_start_wpm = 0;
+        self.speed_ramp_started_at_ms = SPEED_RAMP_IDLE_AT_MS;
+    }
+
+    fn refresh_effective_wpm(&mut self, now_ms: u64, target_wpm: u16) {
+        match self.speed_ramp_started_at_ms {
+            SPEED_RAMP_IDLE_AT_MS => {
+                self.effective_wpm = target_wpm;
+            }
+            SPEED_RAMP_PENDING_AT_MS => {
+                self.speed_ramp_started_at_ms = now_ms;
+                self.effective_wpm = self.speed_ramp_start_wpm;
+            }
+            started_at_ms => {
+                let elapsed_ms = now_ms.saturating_sub(started_at_ms);
+                if elapsed_ms >= SPEED_RAMP_DURATION_MS || self.speed_ramp_start_wpm >= target_wpm {
+                    self.clear_speed_ramp();
+                    self.effective_wpm = target_wpm;
+                    return;
+                }
+
+                let delta_wpm = target_wpm.saturating_sub(self.speed_ramp_start_wpm) as u64;
+                let ramped_delta = (delta_wpm.saturating_mul(elapsed_ms)) / SPEED_RAMP_DURATION_MS;
+                self.effective_wpm = self
+                    .speed_ramp_start_wpm
+                    .saturating_add(ramped_delta as u16)
+                    .min(target_wpm);
+            }
+        }
+    }
+}
+
+const fn ramp_start_wpm(target_wpm: u16) -> u16 {
+    let scaled = ((target_wpm as u32 * SPEED_RAMP_START_NUMERATOR as u32)
+        / SPEED_RAMP_START_DENOMINATOR as u32) as u16;
+    if scaled < MIN_READING_SPEED_WPM {
+        if MIN_READING_SPEED_WPM < target_wpm {
+            MIN_READING_SPEED_WPM
+        } else {
+            target_wpm
+        }
+    } else if scaled < target_wpm {
+        scaled
+    } else {
+        target_wpm
+    }
+}
+
+const fn quantize_display_wpm(wpm: u16, target_wpm: u16) -> u16 {
+    let clamped = if wpm < MIN_READING_SPEED_WPM {
+        MIN_READING_SPEED_WPM
+    } else if wpm > target_wpm {
+        target_wpm
+    } else {
+        wpm
+    };
+
+    let steps = clamped.saturating_sub(MIN_READING_SPEED_WPM) / READING_SPEED_STEP_WPM;
+    let quantized = MIN_READING_SPEED_WPM + (steps * READING_SPEED_STEP_WPM);
+    if quantized < target_wpm {
+        quantized
+    } else {
+        target_wpm
     }
 }
 
@@ -706,10 +853,141 @@ mod tests {
             InlineText::from_slice("Example"),
             Box::new(document),
             false,
+            300,
         );
 
         assert!(!session.is_empty());
         assert_eq!(session.progress.total_paragraphs, 8);
+    }
+
+    #[test]
+    fn opening_article_arms_pending_speed_ramp() {
+        let document = format_article_document(&ArticleDocument::new(
+            SourceKind::Unknown,
+            ReaderScript::MachineSoul,
+        ));
+        let mut session = ReaderSession::new();
+        let start_wpm = ramp_start_wpm(300);
+
+        session.open_article(
+            CollectionKind::Saved,
+            ArticleId(1),
+            InlineText::from_slice("Example"),
+            Box::new(document),
+            false,
+            300,
+        );
+
+        assert_eq!(session.display_wpm(300), start_wpm);
+        assert_eq!(session.effective_wpm, start_wpm);
+        assert_eq!(session.speed_ramp_started_at_ms, SPEED_RAMP_PENDING_AT_MS);
+    }
+
+    #[test]
+    fn first_reader_tick_uses_ramp_start_wpm_for_initial_dwell() {
+        let document = format_article_document(&ArticleDocument::new(
+            SourceKind::Unknown,
+            ReaderScript::MachineSoul,
+        ));
+        let mut session = ReaderSession::new();
+        let start_wpm = ramp_start_wpm(300);
+
+        session.open_article(
+            CollectionKind::Saved,
+            ArticleId(1),
+            InlineText::from_slice("Example"),
+            Box::new(document),
+            false,
+            300,
+        );
+
+        session.advance_if_due(0, 300);
+
+        assert_eq!(
+            session.next_due_at_ms,
+            Some(session.current_unit().dwell_ms(start_wpm) as u64)
+        );
+        assert_eq!(session.display_wpm(300), start_wpm);
+    }
+
+    #[test]
+    fn speed_ramp_reaches_target_after_duration() {
+        let document = format_article_document(&ArticleDocument::new(
+            SourceKind::Unknown,
+            ReaderScript::MachineSoul,
+        ));
+        let mut session = ReaderSession::new();
+        let start_wpm = ramp_start_wpm(300);
+
+        session.open_article(
+            CollectionKind::Saved,
+            ArticleId(1),
+            InlineText::from_slice("Example"),
+            Box::new(document),
+            false,
+            300,
+        );
+        session.advance_if_due(0, 300);
+        session.next_due_at_ms = Some(u64::MAX);
+
+        session.advance_if_due(3_000, 300);
+        assert_eq!(session.effective_wpm, 230);
+        assert_eq!(session.display_wpm(300), 220);
+
+        session.advance_if_due(10_000, 300);
+        assert_eq!(session.display_wpm(300), 300);
+        assert_eq!(session.speed_ramp_started_at_ms, SPEED_RAMP_IDLE_AT_MS);
+    }
+
+    #[test]
+    fn resume_arms_fresh_speed_ramp() {
+        let document = format_article_document(&ArticleDocument::new(
+            SourceKind::Unknown,
+            ReaderScript::MachineSoul,
+        ));
+        let mut session = ReaderSession::new();
+        let start_wpm = ramp_start_wpm(300);
+
+        session.open_article(
+            CollectionKind::Saved,
+            ArticleId(1),
+            InlineText::from_slice("Example"),
+            Box::new(document),
+            false,
+            300,
+        );
+        session.pause();
+
+        assert_eq!(session.display_wpm(300), 300);
+
+        session.resume(300);
+
+        assert_eq!(session.display_wpm(300), start_wpm);
+        assert_eq!(session.speed_ramp_started_at_ms, SPEED_RAMP_PENDING_AT_MS);
+    }
+
+    #[test]
+    fn minimum_target_speed_does_not_ramp_below_floor() {
+        let document = format_article_document(&ArticleDocument::new(
+            SourceKind::Unknown,
+            ReaderScript::MachineSoul,
+        ));
+        let mut session = ReaderSession::new();
+
+        session.open_article(
+            CollectionKind::Saved,
+            ArticleId(1),
+            InlineText::from_slice("Example"),
+            Box::new(document),
+            false,
+            MIN_READING_SPEED_WPM,
+        );
+
+        assert_eq!(
+            session.display_wpm(MIN_READING_SPEED_WPM),
+            MIN_READING_SPEED_WPM
+        );
+        assert_eq!(session.speed_ramp_started_at_ms, SPEED_RAMP_IDLE_AT_MS);
     }
 
     #[test]
@@ -757,7 +1035,7 @@ mod tests {
         session.next_due_at_ms = Some(500);
         session.sync_progress();
 
-        let request = session.jump_live_previous_paragraph();
+        let request = session.jump_live_previous_paragraph(300);
 
         assert_eq!(request, None);
         assert_eq!(session.progress.unit_index, 5);
@@ -795,7 +1073,7 @@ mod tests {
         session.progress.unit_index = 5;
         session.sync_progress();
 
-        let request = session.jump_live_previous_paragraph();
+        let request = session.jump_live_previous_paragraph(300);
 
         assert_eq!(request, None);
         assert_eq!(session.progress.unit_index, 0);
@@ -808,7 +1086,7 @@ mod tests {
         session.next_due_at_ms = Some(750);
         session.sync_progress();
 
-        let request = session.jump_live_previous_paragraph();
+        let request = session.jump_live_previous_paragraph(300);
 
         assert_eq!(request, None);
         assert_eq!(session.progress.unit_index, 0);
@@ -821,13 +1099,15 @@ mod tests {
         let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
         session.total_units = 300;
         session.sync_progress();
+        let start_wpm = ramp_start_wpm(300);
 
-        let request = session.jump_live_next_paragraph().unwrap();
+        let request = session.jump_live_next_paragraph(300).unwrap();
 
         assert_eq!(request.window_start_unit_index, 32);
         assert_eq!(request.content_id.as_str(), "content-1");
         assert_eq!(session.pending_seek_unit_index, Some(64));
         assert_eq!(session.next_due_at_ms, None);
+        assert_eq!(session.display_wpm(300), start_wpm);
     }
 
     #[test]
@@ -836,21 +1116,24 @@ mod tests {
         session.total_units = 300;
         session.prefetched_window = Some(Box::new(make_test_window(32, 96)));
         session.sync_progress();
+        let start_wpm = ramp_start_wpm(300);
 
-        let request = session.jump_live_next_paragraph();
+        let request = session.jump_live_next_paragraph(300);
 
         assert_eq!(request, None);
         assert_eq!(session.active_window().start_unit_index, 32);
         assert_eq!(session.progress.unit_index, 64);
         assert_eq!(session.progress.paragraph_index, 2);
         assert!(session.prefetched_window.is_none());
+        assert_eq!(session.display_wpm(300), start_wpm);
     }
 
     #[test]
     fn apply_loaded_window_completes_pending_live_jump() {
         let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
         session.total_units = 300;
-        let request = session.jump_live_next_paragraph().unwrap();
+        let start_wpm = ramp_start_wpm(300);
+        let request = session.jump_live_next_paragraph(300).unwrap();
 
         session.apply_loaded_window(Box::new(make_test_window(
             request.window_start_unit_index,
@@ -861,6 +1144,39 @@ mod tests {
         assert_eq!(session.progress.paragraph_index, 2);
         assert_eq!(session.pending_seek_unit_index, None);
         assert_eq!(session.active_window().start_unit_index, 32);
+        assert_eq!(session.display_wpm(300), start_wpm);
+    }
+
+    #[test]
+    fn pending_live_jump_uses_ramp_start_wpm_after_window_load() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.total_units = 300;
+        let start_wpm = ramp_start_wpm(300);
+        let request = session.jump_live_next_paragraph(300).unwrap();
+
+        session.apply_loaded_window(Box::new(make_test_window(
+            request.window_start_unit_index,
+            128,
+        )));
+        session.advance_if_due(0, 300);
+
+        assert_eq!(
+            session.next_due_at_ms,
+            Some(session.current_unit().dwell_ms(start_wpm) as u64)
+        );
+    }
+
+    #[test]
+    fn pending_live_jump_does_not_advance_old_window_while_loading() {
+        let mut session = make_seekable_session(0, 32, &[0, 64, 128]);
+        session.total_units = 300;
+        let _request = session.jump_live_next_paragraph(300).unwrap();
+
+        let outcome = session.advance_if_due(1_000, 300);
+
+        assert!(!outcome.advanced);
+        assert_eq!(session.progress.unit_index, 0);
+        assert_eq!(session.next_due_at_ms, None);
     }
 
     #[test]
@@ -870,13 +1186,15 @@ mod tests {
         session.sync_progress();
         session.mode = ReaderMode::Chat;
         session.resume_mode = ReaderMode::Chat;
+        let start_wpm = ramp_start_wpm(300);
 
-        let request = session.jump_live_previous_paragraph();
+        let request = session.jump_live_previous_paragraph(300);
 
         assert_eq!(request, None);
         assert_eq!(session.mode, ReaderMode::Chat);
         assert_eq!(session.resume_mode, ReaderMode::Chat);
         assert_eq!(session.progress.unit_index, 5);
+        assert_eq!(session.display_wpm(300), start_wpm);
     }
 
     #[test]
@@ -886,6 +1204,7 @@ mod tests {
         session.total_units = 400;
         session.mode = ReaderMode::ParagraphNavigation;
         session.resume_mode = ReaderMode::Normal;
+        let start_wpm = ramp_start_wpm(300);
         session.progress.paragraph_index = 10;
         session.progress.total_paragraphs = 10;
         session.paragraphs = Some(
@@ -903,10 +1222,11 @@ mod tests {
         }
         session.active_window = Some(Box::new(ReaderWindow::empty()));
 
-        let request = session.commit_paragraph_navigation().unwrap();
+        let request = session.commit_paragraph_navigation(300).unwrap();
 
         assert_eq!(request.window_start_unit_index, 224);
         assert_eq!(request.content_id.as_str(), "content-1");
+        assert_eq!(session.display_wpm(300), start_wpm);
     }
 
     #[test]
@@ -916,13 +1236,15 @@ mod tests {
         session.resume_mode = ReaderMode::Normal;
         session.progress.paragraph_index = 2;
         session.prefetched_window = Some(Box::new(make_test_window(32, 96)));
+        let start_wpm = ramp_start_wpm(300);
 
-        let request = session.commit_paragraph_navigation();
+        let request = session.commit_paragraph_navigation(300);
 
         assert_eq!(request, None);
         assert_eq!(session.mode, ReaderMode::Normal);
         assert_eq!(session.active_window().start_unit_index, 32);
         assert_eq!(session.progress.unit_index, 64);
         assert_eq!(session.progress.paragraph_index, 2);
+        assert_eq!(session.display_wpm(300), start_wpm);
     }
 }

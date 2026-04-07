@@ -228,7 +228,9 @@ pub fn select_reader(store: &Store) -> ReaderScreenModel {
     ReaderScreenModel {
         appearance: store.settings.appearance,
         title: store.reader.title,
-        wpm: store.settings.reading_speed_wpm,
+        // Surface the live cadence, but only at quantized speed steps so reader ticks do not
+        // force a screen refresh every 20 ms on the Sharp panel path.
+        wpm: store.reader.display_wpm(store.settings.reading_speed_wpm),
         left_word: stage_token.left,
         right_word: stage_token.right,
         preview,
@@ -637,6 +639,7 @@ mod tests {
     #[test]
     fn reader_selector_uses_live_rsvp_stage() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         let article = store.content().article_at(CollectionKind::Inbox, 0);
         let document = format_article_document(&article_document_from_script(
             article.source,
@@ -648,14 +651,40 @@ mod tests {
             InlineText::from_slice(article.reader_title),
             alloc::boxed::Box::new(document),
             article.has_chat,
+            store.settings.reading_speed_wpm,
         );
         store.ui.route = UiRoute::Reader;
 
         let model = select_reader(&store);
 
         assert_eq!(model.title.as_str(), "THE MACHINE SOUL");
+        assert_eq!(model.wpm, 200);
         assert!(!model.right_word.is_empty());
         assert!(!model.preview.is_empty());
+    }
+
+    #[test]
+    fn reader_selector_shows_quantized_live_ramp_wpm() {
+        let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
+        let article = store.content().article_at(CollectionKind::Inbox, 0);
+        let document = format_article_document(&article_document_from_script(
+            article.source,
+            article.script,
+        ));
+        store.reader.open_article(
+            CollectionKind::Inbox,
+            article.id,
+            InlineText::from_slice(article.reader_title),
+            alloc::boxed::Box::new(document),
+            article.has_chat,
+            store.settings.reading_speed_wpm,
+        );
+        store.ui.route = UiRoute::Reader;
+
+        let model = select_reader(&store);
+
+        assert_eq!(model.wpm, 200);
     }
 
     #[test]

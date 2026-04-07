@@ -1,4 +1,4 @@
-use core::convert::Infallible;
+use core::{convert::Infallible, fmt::Write};
 
 use app_runtime::{
     AnimationDescriptor, MotionDirection, PreparedScreen, Screen, ScreenUpdate, TransitionPlan,
@@ -197,6 +197,11 @@ impl AnimationPlayback {
 }
 
 pub fn draw_prepared_screen(frame: &mut FrameBuffer, screen: &PreparedScreen) {
+    draw_prepared_screen_base(frame, screen);
+    apply_theme(frame, screen.appearance());
+}
+
+fn draw_prepared_screen_base(frame: &mut FrameBuffer, screen: &PreparedScreen) {
     frame.clear(false);
 
     match screen {
@@ -206,15 +211,13 @@ pub fn draw_prepared_screen(frame: &mut FrameBuffer, screen: &PreparedScreen) {
         PreparedScreen::ParagraphNavigation(shell) => draw_paragraph_navigation(frame, shell, 1, 1),
         PreparedScreen::Settings(shell) => draw_settings(frame, shell, 1, 1),
     }
-
-    apply_theme(frame, screen.appearance());
 }
 
 pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayback) {
     frame.clear(false);
 
     match playback.plan.animation {
-        AnimationDescriptor::None => draw_prepared_screen(frame, &playback.to),
+        AnimationDescriptor::None => draw_prepared_screen_base(frame, &playback.to),
         AnimationDescriptor::BandReveal(direction) => match playback.to {
             PreparedScreen::Dashboard(shell) => {
                 if let PreparedScreen::Dashboard(from_shell) = playback.from {
@@ -236,7 +239,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
             PreparedScreen::Collection(shell) => {
                 draw_collection(frame, &shell, playback.step, playback.plan.steps, 0)
             }
-            _ => draw_prepared_screen(frame, &playback.to),
+            _ => draw_prepared_screen_base(frame, &playback.to),
         },
         AnimationDescriptor::ListStep(direction) => {
             if let (PreparedScreen::Collection(from_shell), PreparedScreen::Collection(to_shell)) =
@@ -251,18 +254,18 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
                     playback.plan.steps,
                 );
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::ReaderEnter => {
             if let PreparedScreen::Reader(shell) = playback.to {
                 draw_reader(frame, &shell, playback.step, playback.plan.steps);
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::ReaderExit => {
-            draw_prepared_screen(frame, &playback.to);
+            draw_prepared_screen_base(frame, &playback.to);
         }
         AnimationDescriptor::ModalReveal => {
             if let (PreparedScreen::Reader(from_shell), PreparedScreen::Reader(to_shell)) =
@@ -279,7 +282,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
             } else if let PreparedScreen::Reader(shell) = playback.to {
                 draw_reader(frame, &shell, playback.step, playback.plan.steps);
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::ModalHide => {
@@ -297,7 +300,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
             } else if let PreparedScreen::Reader(shell) = playback.to {
                 draw_reader(frame, &shell, playback.step, playback.plan.steps);
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::ParagraphTickMove(direction) => {
@@ -315,7 +318,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
                     playback.plan.steps,
                 );
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::SettingsValuePulse => {
@@ -323,7 +326,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
                 draw_settings(frame, &shell, 1, 1);
                 draw_value_pulse(frame, playback.step, playback.plan.steps);
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::AppearanceFlip => {
@@ -331,7 +334,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
                 draw_settings(frame, &shell, 1, 1);
                 draw_row_flash(frame, 88 + 1, 30, playback.step, playback.plan.steps);
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
         AnimationDescriptor::RefreshPulse => {
@@ -339,7 +342,7 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
                 draw_settings(frame, &shell, 1, 1);
                 draw_refresh_pulse(frame, playback.step, playback.plan.steps);
             } else {
-                draw_prepared_screen(frame, &playback.to);
+                draw_prepared_screen_base(frame, &playback.to);
             }
         }
     }
@@ -1028,9 +1031,10 @@ fn draw_reader_base(frame: &mut FrameBuffer, shell: &ReaderShell, step: u8, tota
         Alignment::Left,
         reader_preview_max_width_px(shell.stage.wpm),
     );
+    let wpm = wpm_label(shell.stage.wpm);
     draw_text_right(
         frame,
-        wpm_label(shell.stage.wpm),
+        wpm.as_str(),
         Point::new(READER_TEXT_RIGHT_X, READER_PREVIEW_Y),
         ui_font_body(),
         BinaryColor::On,
@@ -2432,23 +2436,15 @@ fn battery_label(percent: u8) -> &'static str {
     }
 }
 
-fn wpm_label(wpm: u16) -> &'static str {
-    match wpm {
-        200 => "200 WPM",
-        220 => "220 WPM",
-        240 => "240 WPM",
-        260 => "260 WPM",
-        280 => "280 WPM",
-        300 => "300 WPM",
-        320 => "320 WPM",
-        340 => "340 WPM",
-        360 => "360 WPM",
-        _ => "260 WPM",
-    }
+fn wpm_label(wpm: u16) -> HeaplessString<8> {
+    let mut label = HeaplessString::new();
+    let _ = write!(label, "{} WPM", wpm);
+    label
 }
 
 fn reader_preview_max_width_px(wpm: u16) -> i32 {
-    let wpm_width = mono_text_width_px(wpm_label(wpm), ui_font_body(), 1);
+    let label = wpm_label(wpm);
+    let wpm_width = mono_text_width_px(label.as_str(), ui_font_body(), 1);
     (READER_TEXT_RIGHT_X - READER_TEXT_LEFT_X - wpm_width - READER_FOOTER_WPM_GAP_PX).max(0)
 }
 
@@ -2559,6 +2555,12 @@ mod tests {
             badge: None,
             pause_modal,
         }
+    }
+
+    fn make_dark_reader_shell(progress_width: u16) -> ReaderShell {
+        let mut shell = make_reader_shell(progress_width);
+        shell.appearance = AppearanceMode::Dark;
+        shell
     }
 
     fn make_pause_modal() -> PauseModal {
@@ -2718,8 +2720,31 @@ mod tests {
     }
 
     #[test]
+    fn reader_exit_transition_matches_dark_collection_theme() {
+        let reader = make_dark_reader_shell(64);
+        let mut collection =
+            make_collection_shell([("ONE", "Alpha"), ("TWO", "Bravo"), ("THREE", "Charlie")]);
+        collection.appearance = AppearanceMode::Dark;
+        let animation = AnimationPlayback {
+            from: PreparedScreen::Reader(reader),
+            to: PreparedScreen::Collection(collection),
+            screen: Screen::Saved,
+            plan: TransitionPlan::new(AnimationDescriptor::ReaderExit, 3, 50),
+            step: 1,
+        };
+        let mut transition = FrameBuffer::new();
+        let mut expected = FrameBuffer::new();
+
+        draw_transition_frame(&mut transition, &animation);
+        draw_prepared_screen(&mut expected, &PreparedScreen::Collection(collection));
+
+        assert_eq!(transition.bytes(), expected.bytes());
+    }
+
+    #[test]
     fn reader_footer_reserves_gap_for_wpm_label() {
-        let wpm_width = mono_text_width_px(wpm_label(300), ui_font_body(), 1);
+        let wpm = wpm_label(300);
+        let wpm_width = mono_text_width_px(wpm.as_str(), ui_font_body(), 1);
 
         assert_eq!(READER_TITLE_MAX_WIDTH_PX, 360);
         assert_eq!(reader_preview_max_width_px(300), 288);
@@ -2727,6 +2752,11 @@ mod tests {
             reader_preview_max_width_px(300) + READER_FOOTER_WPM_GAP_PX + wpm_width,
             READER_TITLE_MAX_WIDTH_PX
         );
+    }
+
+    #[test]
+    fn wpm_label_formats_intermediate_ramp_values() {
+        assert_eq!(wpm_label(288).as_str(), "288 WPM");
     }
 
     #[test]
