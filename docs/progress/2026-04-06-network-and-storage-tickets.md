@@ -26,8 +26,9 @@ is a primary reliability problem.
   endpoint cache, probe fallback can use it within the same network session,
   and backend session open / startup refresh now try that cached endpoint
   before declaring DNS dead.
-- Still pending: on-device validation that the fallback actually reduces user-
-  visible DNS failures without masking real link problems.
+- On-device validation passed: request-side fallback is now visible in device
+  logs, including a successful `backend request dns fallback succeeded`
+  recovery path during the April 7 handoff experiments.
 
 ### Non-goals
 
@@ -227,24 +228,29 @@ is reasonable to try a more aggressive transfer profile.
 
 ### Scope
 
-- keep backend package download chunking and storage stage chunking aligned
 - widen the chunk size materially beyond the original `8 KiB` baseline
-- widen stage flush cadence with the chunk so storage does fewer forced flushes
+- keep stage flush cadence derived from the storage handoff chunk so larger
+  receive buffers do not force the storage side into all-or-nothing bursts
 - make the effective transfer profile explicit in boot and static-inventory
   logs
 - keep an easy build-time override for A/B runs at even larger chunk sizes
+- keep storage handoff smaller than the receive-side socket buffer so package
+  streaming and SD writes can overlap again
 
 ### Current Progress
 
 - Code landed: backend package streaming and storage staging now read their
-  chunk size from one shared transfer-tuning policy instead of separate raw
-  constants.
-- The current product-default transfer profile is `65536` byte chunks with a
-  derived `131072` byte stage flush interval. The initial `32768` byte pass was
-  retained only long enough to compare against the `65536` byte override.
+  receive/handoff sizes from one shared transfer-tuning policy instead of
+  separate raw constants.
+- The current product-default transfer profile is `131072` byte receive chunks,
+  a fixed `65536` byte storage handoff chunk, and a derived `131072` byte
+  stage flush interval. The intermediate adaptive handoff experiment was
+  removed after A/B runs because it added complexity without a durable win over
+  the simpler fixed profile.
 - A controlled build-time override path
   (`MOTIF_PACKAGE_TRANSFER_CHUNK_LEN`) exists for deliberate higher-chunk A/B
-  runs without touching the code again.
+  runs without touching the code again, and the current guardrail allows
+  experiments anywhere in the `8 KiB ..= 131072` byte receive range.
 
 ### Non-goals
 

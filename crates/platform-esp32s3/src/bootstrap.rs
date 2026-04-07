@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(all(
+        feature = "telemetry-memtrace",
+        feature = "telemetry-verbose-diagnostics"
+    )),
+    allow(unused_imports, unused_variables)
+)]
+
 extern crate alloc;
 
 use ::domain::{
@@ -32,7 +40,7 @@ use esp_hal::{
     time::Rate,
     timer::timg::TimerGroup,
 };
-use log::info;
+use log::{info, warn};
 use ls027b7dh01::FrameBuffer;
 
 use crate::{
@@ -217,7 +225,7 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                 .await;
         }
         Effect::CollectionConfirmIgnored { collection, reason } => {
-            info!(
+            warn!(
                 "collection confirm ignored collection={:?} reason={}",
                 collection,
                 reason.label()

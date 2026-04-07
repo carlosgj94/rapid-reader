@@ -2,7 +2,7 @@
 runner = "espflash flash --monitor --chip esp32s3 --flash-size 16mb --partition-table partitions/motif.csv"
 
 [env]
-ESP_LOG="info"
+ESP_LOG="warn"
 ESP_HAL_CONFIG_PSRAM_MODE="octal"
 
 [build]

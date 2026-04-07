@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(all(
+        feature = "telemetry-memtrace",
+        feature = "telemetry-verbose-diagnostics"
+    )),
+    allow(unused_imports, unused_variables)
+)]
+
 extern crate alloc;
 
 use alloc::boxed::Box;

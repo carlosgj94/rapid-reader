@@ -180,7 +180,7 @@ impl CollectionManifestItem {
         matches!(self.remote_status, RemoteContentStatus::Ready)
             && matches!(
                 self.package_state,
-                PackageState::Missing | PackageState::Stale
+                PackageState::Missing | PackageState::Stale | PackageState::Failed
             )
     }
 }

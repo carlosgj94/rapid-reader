@@ -900,6 +900,44 @@ mod tests {
     }
 
     #[test]
+    fn saved_confirm_retries_failed_item() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        store.storage = make_storage_with_sd();
+        store
+            .handle_event(Event::NetworkStatusChanged(NetworkStatus::Online), 0)
+            .unwrap();
+        store
+            .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
+            .unwrap();
+        let mut manifest = CollectionManifestState::empty();
+        let item = make_ready_saved_item(PackageState::Failed);
+        let _ = manifest.try_push(item);
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, manifest);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::PrepareContent(PrepareContentRequest::from_manifest(
+                CollectionKind::Saved,
+                item,
+            ))
+        );
+        assert_eq!(
+            store
+                .content()
+                .collection_state(CollectionKind::Saved)
+                .item_at(0)
+                .unwrap()
+                .package_state,
+            PackageState::Fetching
+        );
+    }
+
+    #[test]
     fn saved_confirm_queues_until_network_recovers() {
         let mut store = Store::new();
         store.ui.route = UiRoute::Collection(CollectionKind::Saved);

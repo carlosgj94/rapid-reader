@@ -173,14 +173,17 @@ Current implemented behavior includes:
 Current package/stage buffers are intentionally much larger than the original
 baseline:
 
-- package download chunk length: `65536` bytes
-- stage write chunk length: `65536` bytes
+- package download chunk length: `131072` bytes by default
+- stage/storage handoff chunk length: fixed at `65536` bytes so storage starts
+  draining before the receive buffer fills completely
 - stage flush interval: `131072` bytes
 
-Those values now come from one shared transfer-tuning policy so backend and
-storage stay aligned. The repo also exposes a deliberate build-time override
-(`MOTIF_PACKAGE_TRANSFER_CHUNK_LEN`) for higher-chunk package A/B tests without
-forking the code.
+Those values now come from one shared fixed transfer-tuning policy so backend
+and storage stay coordinated without forcing the storage path to buffer a full
+`128 KiB` article burst before the first SD write. The repo still exposes a
+deliberate build-time override (`MOTIF_PACKAGE_TRANSFER_CHUNK_LEN`) for
+controlled A/B tests within the `8 KiB ..= 128 KiB` range without forking the
+code.
 
 That work removed SD throughput as the primary bottleneck on healthy runs.
 

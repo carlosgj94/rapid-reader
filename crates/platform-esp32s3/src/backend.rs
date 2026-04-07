@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(all(
+        feature = "telemetry-memtrace",
+        feature = "telemetry-verbose-diagnostics"
+    )),
+    allow(unused_imports, unused_variables)
+)]
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -22,7 +30,7 @@ use esp_hal::{
     peripherals::{ADC1, RNG},
     rng::{Trng, TrngSource},
 };
-use log::info;
+use log::{info, warn};
 use mbedtls_rs::{
     Certificate, ClientSessionConfig, SerializedClientSession, Session, SessionConfig,
     SessionError, Tls, TlsReference, TlsVersion, X509,
@@ -78,12 +86,14 @@ const PACKAGE_RETRY_NETWORK_READY_MAX_TIMEOUT_SECS: u64 = 30;
 const REQUEST_NETWORK_READY_POLL_MS: u64 = 250;
 // Real device traces showed that an aggressive background `/device/v1/me`
 // keepalive could kill an otherwise healthy reusable TLS session between two
-// article opens. Keep passive reuse for nearby follow-up requests, but apply a
-// much stricter age limit to streaming package fetches because the server path
-// was already resetting ~20 s idle package sockets on first write.
+// article opens. Keep passive reuse for truly nearby follow-up requests, but
+// apply a much stricter age limit to streaming package fetches because the
+// server path was already resetting ~20 s idle package sockets on first write
+// and even 10 s reuse windows were producing multi-second stalls before the
+// next request reached first byte.
 const REUSABLE_BUFFERED_SESSION_IDLE_TIMEOUT_SECS: u64 = 60;
-const REUSABLE_STREAMING_SESSION_IDLE_TIMEOUT_SECS: u64 = 10;
-const MBEDTLS_DEBUG_LEVEL: u32 = 1;
+const REUSABLE_STREAMING_SESSION_IDLE_TIMEOUT_SECS: u64 = 3;
+const MBEDTLS_DEBUG_LEVEL: u32 = 0;
 const STREAM_PROGRESS_LOG_INTERVAL_BYTES: usize = 16 * 1024;
 const HTTP_RESPONSE_MAX_LEN: usize = 8 * 1024;
 const HTTP_STREAM_HEADER_MAX_LEN: usize = 2048;
@@ -95,6 +105,8 @@ const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
 const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
 const PACKAGE_DOWNLOAD_CHUNK_LEN: usize = transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN;
+const PACKAGE_STORAGE_HANDOFF_CHUNK_LEN: usize =
+    transfer_tuning::PACKAGE_TRANSFER_STORAGE_HANDOFF_CHUNK_LEN;
 // Package prefetch materially increases boot-time latency and was timing out on
 // real device/package responses. Keep startup focused on refresh + manifest sync.
 const STARTUP_SAVED_PREFETCH_ENABLED: bool = false;
@@ -595,6 +607,7 @@ pub(crate) fn log_static_inventory() {
         "http_stream_header_max_len" = HTTP_STREAM_HEADER_MAX_LEN,
         "http_stream_header_storage" = "external_preferred_box",
         "package_download_chunk_len" = PACKAGE_DOWNLOAD_CHUNK_LEN,
+        "package_storage_handoff_chunk_len" = PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
         "package_download_chunk_source" = transfer_tuning::PACKAGE_TRANSFER_SOURCE,
         "package_download_chunk_storage" = "external_preferred_box",
         "collection_page_limit" = COLLECTION_PAGE_LIMIT,
@@ -709,7 +722,7 @@ pub fn install(
         .spawn(backend_task(stack, startup, rng, adc1))
         .is_err()
     {
-        info!("backend failed to spawn auth task");
+        warn!("backend failed to spawn auth task");
     }
 }
 
@@ -731,7 +744,7 @@ async fn backend_task(
         Ok(trng) => trng,
         Err(_) => {
             log_status(SyncStatus::TransportFailed);
-            info!("backend tls init failed: TRNG unavailable");
+            warn!("backend tls init failed: TRNG unavailable");
             return;
         }
     };
@@ -740,7 +753,7 @@ async fn backend_task(
         Ok(tls) => tls,
         Err(err) => {
             log_status(SyncStatus::TransportFailed);
-            info!("backend tls init failed: {:?}", err);
+            warn!("backend tls init failed: {:?}", err);
             return;
         }
     };
@@ -756,7 +769,7 @@ async fn backend_task(
         Ok(ca_chain) => ca_chain,
         Err(err) => {
             log_status(SyncStatus::TransportFailed);
-            info!("backend ca chain init failed: {:?}", err);
+            warn!("backend ca chain init failed: {:?}", err);
             return;
         }
     };
@@ -827,7 +840,7 @@ async fn backend_task(
                         "error" = backend_error_label(err),
                     );
                     log_status(SyncStatus::TransportFailed);
-                    info!("backend refresh failed: {:?}", err);
+                    warn!("backend refresh failed: {:?}", err);
                     Timer::after(Duration::from_millis(RETRY_BACKOFF_MS)).await;
                     continue;
                 }
@@ -895,7 +908,7 @@ async fn backend_task(
         Ok(event_loop) => event_loop,
         Err(_) => {
             log_status(SyncStatus::TransportFailed);
-            info!("backend event loop alloc failed");
+            warn!("backend event loop alloc failed");
             return;
         }
     };
@@ -1039,7 +1052,7 @@ async fn perform_health_check(
                 last_error = Some(err);
                 attempt += 1;
                 if attempt < 3 {
-                    info!("backend health retry attempt={} err={:?}", attempt, err);
+                    warn!("backend health retry attempt={} err={:?}", attempt, err);
                     Timer::after(Duration::from_millis(750)).await;
                 }
             }
@@ -1215,7 +1228,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
                 if is_transient_transport_error(err) && attempt + 1 < TRANSPORT_RETRY_ATTEMPTS =>
             {
                 attempt += 1;
-                info!("backend startup retry attempt={} err={:?}", attempt, err);
+                warn!("backend startup retry attempt={} err={:?}", attempt, err);
                 // Startup sync normally suspends the background probe task to
                 // keep the shared socket set focused on refresh + manifest
                 // fetches. If the first attempt invalidates backend-path
@@ -1293,13 +1306,13 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     .await
     .map_err(|_| {
         crate::internet::invalidate_backend_path("connect_timeout");
-        info!("backend request connect timed out path={}", REFRESH_PATH);
+        warn!("backend request connect timed out path={}", REFRESH_PATH);
         log_request_heap(REFRESH_PATH, "connect timeout");
         RefreshError::Other(BackendError::Connect)
     })?
     .map_err(|_| {
         crate::internet::invalidate_backend_path("connect_failed");
-        info!("backend request connect failed path={}", REFRESH_PATH);
+        warn!("backend request connect failed path={}", REFRESH_PATH);
         log_request_heap(REFRESH_PATH, "connect failed");
         RefreshError::Other(BackendError::Connect)
     })?;
@@ -1332,7 +1345,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     );
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
-            info!("backend request tls setup failed path={}", REFRESH_PATH);
+            warn!("backend request tls setup failed path={}", REFRESH_PATH);
             log_request_heap(REFRESH_PATH, "tls setup failed");
         })
         .map_err(RefreshError::Other)?;
@@ -1482,7 +1495,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
             None
         }
     } else {
-        info!("backend startup session closing before steady state reason=sync_failed");
+        warn!("backend startup session closing before steady state reason=sync_failed");
         if let Err(err) = session.close().await {
             info!("backend tls close failed reason=startup done err={:?}", err);
         }
@@ -1774,7 +1787,7 @@ async fn handle_prepare_content_request<'a>(
                     "content_id" = request.content_id.as_str(),
                 );
                 log_status(SyncStatus::AuthFailed);
-                info!(
+                warn!(
                     "backend content prepare refresh rejected status={} source={}",
                     status,
                     current.source.label(),
@@ -1800,7 +1813,7 @@ async fn handle_prepare_content_request<'a>(
                 );
                 *access_session = None;
                 log_status(SyncStatus::TransportFailed);
-                info!("backend content prepare refresh failed: {:?}", err);
+                warn!("backend content prepare refresh failed: {:?}", err);
                 let _ = publish_package_state(
                     operation_trace,
                     request.collection,
@@ -1901,7 +1914,7 @@ async fn handle_prepare_content_request<'a>(
                         PackageState::Failed,
                     )
                     .await;
-                    info!(
+                    warn!(
                         "backend content open after prepare failed collection={:?} content_id={} err={:?}",
                         request.collection,
                         request.content_id.as_str(),
@@ -1955,7 +1968,7 @@ async fn handle_prepare_content_request<'a>(
                 PackageState::Failed,
             )
             .await;
-            info!("backend content fetch rejected status={}", status);
+            warn!("backend content fetch rejected status={}", status);
         }
         Err(PackagePrepareError::Other(err)) => {
             crate::memtrace!(
@@ -1976,7 +1989,7 @@ async fn handle_prepare_content_request<'a>(
                 prepare_error_package_state(err),
             )
             .await;
-            info!("backend content fetch failed: {:?}", err);
+            warn!("backend content fetch failed: {:?}", err);
         }
     }
 }
@@ -2007,7 +2020,7 @@ async fn send_https_request<'a>(
     };
     match first_attempt {
         Err(err) if is_transient_transport_error(err) && TRANSPORT_RETRY_ATTEMPTS > 1 => {
-            info!(
+            warn!(
                 "backend request retry path={} attempt=1 err={:?}",
                 request.path, err
             );
@@ -2097,7 +2110,7 @@ async fn send_https_request_reusing_session<'a, 'b>(
     match first_attempt {
         Err(err) if is_transient_transport_error(err) && TRANSPORT_RETRY_ATTEMPTS > 1 => {
             close_reusable_session(reusable_session, "retry").await;
-            info!(
+            warn!(
                 "backend request retry path={} attempt=1 err={:?}",
                 request.path, err
             );
@@ -2359,9 +2372,13 @@ async fn wait_for_backend_request_path_ready(
 
         if link_up && network_address.is_some() && backend_path_ready {
             let waited_ms = elapsed_since_ms(started_ms);
-            info!(
+            crate::verbose_diag!(
                 "backend request network ready path={} reason={} wait_ms={} network_ip={:?} backend_path_ready={}",
-                path, reason, waited_ms, network_address, backend_path_ready,
+                path,
+                reason,
+                waited_ms,
+                network_address,
+                backend_path_ready,
             );
             log_request_phase(trace, path, class, "network_ready", waited_ms);
             return Ok(());
@@ -2375,9 +2392,14 @@ async fn wait_for_backend_request_path_ready(
             let path_restored = !previous_backend_path_ready && backend_path_ready;
             if link_restored || ip_restored || path_restored {
                 last_progress_ms = now_ms();
-                info!(
+                crate::verbose_diag!(
                     "backend request network progress path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
-                    path, reason, waited_ms, link_up, network_address, backend_path_ready,
+                    path,
+                    reason,
+                    waited_ms,
+                    link_up,
+                    network_address,
+                    backend_path_ready,
                 );
                 log_request_phase(trace, path, class, "network_wait_progress", waited_ms);
             }
@@ -2387,7 +2409,7 @@ async fn wait_for_backend_request_path_ready(
 
             let stalled_ms = elapsed_since_ms(last_progress_ms);
             if waited_ms >= max_timeout_ms || stalled_ms >= timeout_ms {
-                info!(
+                warn!(
                     "backend request network wait timed out path={} reason={} wait_ms={} stalled_ms={} link_up={} network_ip={:?} backend_path_ready={}",
                     path,
                     reason,
@@ -2401,7 +2423,7 @@ async fn wait_for_backend_request_path_ready(
                 return Err(BackendError::Connect);
             }
         } else if waited_ms >= timeout_ms {
-            info!(
+            warn!(
                 "backend request network wait timed out path={} reason={} wait_ms={} link_up={} network_ip={:?} backend_path_ready={}",
                 path, reason, waited_ms, link_up, network_address, backend_path_ready,
             );
@@ -2410,9 +2432,13 @@ async fn wait_for_backend_request_path_ready(
         }
 
         if !logged_wait {
-            info!(
+            crate::verbose_diag!(
                 "backend request waiting for network path={} reason={} link_up={} network_ip={:?} backend_path_ready={}",
-                path, reason, link_up, network_address, backend_path_ready,
+                path,
+                reason,
+                link_up,
+                network_address,
+                backend_path_ready,
             );
             log_request_phase(trace, path, class, "network_wait_start", waited_ms);
             logged_wait = true;
@@ -2436,13 +2462,15 @@ async fn open_backend_session<'a>(
     let streaming = class.is_streaming();
     let network_address = current_network_address(stack).ok_or_else(|| {
         crate::internet::invalidate_backend_path("missing_ip");
-        info!("backend request network unavailable path={}", path);
+        warn!("backend request network unavailable path={}", path);
         log_request_heap(path, "network unavailable");
         BackendError::Connect
     })?;
-    info!(
+    crate::verbose_diag!(
         "backend request open path={} streaming={} network_ip={:?}",
-        path, streaming, network_address
+        path,
+        streaming,
+        network_address
     );
     let mut metrics = RequestMetrics::new(trace, false, class);
     log_request_phase(trace, path, class, "open", 0);
@@ -2458,21 +2486,23 @@ async fn open_backend_session<'a>(
     .await
     .map_err(|_| {
         crate::internet::invalidate_backend_path("connect_timeout");
-        info!("backend request connect timed out path={}", path);
+        warn!("backend request connect timed out path={}", path);
         log_request_heap(path, "connect timeout");
         BackendError::Connect
     })?
     .map_err(|_| {
         crate::internet::invalidate_backend_path("connect_failed");
-        info!("backend request connect failed path={}", path);
+        warn!("backend request connect failed path={}", path);
         log_request_heap(path, "connect failed");
         BackendError::Connect
     })?;
     crate::internet::record_backend_endpoint(resolved_remote.addr, "request_connect_ok");
     metrics.connect_ms = elapsed_since_ms(connect_started_ms);
-    info!(
+    crate::verbose_diag!(
         "backend request connect ok path={} remote_ip={} connect_ms={}",
-        path, resolved_remote.addr, metrics.connect_ms
+        path,
+        resolved_remote.addr,
+        metrics.connect_ms
     );
     if matches!(resolved_remote.source, BackendEndpointSource::Cached) {
         info!(
@@ -2489,7 +2519,7 @@ async fn open_backend_session<'a>(
     log_request_phase(trace, path, class, "tls_setup_start", metrics.elapsed_ms());
     let mut session = open_tls_session(tls, ca_chain, CompatConnection::new(connection))
         .inspect_err(|_err| {
-            info!("backend request tls setup failed path={}", path);
+            warn!("backend request tls setup failed path={}", path);
             log_request_heap(path, "tls setup failed");
         })?;
     prepare_tls_session_resume(
@@ -2518,12 +2548,14 @@ async fn open_backend_session<'a>(
     log_request_heap(path, "tls handshake ok");
     log_request_phase(trace, path, class, "tls_handshake_ok", metrics.elapsed_ms());
     let verification_flags = session.tls_verification_details();
-    info!(
+    crate::verbose_diag!(
         "backend request tls ok path={} tls_ms={} verification_flags=0x{:08x}",
-        path, metrics.tls_ms, verification_flags
+        path,
+        metrics.tls_ms,
+        verification_flags
     );
     if verification_flags != 0 {
-        info!(
+        warn!(
             "backend request tls verification flags path={} flags=0x{:08x}",
             path, verification_flags
         );
@@ -2551,9 +2583,11 @@ async fn resolve_backend_remote(
 
     match remote {
         Ok(IpAddr::V4(addr)) => {
-            info!(
+            crate::verbose_diag!(
                 "backend request dns ok path={} remote_ip={} dns_ms={}",
-                path, addr, metrics.dns_ms
+                path,
+                addr,
+                metrics.dns_ms
             );
             log_request_phase(trace, path, class, "dns_ok", metrics.dns_ms);
             Ok(ResolvedBackendRemote {
@@ -2607,8 +2641,8 @@ where
     info!("backend tls close start reason={}", reason);
     match with_timeout(Duration::from_millis(250), session.close()).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => info!("backend tls close failed reason={} err={:?}", reason, err),
-        Err(_) => info!("backend tls close timed out reason={}", reason),
+        Ok(Err(err)) => warn!("backend tls close failed reason={} err={:?}", reason, err),
+        Err(_) => warn!("backend tls close timed out reason={}", reason),
     }
 }
 
@@ -4088,7 +4122,7 @@ async fn stream_https_response_body_to_storage_reusing_session<'a>(
     match first_attempt {
         Err(err) if is_transient_transport_error(err) && TRANSPORT_RETRY_ATTEMPTS > 1 => {
             close_reusable_session(reusable_session, "stream retry").await;
-            info!(
+            warn!(
                 "backend request retry path={} attempt=1 err={:?}",
                 request.path, err
             );
@@ -4267,8 +4301,8 @@ where
         let body_start = header_end + 4;
         let initial_body_len = header_len.saturating_sub(body_start);
         let response_reusable = is_response_connection_reusable(metadata);
-        info!(
-            "backend request stream headers path={} status={} header_bytes={} initial_body_bytes={} content_length={:?} chunked={} connection_close={} response_reusable={} elapsed_ms={}",
+        crate::verbose_diag!(
+            "backend request stream headers path={} status={} header_bytes={} initial_body_bytes={} content_length={:?} chunked={} connection_close={} response_reusable={} storage_handoff_chunk_len={} elapsed_ms={}",
             path,
             metadata.status,
             metadata.body_start,
@@ -4277,6 +4311,7 @@ where
             metadata.chunked,
             metadata.connection_close,
             response_reusable,
+            PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
             metrics.elapsed_ms(),
         );
         crate::memtrace!(
@@ -4292,6 +4327,7 @@ where
             "initial_body_bytes" = initial_body_len,
             "content_length_known" = bool_flag(metadata.content_length.is_some()),
             "content_length" = metadata.content_length.unwrap_or(0),
+            "storage_handoff_chunk_len" = PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
             "response_buffer_capacity" = 0,
             "response_buffer_headroom" = 0,
             "connection_close" = bool_flag(connection_close),
@@ -4325,10 +4361,13 @@ where
                 if initial_body_len > 0 {
                     chunk[..initial_body_len].copy_from_slice(&header[body_start..header_len]);
                     buffered_chunk_len = initial_body_len;
-                    if buffered_chunk_len == chunk.len() {
-                        flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len)
-                            .await?;
-                    }
+                    drain_buffered_package_chunks(
+                        metrics.trace,
+                        chunk,
+                        &mut buffered_chunk_len,
+                        PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
+                    )
+                    .await?;
                     streamed_body_bytes = initial_body_len;
                     log_stream_progress_if_needed(
                         metrics,
@@ -4368,10 +4407,13 @@ where
                         Some(content_length),
                         metrics.elapsed_ms(),
                     );
-                    if buffered_chunk_len == chunk.len() {
-                        flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len)
-                            .await?;
-                    }
+                    drain_buffered_package_chunks(
+                        metrics.trace,
+                        chunk,
+                        &mut buffered_chunk_len,
+                        PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
+                    )
+                    .await?;
                 }
                 flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
                 log_stream_complete(
@@ -4393,10 +4435,13 @@ where
                 if initial_body_len > 0 {
                     chunk[..initial_body_len].copy_from_slice(&header[body_start..header_len]);
                     buffered_chunk_len = initial_body_len;
-                    if buffered_chunk_len == chunk.len() {
-                        flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len)
-                            .await?;
-                    }
+                    drain_buffered_package_chunks(
+                        metrics.trace,
+                        chunk,
+                        &mut buffered_chunk_len,
+                        PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
+                    )
+                    .await?;
                     streamed_body_bytes = initial_body_len;
                     log_stream_progress_if_needed(
                         metrics,
@@ -4415,7 +4460,16 @@ where
 
     loop {
         if buffered_chunk_len == chunk.len() {
-            flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
+            drain_buffered_package_chunks(
+                metrics.trace,
+                chunk,
+                &mut buffered_chunk_len,
+                PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
+            )
+            .await?;
+            if buffered_chunk_len == chunk.len() {
+                flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
+            }
         }
         let read = await_body_io_timeout_for(
             path,
@@ -4438,6 +4492,13 @@ where
             None,
             metrics.elapsed_ms(),
         );
+        drain_buffered_package_chunks(
+            metrics.trace,
+            chunk,
+            &mut buffered_chunk_len,
+            PACKAGE_STORAGE_HANDOFF_CHUNK_LEN,
+        )
+        .await?;
     }
     flush_buffered_package_chunk(metrics.trace, chunk, &mut buffered_chunk_len).await?;
 
@@ -4456,6 +4517,24 @@ where
         connection_reusable: false,
     })
 }
+
+async fn drain_buffered_package_chunks(
+    trace: TraceContext,
+    chunk: &mut [u8],
+    buffered_len: &mut usize,
+    storage_handoff_chunk_len: usize,
+) -> Result<(), BackendError> {
+    if storage_handoff_chunk_len == 0 {
+        return Ok(());
+    }
+
+    while *buffered_len >= storage_handoff_chunk_len {
+        write_buffered_package_prefix(trace, chunk, buffered_len, storage_handoff_chunk_len)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn flush_buffered_package_chunk(
     trace: TraceContext,
     chunk: &mut [u8],
@@ -4469,6 +4548,32 @@ async fn flush_buffered_package_chunk(
         .map_err(map_storage_backend_error)?;
     *buffered_len = 0;
     Ok(())
+}
+
+async fn write_buffered_package_prefix(
+    trace: TraceContext,
+    chunk: &mut [u8],
+    buffered_len: &mut usize,
+    write_len: usize,
+) -> Result<(), BackendError> {
+    if *buffered_len < write_len {
+        return Ok(());
+    }
+
+    content_storage::write_package_chunk_traced(trace, &chunk[..write_len])
+        .await
+        .map_err(map_storage_backend_error)?;
+    consume_buffered_chunk_prefix(chunk, buffered_len, write_len);
+    Ok(())
+}
+
+fn consume_buffered_chunk_prefix(chunk: &mut [u8], buffered_len: &mut usize, consumed_len: usize) {
+    let consumed_len = consumed_len.min(*buffered_len);
+    let remaining_len = (*buffered_len).saturating_sub(consumed_len);
+    if remaining_len > 0 {
+        chunk.copy_within(consumed_len..*buffered_len, 0);
+    }
+    *buffered_len = remaining_len;
 }
 
 fn parse_http_status(response: &[u8]) -> Result<u16, BackendError> {
@@ -5405,46 +5510,52 @@ fn log_heap(label: &str) {
     );
 }
 
-fn log_request_heap(path: &str, stage: &str) {
-    let stats = crate::telemetry::capture_heap();
-    info!(
-        "backend heap path={} stage={} size={} used={} free={} internal_size={} internal_used={} internal_free={} internal_peak_used={} internal_min_free={} external_size={} external_used={} external_free={} external_peak_used={} external_min_free={}",
-        path,
-        stage,
-        stats.size,
-        stats.used,
-        stats.free,
-        stats.internal_size,
-        stats.internal_used,
-        stats.internal_free,
-        stats.internal_peak_used,
-        stats.internal_min_free,
-        stats.external_size,
-        stats.external_used,
-        stats.external_free,
-        stats.external_peak_used,
-        stats.external_min_free,
-    );
-    info!(
-        "backend heap regions path={} stage={} region0_kind={} region0_used={} region0_free={} region0_peak_used={} region0_min_free={} region1_kind={} region1_used={} region1_free={} region1_peak_used={} region1_min_free={} region2_kind={} region2_used={} region2_free={} region2_peak_used={} region2_min_free={}",
-        path,
-        stage,
-        stats.regions[0].kind,
-        stats.regions[0].used,
-        stats.regions[0].free,
-        stats.regions[0].peak_used,
-        stats.regions[0].min_free,
-        stats.regions[1].kind,
-        stats.regions[1].used,
-        stats.regions[1].free,
-        stats.regions[1].peak_used,
-        stats.regions[1].min_free,
-        stats.regions[2].kind,
-        stats.regions[2].used,
-        stats.regions[2].free,
-        stats.regions[2].peak_used,
-        stats.regions[2].min_free,
-    );
+fn log_request_heap(_path: &str, _stage: &str) {
+    #[cfg(not(feature = "telemetry-verbose-diagnostics"))]
+    let _ = (_path, _stage);
+
+    #[cfg(feature = "telemetry-verbose-diagnostics")]
+    {
+        let stats = crate::telemetry::capture_heap();
+        info!(
+            "backend heap path={} stage={} size={} used={} free={} internal_size={} internal_used={} internal_free={} internal_peak_used={} internal_min_free={} external_size={} external_used={} external_free={} external_peak_used={} external_min_free={}",
+            _path,
+            _stage,
+            stats.size,
+            stats.used,
+            stats.free,
+            stats.internal_size,
+            stats.internal_used,
+            stats.internal_free,
+            stats.internal_peak_used,
+            stats.internal_min_free,
+            stats.external_size,
+            stats.external_used,
+            stats.external_free,
+            stats.external_peak_used,
+            stats.external_min_free,
+        );
+        info!(
+            "backend heap regions path={} stage={} region0_kind={} region0_used={} region0_free={} region0_peak_used={} region0_min_free={} region1_kind={} region1_used={} region1_free={} region1_peak_used={} region1_min_free={} region2_kind={} region2_used={} region2_free={} region2_peak_used={} region2_min_free={}",
+            _path,
+            _stage,
+            stats.regions[0].kind,
+            stats.regions[0].used,
+            stats.regions[0].free,
+            stats.regions[0].peak_used,
+            stats.regions[0].min_free,
+            stats.regions[1].kind,
+            stats.regions[1].used,
+            stats.regions[1].free,
+            stats.regions[1].peak_used,
+            stats.regions[1].min_free,
+            stats.regions[2].kind,
+            stats.regions[2].used,
+            stats.regions[2].free,
+            stats.regions[2].peak_used,
+            stats.regions[2].min_free,
+        );
+    }
 }
 
 fn now_ms() -> u64 {
@@ -5528,18 +5639,22 @@ fn log_stream_progress_if_needed(
         return;
     }
 
-    let stats = esp_alloc::HEAP.stats();
     let remaining_bytes = total_bytes.map(|total| total.saturating_sub(received_bytes));
-    info!(
-        "backend request stream progress path={} received_bytes={} total_bytes={:?} remaining_bytes={:?} elapsed_ms={} heap_used={} heap_free={}",
-        path,
-        received_bytes,
-        total_bytes,
-        remaining_bytes,
-        elapsed_ms,
-        stats.current_usage,
-        stats.size.saturating_sub(stats.current_usage),
-    );
+
+    #[cfg(feature = "telemetry-verbose-diagnostics")]
+    {
+        let stats = esp_alloc::HEAP.stats();
+        info!(
+            "backend request stream progress path={} received_bytes={} total_bytes={:?} remaining_bytes={:?} elapsed_ms={} heap_used={} heap_free={}",
+            path,
+            received_bytes,
+            total_bytes,
+            remaining_bytes,
+            elapsed_ms,
+            stats.current_usage,
+            stats.size.saturating_sub(stats.current_usage),
+        );
+    }
     crate::memtrace!(
         "request_stream_progress",
         "component" = "backend",
@@ -5569,17 +5684,20 @@ fn log_stream_complete(
     response_reusable: bool,
     elapsed_ms: u64,
 ) {
-    let stats = esp_alloc::HEAP.stats();
-    info!(
-        "backend request stream complete path={} received_bytes={} total_bytes={:?} response_reusable={} elapsed_ms={} heap_used={} heap_free={}",
-        path,
-        received_bytes,
-        total_bytes,
-        response_reusable,
-        elapsed_ms,
-        stats.current_usage,
-        stats.size.saturating_sub(stats.current_usage),
-    );
+    #[cfg(feature = "telemetry-verbose-diagnostics")]
+    {
+        let stats = esp_alloc::HEAP.stats();
+        info!(
+            "backend request stream complete path={} received_bytes={} total_bytes={:?} response_reusable={} elapsed_ms={} heap_used={} heap_free={}",
+            path,
+            received_bytes,
+            total_bytes,
+            response_reusable,
+            elapsed_ms,
+            stats.current_usage,
+            stats.size.saturating_sub(stats.current_usage),
+        );
+    }
     crate::memtrace!(
         "request_stream_complete",
         "component" = "backend",
@@ -6004,5 +6122,28 @@ mod tests {
         assert_eq!(page.collection.len(), 1);
         assert_eq!(page.next_cursor.as_ref().unwrap().as_str(), "cursor-2");
         assert!(page.body_preview.is_some());
+    }
+
+    #[test]
+    fn consume_buffered_chunk_prefix_compacts_remaining_bytes() {
+        let mut chunk = [0u8; 8];
+        chunk[..6].copy_from_slice(b"ABCDEF");
+        let mut buffered_len = 6usize;
+
+        consume_buffered_chunk_prefix(&mut chunk, &mut buffered_len, 4);
+
+        assert_eq!(buffered_len, 2);
+        assert_eq!(&chunk[..buffered_len], b"EF");
+    }
+
+    #[test]
+    fn consume_buffered_chunk_prefix_saturates_to_empty() {
+        let mut chunk = [0u8; 8];
+        chunk[..3].copy_from_slice(b"XYZ");
+        let mut buffered_len = 3usize;
+
+        consume_buffered_chunk_prefix(&mut chunk, &mut buffered_len, 8);
+
+        assert_eq!(buffered_len, 0);
     }
 }

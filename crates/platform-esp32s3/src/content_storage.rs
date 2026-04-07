@@ -1,3 +1,11 @@
+#![cfg_attr(
+    not(all(
+        feature = "telemetry-memtrace",
+        feature = "telemetry-verbose-diagnostics"
+    )),
+    allow(unused_imports, unused_variables)
+)]
+
 extern crate alloc;
 
 use alloc::{boxed::Box, string::String, vec::Vec};
@@ -30,7 +38,7 @@ use embedded_sdmmc::{
     SdCard, ShortFileName, TimeSource, Timestamp, VolumeIdx, VolumeManager,
 };
 use esp_hal::{Blocking, delay::Delay, gpio::Output, spi::master::Spi, time::Rate};
-use log::info;
+use log::{info, warn};
 use services::storage::StorageError;
 
 use crate::telemetry::{TraceContext, bool_flag, collection_label};
@@ -55,7 +63,8 @@ const READER_PACKAGE_HEADER_LEN: usize = 32;
 const READER_PACKAGE_PARAGRAPH_ENTRY_LEN: usize = 72;
 const READER_PACKAGE_UNIT_ENTRY_LEN: usize = 40;
 const PACKAGE_COPY_BUFFER_LEN: usize = 8 * 1024;
-const STAGE_WRITE_CHUNK_LEN: usize = crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN;
+const STAGE_WRITE_CHUNK_LEN: usize =
+    crate::transfer_tuning::PACKAGE_TRANSFER_STORAGE_HANDOFF_CHUNK_LEN;
 const STAGE_FLUSH_INTERVAL_BYTES: u32 =
     crate::transfer_tuning::PACKAGE_TRANSFER_FLUSH_INTERVAL_BYTES;
 const STAGE_PROGRESS_LOG_INTERVAL_BYTES: u32 = 16 * 1024;
@@ -496,6 +505,9 @@ pub(crate) fn log_static_inventory(
         "collection_manifest_state_bytes" = size_of::<CollectionManifestState>(),
         "storage_queue_capacity" = STORAGE_CMD_QUEUE_CAPACITY,
         "storage_queue_resident_bytes" = STORAGE_CMD_QUEUE_CAPACITY * size_of::<StorageCommand>(),
+        "transfer_receive_chunk_len" = crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN,
+        "transfer_storage_handoff_chunk_len" =
+            crate::transfer_tuning::PACKAGE_TRANSFER_STORAGE_HANDOFF_CHUNK_LEN,
         "stage_write_chunk_len" = STAGE_WRITE_CHUNK_LEN,
         "stage_write_chunk_source" = crate::transfer_tuning::PACKAGE_TRANSFER_SOURCE,
         "stage_flush_interval_bytes" = STAGE_FLUSH_INTERVAL_BYTES,
@@ -650,7 +662,7 @@ pub fn mount<'d>(
     let device = match ExclusiveDevice::new_no_delay(spi, cs) {
         Ok(device) => device,
         Err(_) => {
-            info!("content storage mount failed: sd chip-select init");
+            warn!("content storage mount failed: sd chip-select init");
             return ContentStorageMount {
                 storage: None,
                 sd_card_ready: false,
@@ -669,7 +681,7 @@ pub fn mount<'d>(
     let total_bytes = match card.num_bytes() {
         Ok(bytes) => bytes,
         Err(err) => {
-            info!("content storage mount failed: {:?}", err);
+            warn!("content storage mount failed: {:?}", err);
             return ContentStorageMount {
                 storage: None,
                 sd_card_ready: false,
@@ -689,10 +701,11 @@ pub fn mount<'d>(
     {
         Ok(()) => {
             info!(
-                "content storage sd spi run hz={} source={} transfer_chunk_len={} transfer_flush_interval_bytes={} transfer_source={}",
+                "content storage sd spi run hz={} source={} transfer_chunk_len={} transfer_storage_handoff_chunk_len={} transfer_flush_interval_bytes={} transfer_source={}",
                 run_spi_hz,
                 run_spi_source,
                 crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN,
+                crate::transfer_tuning::PACKAGE_TRANSFER_STORAGE_HANDOFF_CHUNK_LEN,
                 crate::transfer_tuning::PACKAGE_TRANSFER_FLUSH_INTERVAL_BYTES,
                 crate::transfer_tuning::PACKAGE_TRANSFER_SOURCE,
             );
@@ -700,10 +713,11 @@ pub fn mount<'d>(
         }
         Err(err) => {
             info!(
-                "content storage sd spi speed switch failed hz={} source={} transfer_chunk_len={} transfer_flush_interval_bytes={} transfer_source={} err={:?}",
+                "content storage sd spi speed switch failed hz={} source={} transfer_chunk_len={} transfer_storage_handoff_chunk_len={} transfer_flush_interval_bytes={} transfer_source={} err={:?}",
                 run_spi_hz,
                 run_spi_source,
                 crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN,
+                crate::transfer_tuning::PACKAGE_TRANSFER_STORAGE_HANDOFF_CHUNK_LEN,
                 crate::transfer_tuning::PACKAGE_TRANSFER_FLUSH_INTERVAL_BYTES,
                 crate::transfer_tuning::PACKAGE_TRANSFER_SOURCE,
                 err
@@ -731,7 +745,7 @@ pub fn mount<'d>(
     let mut last_recovery = StorageRecoveryStatus::Clean;
 
     if let Err(err) = storage.initialize_layout() {
-        info!("content storage layout init failed: {:?}", err);
+        warn!("content storage layout init failed: {:?}", err);
         if matches!(err, StorageError::CorruptData) {
             info!(
                 "content storage layout corrupt: wiping motif sd data root={} version={}",
@@ -743,7 +757,7 @@ pub fn mount<'d>(
                     info!("content storage layout recovered by wiping motif sd data");
                 }
                 Err(recovery_err) => {
-                    info!("content storage layout recovery failed: {:?}", recovery_err);
+                    warn!("content storage layout recovery failed: {:?}", recovery_err);
                     return ContentStorageMount {
                         storage: None,
                         sd_card_ready: false,
@@ -769,7 +783,7 @@ pub fn mount<'d>(
             };
         }
     } else if let Err(err) = storage.load_state() {
-        info!("content storage state load failed: {:?}", err);
+        warn!("content storage state load failed: {:?}", err);
         if matches!(err, StorageError::CorruptData) {
             info!(
                 "content storage state corrupt: wiping motif sd data root={} version={}",
@@ -781,7 +795,7 @@ pub fn mount<'d>(
                     info!("content storage state recovered by wiping motif sd data");
                 }
                 Err(recovery_err) => {
-                    info!("content storage state recovery failed: {:?}", recovery_err);
+                    warn!("content storage state recovery failed: {:?}", recovery_err);
                     return ContentStorageMount {
                         storage: None,
                         sd_card_ready: false,
@@ -826,7 +840,7 @@ pub fn install(spawner: Spawner, storage: Option<Box<SdContentStorage<'static>>>
     };
 
     if spawner.spawn(content_storage_task(storage)).is_err() {
-        info!("content storage failed to spawn task");
+        warn!("content storage failed to spawn task");
     }
 }
 
@@ -1647,7 +1661,7 @@ impl<'d> SdContentStorage<'d> {
             self.flush_stage_file(stage.stage_file)?;
             stage.flushed_bytes = stage.bytes_written;
             let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
-            info!(
+            crate::verbose_diag!(
                 "content storage stage flush content_id={} slot={} bytes_written={} dirty_bytes={} elapsed_ms={}",
                 stage.content_id.as_str(),
                 stage.slot_id,
@@ -1684,7 +1698,7 @@ impl<'d> SdContentStorage<'d> {
         };
         if crossed_progress_boundary {
             let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
-            info!(
+            crate::verbose_diag!(
                 "content storage stage progress content_id={} slot={} bytes_written={} chunk_len={} elapsed_ms={}",
                 stage.content_id.as_str(),
                 stage.slot_id,
@@ -1766,7 +1780,7 @@ impl<'d> SdContentStorage<'d> {
             self.flush_stage_file(stage.stage_file)?;
             let metrics = self.storage_space_metrics_for_open_volume(stage.stage_volume)?;
             let dirty_bytes = stage.bytes_written.saturating_sub(stage.flushed_bytes);
-            info!(
+            crate::verbose_diag!(
                 "content storage stage flush content_id={} slot={} bytes_written={} dirty_bytes={} elapsed_ms={}",
                 stage.content_id.as_str(),
                 stage.slot_id,

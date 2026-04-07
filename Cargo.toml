@@ -14,6 +14,12 @@ members = [
   "crates/ls027b7dh01",
 ]
 
+[features]
+default = []
+firmware-info-logs = []
+telemetry-memtrace = ["platform-esp32s3/telemetry-memtrace"]
+telemetry-verbose-diagnostics = ["platform-esp32s3/telemetry-verbose-diagnostics"]
+
 [patch."https://github.com/esp-rs/esp-mbedtls.git"]
 mbedtls-rs = { path = "third_party/mbedtls-rs" }
 mbedtls-rs-sys = { path = "third_party/mbedtls-rs-sys" }

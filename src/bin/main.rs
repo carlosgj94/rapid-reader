@@ -17,9 +17,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+#[cfg(feature = "firmware-info-logs")]
+const FIRMWARE_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
+#[cfg(not(feature = "firmware-info-logs"))]
+const FIRMWARE_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Warn;
+
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
-    esp_println::logger::init_logger(log::LevelFilter::Info);
+    esp_println::logger::init_logger(FIRMWARE_LOG_LEVEL);
     esp_println::println!("boot: motif minimal firmware");
     platform_esp32s3::bootstrap::run_minimal(spawner).await
 }

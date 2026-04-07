@@ -226,6 +226,7 @@ fn region_kind(region: &RegionStats) -> &'static str {
     }
 }
 
+#[cfg(feature = "telemetry-memtrace")]
 #[macro_export]
 macro_rules! memtrace {
     ($kind:literal $(, $key:literal = $value:expr )* $(,)?) => {{
@@ -284,4 +285,24 @@ macro_rules! memtrace {
             snapshot.regions[2].min_free,
         );
     }};
+}
+
+#[cfg(not(feature = "telemetry-memtrace"))]
+#[macro_export]
+macro_rules! memtrace {
+    ($($tt:tt)*) => {{}};
+}
+
+#[cfg(feature = "telemetry-verbose-diagnostics")]
+#[macro_export]
+macro_rules! verbose_diag {
+    ($($arg:tt)*) => {{
+        log::info!($($arg)*);
+    }};
+}
+
+#[cfg(not(feature = "telemetry-verbose-diagnostics"))]
+#[macro_export]
+macro_rules! verbose_diag {
+    ($($tt:tt)*) => {{}};
 }

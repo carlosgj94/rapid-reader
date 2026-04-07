@@ -13,7 +13,7 @@ use esp_radio::wifi::{
     ClientConfig, Config as WifiDriverConfig, CountryInfo, ModeConfig, PowerSaveMode,
     WifiController, WifiDevice, WifiEvent, WifiStaState,
 };
-use log::info;
+use log::{info, warn};
 
 use domain::{
     network::{NetworkState, NetworkStatus},
@@ -89,7 +89,7 @@ pub fn install(spawner: Spawner, wifi: WIFI<'static>) -> Option<Stack<'static>> 
     let controller = match esp_radio::init() {
         Ok(controller) => Box::leak(Box::new(controller)),
         Err(err) => {
-            info!("internet init failed: {:?}", err);
+            warn!("internet init failed: {:?}", err);
             publish_status(NetworkStatus::Offline);
             return None;
         }
@@ -112,7 +112,7 @@ pub fn install(spawner: Spawner, wifi: WIFI<'static>) -> Option<Stack<'static>> 
         match esp_radio::wifi::new(controller, wifi, wifi_driver_config) {
             Ok(parts) => parts,
             Err(err) => {
-                info!("internet wifi setup failed: {:?}", err);
+                warn!("internet wifi setup failed: {:?}", err);
                 publish_status(NetworkStatus::Offline);
                 return None;
             }
@@ -139,19 +139,19 @@ pub fn install(spawner: Spawner, wifi: WIFI<'static>) -> Option<Stack<'static>> 
         .spawn(connection_task(wifi_controller, credentials))
         .is_err()
     {
-        info!("internet failed to spawn connection task");
+        warn!("internet failed to spawn connection task");
         publish_status(NetworkStatus::Offline);
         return None;
     }
 
     if spawner.spawn(net_task(runner)).is_err() {
-        info!("internet failed to spawn network runner task");
+        warn!("internet failed to spawn network runner task");
         publish_status(NetworkStatus::Offline);
         return None;
     }
 
     if spawner.spawn(probe_task(stack)).is_err() {
-        info!("internet failed to spawn probe task");
+        warn!("internet failed to spawn probe task");
         publish_status(NetworkStatus::Offline);
         return None;
     }
@@ -310,7 +310,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
             );
 
             if let Err(err) = controller.set_config(&client_config) {
-                info!("internet wifi config failed: {:?}", err);
+                warn!("internet wifi config failed: {:?}", err);
                 invalidate_backend_path("wifi_config_failed");
                 publish_status(NetworkStatus::Offline);
                 Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
@@ -319,7 +319,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
 
             info!("internet starting wifi");
             if let Err(err) = controller.start_async().await {
-                info!("internet wifi start failed: {:?}", err);
+                warn!("internet wifi start failed: {:?}", err);
                 invalidate_backend_path("wifi_start_failed");
                 publish_status(NetworkStatus::Offline);
                 Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
@@ -333,7 +333,7 @@ async fn connection_task(mut controller: WifiController<'static>, credentials: W
         match controller.connect_async().await {
             Ok(_) => info!("internet wifi associated"),
             Err(err) => {
-                info!("internet wifi connect failed: {:?}", err);
+                warn!("internet wifi connect failed: {:?}", err);
                 invalidate_backend_path("wifi_connect_failed");
                 publish_status(NetworkStatus::Offline);
                 Timer::after(Duration::from_millis(RECONNECT_BACKOFF_MS)).await;
@@ -401,7 +401,7 @@ async fn probe_task(stack: Stack<'static>) {
                 probe_ready = true;
             }
             Err(err) => {
-                info!("internet probe failed: {:?}", err);
+                warn!("internet probe failed: {:?}", err);
                 invalidate_backend_path("probe_failed");
                 publish_status(NetworkStatus::ProbeFailed);
                 Timer::after(Duration::from_millis(STATUS_POLL_MS)).await;
