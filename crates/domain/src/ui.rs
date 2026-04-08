@@ -1,4 +1,4 @@
-use crate::content::CollectionKind;
+use crate::{content::CollectionKind, settings::TOPIC_CATEGORY_COUNT};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum UiRoute {
@@ -18,6 +18,8 @@ pub enum DashboardFocus {
 }
 
 impl DashboardFocus {
+    pub const COUNT: usize = 3;
+
     pub const fn as_collection(self) -> CollectionKind {
         match self {
             Self::Inbox => CollectionKind::Inbox,
@@ -26,19 +28,19 @@ impl DashboardFocus {
         }
     }
 
-    pub const fn previous(self) -> Self {
+    pub const fn index(self) -> usize {
         match self {
-            Self::Inbox => Self::Recommendations,
-            Self::Saved => Self::Inbox,
-            Self::Recommendations => Self::Saved,
+            Self::Inbox => 0,
+            Self::Saved => 1,
+            Self::Recommendations => 2,
         }
     }
 
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Inbox => Self::Saved,
-            Self::Saved => Self::Recommendations,
-            Self::Recommendations => Self::Inbox,
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Inbox,
+            1 => Self::Saved,
+            _ => Self::Recommendations,
         }
     }
 }
@@ -78,25 +80,25 @@ impl SettingsRow {
         }
     }
 
-    pub const fn previous(self) -> Self {
+    pub const fn index(self) -> usize {
         match self {
-            Self::ReadingSpeed => Self::ConnectAccount,
-            Self::Appearance => Self::ReadingSpeed,
-            Self::RefreshData => Self::Appearance,
-            Self::TopicPreferences => Self::RefreshData,
-            Self::NetworkConnection => Self::TopicPreferences,
-            Self::ConnectAccount => Self::NetworkConnection,
+            Self::ReadingSpeed => 0,
+            Self::Appearance => 1,
+            Self::RefreshData => 2,
+            Self::TopicPreferences => 3,
+            Self::NetworkConnection => 4,
+            Self::ConnectAccount => 5,
         }
     }
 
-    pub const fn next(self) -> Self {
-        match self {
-            Self::ReadingSpeed => Self::Appearance,
-            Self::Appearance => Self::RefreshData,
-            Self::RefreshData => Self::TopicPreferences,
-            Self::TopicPreferences => Self::NetworkConnection,
-            Self::NetworkConnection => Self::ConnectAccount,
-            Self::ConnectAccount => Self::ReadingSpeed,
+    pub const fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::ReadingSpeed,
+            1 => Self::Appearance,
+            2 => Self::RefreshData,
+            3 => Self::TopicPreferences,
+            4 => Self::NetworkConnection,
+            _ => Self::ConnectAccount,
         }
     }
 }
@@ -179,59 +181,81 @@ impl UiState {
     }
 
     pub fn move_dashboard_previous(&mut self) {
-        self.dashboard_focus = self.dashboard_focus.previous();
+        self.dashboard_focus =
+            DashboardFocus::from_index(self.dashboard_focus.index().saturating_sub(1));
     }
 
     pub fn move_dashboard_next(&mut self) {
-        self.dashboard_focus = self.dashboard_focus.next();
+        self.dashboard_focus = DashboardFocus::from_index(
+            self.dashboard_focus
+                .index()
+                .saturating_add(1)
+                .min(DashboardFocus::COUNT.saturating_sub(1)),
+        );
     }
 
     pub fn move_collection_previous(&mut self, kind: CollectionKind, len: usize) {
-        if len <= 1 {
-            return;
-        }
-
         let target = match kind {
             CollectionKind::Saved => &mut self.saved_index,
             CollectionKind::Inbox => &mut self.inbox_index,
             CollectionKind::Recommendations => &mut self.recommendations_index,
         };
 
-        *target = (*target + len - 1) % len;
+        if len == 0 {
+            *target = 0;
+            return;
+        }
+
+        *target = (*target).min(len.saturating_sub(1)).saturating_sub(1);
     }
 
     pub fn move_collection_next(&mut self, kind: CollectionKind, len: usize) {
-        if len <= 1 {
-            return;
-        }
-
         let target = match kind {
             CollectionKind::Saved => &mut self.saved_index,
             CollectionKind::Inbox => &mut self.inbox_index,
             CollectionKind::Recommendations => &mut self.recommendations_index,
         };
 
-        *target = (*target + 1) % len;
+        if len == 0 {
+            *target = 0;
+            return;
+        }
+
+        *target = (*target)
+            .min(len.saturating_sub(1))
+            .saturating_add(1)
+            .min(len.saturating_sub(1));
     }
 
     pub fn move_settings_previous(&mut self) {
-        self.settings_row = self.settings_row.previous();
+        self.settings_row = SettingsRow::from_index(self.settings_row.index().saturating_sub(1));
     }
 
     pub fn move_settings_next(&mut self) {
-        self.settings_row = self.settings_row.next();
+        self.settings_row = SettingsRow::from_index(
+            self.settings_row
+                .index()
+                .saturating_add(1)
+                .min(SettingsRow::COUNT.saturating_sub(1)),
+        );
     }
 
     pub fn move_topic_previous(&mut self, chip_count: usize) {
         match self.topic_focus.region {
             TopicRegion::Categories => {
-                self.topic_focus.category_index =
-                    (self.topic_focus.category_index + 4usize - 1) % 4usize;
+                self.topic_focus.category_index = self.topic_focus.category_index.saturating_sub(1);
                 self.topic_focus.chip_index = 0;
             }
             TopicRegion::Chips => {
-                self.topic_focus.chip_index =
-                    (self.topic_focus.chip_index + chip_count - 1) % chip_count.max(1);
+                if chip_count == 0 {
+                    self.topic_focus.chip_index = 0;
+                } else {
+                    self.topic_focus.chip_index = self
+                        .topic_focus
+                        .chip_index
+                        .min(chip_count.saturating_sub(1))
+                        .saturating_sub(1);
+                }
             }
         }
     }
@@ -239,11 +263,24 @@ impl UiState {
     pub fn move_topic_next(&mut self, chip_count: usize) {
         match self.topic_focus.region {
             TopicRegion::Categories => {
-                self.topic_focus.category_index = (self.topic_focus.category_index + 1) % 4usize;
+                self.topic_focus.category_index = self
+                    .topic_focus
+                    .category_index
+                    .saturating_add(1)
+                    .min(TOPIC_CATEGORY_COUNT.saturating_sub(1));
                 self.topic_focus.chip_index = 0;
             }
             TopicRegion::Chips => {
-                self.topic_focus.chip_index = (self.topic_focus.chip_index + 1) % chip_count.max(1);
+                if chip_count == 0 {
+                    self.topic_focus.chip_index = 0;
+                } else {
+                    self.topic_focus.chip_index = self
+                        .topic_focus
+                        .chip_index
+                        .min(chip_count.saturating_sub(1))
+                        .saturating_add(1)
+                        .min(chip_count.saturating_sub(1));
+                }
             }
         }
     }

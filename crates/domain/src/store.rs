@@ -546,16 +546,27 @@ impl Store {
 
         match command {
             UiCommand::FocusPrevious => {
-                if subtopic_len > 1 {
-                    self.ui.recommendations_subtopic_index =
-                        (self.ui.recommendations_subtopic_index + subtopic_len - 1) % subtopic_len;
+                if subtopic_len == 0 {
+                    self.ui.recommendations_subtopic_index = 0;
+                } else {
+                    self.ui.recommendations_subtopic_index = self
+                        .ui
+                        .recommendations_subtopic_index
+                        .min(subtopic_len.saturating_sub(1))
+                        .saturating_sub(1);
                 }
                 self.ui.recommendations_focus_flash_ticks = 0;
             }
             UiCommand::FocusNext => {
-                if subtopic_len > 1 {
-                    self.ui.recommendations_subtopic_index =
-                        (self.ui.recommendations_subtopic_index + 1) % subtopic_len;
+                if subtopic_len == 0 {
+                    self.ui.recommendations_subtopic_index = 0;
+                } else {
+                    self.ui.recommendations_subtopic_index = self
+                        .ui
+                        .recommendations_subtopic_index
+                        .min(subtopic_len.saturating_sub(1))
+                        .saturating_add(1)
+                        .min(subtopic_len.saturating_sub(1));
                 }
                 self.ui.recommendations_focus_flash_ticks = 0;
             }
@@ -1074,6 +1085,18 @@ mod tests {
         item.title.set_truncated("Example saved title");
         item.remote_status = RemoteContentStatus::Ready;
         item.package_state = package_state;
+        item
+    }
+
+    fn make_manifest_item(remote_item_id: &str, title: &str) -> CollectionManifestItem {
+        let mut item = CollectionManifestItem::empty();
+        item.remote_item_id.set_truncated(remote_item_id);
+        item.content_id.set_truncated(remote_item_id);
+        item.detail_locator = DetailLocator::Saved;
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.title.set_truncated(title);
+        item.remote_status = RemoteContentStatus::Ready;
+        item.package_state = PackageState::Cached;
         item
     }
 
@@ -1947,6 +1970,86 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store.ui.saved_index, 0);
+    }
+
+    #[test]
+    fn dashboard_focus_previous_stops_at_first_item() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Dashboard;
+        store.ui.dashboard_focus = crate::ui::DashboardFocus::Inbox;
+
+        let effect = store
+            .dispatch(Command::Ui(UiCommand::FocusPrevious))
+            .unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.ui.dashboard_focus, crate::ui::DashboardFocus::Inbox);
+    }
+
+    #[test]
+    fn collection_focus_next_stops_at_last_item() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Saved);
+        let mut collection = CollectionManifestState::empty();
+        let _ = collection.try_push(make_manifest_item("saved-1", "First"));
+        let _ = collection.try_push(make_manifest_item("saved-2", "Second"));
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Saved, collection);
+        store.ui.saved_index = 1;
+
+        let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.ui.saved_index, 1);
+    }
+
+    #[test]
+    fn recommendations_subtopic_focus_next_stops_at_last_item() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Recommendations);
+        store.ui.recommendations_region = RecommendationsRegion::Subtopics;
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store.ui.recommendations_subtopic_index = 2;
+
+        let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.ui.recommendations_subtopic_index, 2);
+    }
+
+    #[test]
+    fn settings_focus_previous_stops_at_first_row() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Settings;
+        store.ui.settings_mode = SettingsMode::Master;
+        store.ui.settings_row = SettingsRow::ReadingSpeed;
+
+        let effect = store
+            .dispatch(Command::Ui(UiCommand::FocusPrevious))
+            .unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.ui.settings_row, SettingsRow::ReadingSpeed);
+    }
+
+    #[test]
+    fn topic_preferences_focus_next_stops_at_last_chip() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Settings;
+        store.ui.settings_mode = SettingsMode::TopicPreferences;
+        store.ui.topic_focus.region = TopicRegion::Chips;
+        store.ui.topic_focus.chip_index = crate::settings::TOPIC_CHIP_COUNT - 1;
+
+        let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(
+            store.ui.topic_focus.chip_index,
+            crate::settings::TOPIC_CHIP_COUNT - 1
+        );
     }
 
     #[test]

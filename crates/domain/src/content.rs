@@ -235,19 +235,18 @@ impl CollectionManifestState {
     }
 
     pub fn item_at(&self, index: usize) -> Option<CollectionManifestItem> {
-        if self.is_empty() {
-            None
+        if index < self.len() {
+            Some(self.items[index])
         } else {
-            Some(self.items[index % self.len()])
+            None
         }
     }
 
     pub fn item_mut_at(&mut self, index: usize) -> Option<&mut CollectionManifestItem> {
-        if self.is_empty() {
-            None
+        if index < self.len() {
+            Some(&mut self.items[index])
         } else {
-            let len = self.len();
-            Some(&mut self.items[index % len])
+            None
         }
     }
 
@@ -349,10 +348,10 @@ impl RecommendationSubtopicsState {
     }
 
     pub fn item_at(&self, index: usize) -> Option<RecommendationSubtopic> {
-        if self.is_empty() {
-            None
+        if index < self.len() {
+            Some(self.items[index])
         } else {
-            Some(self.items[index % self.len()])
+            None
         }
     }
 

@@ -21,6 +21,7 @@ pub const VISIBLE_LIST_ROWS: usize = 3;
 pub const SETTINGS_ROW_COUNT: usize = 6;
 pub const RECOMMENDATION_VISIBLE_TABS: usize = 4;
 pub const RECOMMENDATION_TAB_LABEL_MAX_BYTES: usize = RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES + 1;
+const END_OF_LIST_LABEL: &str = "END";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct StatusClusterModel {
@@ -198,9 +199,7 @@ pub fn select_active_screen(store: &Store) -> ActiveScreenModel {
 
 pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
     let focused = store.ui.dashboard_focus;
-    let previous = focused.previous().as_collection();
-    let next = focused.next().as_collection();
-    let current = focused.as_collection();
+    let focused_index = focused.index();
 
     DashboardScreenModel {
         appearance: store.settings.appearance,
@@ -213,20 +212,19 @@ pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
         ),
         rail_label: "M\nO\nT\nI\nF",
         items: [
-            DashboardItemModel {
-                label: previous.dashboard_label(),
-                live_dot: previous.has_dashboard_live_dot(),
-                selected: false,
-            },
-            DashboardItemModel {
-                label: current.dashboard_label(),
-                live_dot: current.has_dashboard_live_dot(),
-                selected: true,
-            },
-            DashboardItemModel {
-                label: next.dashboard_label(),
-                live_dot: next.has_dashboard_live_dot(),
-                selected: false,
+            focused_index
+                .checked_sub(1)
+                .map(DashboardFocus::from_index)
+                .map(|focus| dashboard_item(focus.as_collection(), false))
+                .unwrap_or_else(dashboard_empty_item),
+            dashboard_item(focused.as_collection(), true),
+            if focused_index + 1 < DashboardFocus::COUNT {
+                dashboard_item(
+                    DashboardFocus::from_index(focused_index + 1).as_collection(),
+                    false,
+                )
+            } else {
+                dashboard_end_item()
             },
         ],
         focused,
@@ -658,27 +656,27 @@ fn select_manifest_collection_rows(
     selected_index: usize,
     spinner_phase: u8,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
-    let Some(selected) = collection.item_at(selected_index) else {
+    let Some(selected) = collection.item_at(selected_index.min(collection.len().saturating_sub(1)))
+    else {
         return empty_collection_rows(kind);
     };
-    if collection.len() == 1 {
-        return [
-            content_row("", "", false),
-            content_row_from_manifest(selected, reading_progress, kind, true, spinner_phase),
-            content_row("", "", false),
-        ];
-    }
-    let previous = collection
-        .item_at((selected_index + collection.len() - 1) % collection.len())
-        .unwrap_or(selected);
-    let next = collection
-        .item_at((selected_index + 1) % collection.len())
-        .unwrap_or(selected);
+    let selected_index = selected_index.min(collection.len().saturating_sub(1));
+    let previous = selected_index
+        .checked_sub(1)
+        .and_then(|index| collection.item_at(index));
+    let next = collection.item_at(selected_index.saturating_add(1));
 
     [
-        content_row_from_manifest(previous, reading_progress, kind, false, spinner_phase),
+        previous
+            .map(|item| {
+                content_row_from_manifest(item, reading_progress, kind, false, spinner_phase)
+            })
+            .unwrap_or_else(empty_content_row),
         content_row_from_manifest(selected, reading_progress, kind, true, spinner_phase),
-        content_row_from_manifest(next, reading_progress, kind, false, spinner_phase),
+        next.map(|item| {
+            content_row_from_manifest(item, reading_progress, kind, false, spinner_phase)
+        })
+        .unwrap_or_else(end_content_row),
     ]
 }
 
@@ -689,6 +687,38 @@ fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
         progress_badge: None,
         loading_phase: None,
         selected,
+    }
+}
+
+fn empty_content_row() -> ContentRowModel {
+    content_row("", "", false)
+}
+
+fn end_content_row() -> ContentRowModel {
+    content_row("", END_OF_LIST_LABEL, false)
+}
+
+fn dashboard_item(collection: CollectionKind, selected: bool) -> DashboardItemModel {
+    DashboardItemModel {
+        label: collection.dashboard_label(),
+        live_dot: collection.has_dashboard_live_dot(),
+        selected,
+    }
+}
+
+fn dashboard_empty_item() -> DashboardItemModel {
+    DashboardItemModel {
+        label: "",
+        live_dot: false,
+        selected: false,
+    }
+}
+
+fn dashboard_end_item() -> DashboardItemModel {
+    DashboardItemModel {
+        label: END_OF_LIST_LABEL,
+        live_dot: false,
+        selected: false,
     }
 }
 
@@ -896,6 +926,30 @@ mod tests {
         assert_eq!(model.items[0].label, "INBOX");
         assert_eq!(model.items[2].label, "FOR YOU");
         assert_eq!(model.sync_indicator, None);
+    }
+
+    #[test]
+    fn dashboard_first_focus_uses_empty_top_slot() {
+        let mut store = Store::new();
+        store.ui.dashboard_focus = DashboardFocus::Inbox;
+
+        let model = select_dashboard(&store);
+
+        assert_eq!(model.items[0].label, "");
+        assert_eq!(model.items[1].label, "INBOX");
+        assert_eq!(model.items[2].label, "SAVED");
+    }
+
+    #[test]
+    fn dashboard_last_focus_uses_end_bottom_slot() {
+        let mut store = Store::new();
+        store.ui.dashboard_focus = DashboardFocus::Recommendations;
+
+        let model = select_dashboard(&store);
+
+        assert_eq!(model.items[0].label, "SAVED");
+        assert_eq!(model.items[1].label, "FOR YOU");
+        assert_eq!(model.items[2].label, "END");
     }
 
     #[test]
@@ -1150,7 +1204,59 @@ mod tests {
         assert_eq!(model.rows[1].title.as_str(), "Example saved title");
         assert_eq!(model.rows[1].loading_phase, None);
         assert!(model.rows[2].meta.is_empty());
-        assert!(model.rows[2].title.is_empty());
+        assert_eq!(model.rows[2].title.as_str(), "END");
+    }
+
+    #[test]
+    fn saved_collection_selector_stops_at_last_item_and_shows_end_row() {
+        let mut store = Store::new();
+        let mut first = CollectionManifestItem::empty();
+        first.meta.set_truncated("EXAMPLE / SAVED");
+        first.title.set_truncated("First saved title");
+        let mut second = CollectionManifestItem::empty();
+        second.meta.set_truncated("EXAMPLE / SAVED");
+        second.title.set_truncated("Second saved title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(first);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(second);
+        store.ui.saved_index = 1;
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert_eq!(model.rows[0].title.as_str(), "First saved title");
+        assert_eq!(model.rows[1].title.as_str(), "Second saved title");
+        assert_eq!(model.rows[2].title.as_str(), "END");
+    }
+
+    #[test]
+    fn saved_collection_selector_keeps_first_row_empty_instead_of_wrapping() {
+        let mut store = Store::new();
+        let mut first = CollectionManifestItem::empty();
+        first.meta.set_truncated("EXAMPLE / SAVED");
+        first.title.set_truncated("First saved title");
+        let mut second = CollectionManifestItem::empty();
+        second.meta.set_truncated("EXAMPLE / SAVED");
+        second.title.set_truncated("Second saved title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(first);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(second);
+        store.ui.saved_index = 0;
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert!(model.rows[0].title.is_empty());
+        assert_eq!(model.rows[1].title.as_str(), "First saved title");
+        assert_eq!(model.rows[2].title.as_str(), "Second saved title");
     }
 
     #[test]
