@@ -50,7 +50,10 @@ use domain::{
         CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestItem,
         CollectionManifestState, DetailLocator, MANIFEST_ITEM_CAPACITY, PackageState,
         PrepareContentPhase, PrepareContentProgress, PrepareContentRequest,
-        RECOMMENDATION_SERVE_ID_MAX_BYTES, REMOTE_ITEM_ID_MAX_BYTES, RemoteContentStatus,
+        RECOMMENDATION_SERVE_ID_MAX_BYTES, RECOMMENDATION_SUBTOPIC_CAPACITY,
+        RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES, RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES,
+        REMOTE_ITEM_ID_MAX_BYTES, RecommendationSubtopic, RecommendationSubtopicsState,
+        RecommendationTopicRequest, RemoteContentStatus,
     },
     runtime::Event,
     text::InlineText,
@@ -65,6 +68,8 @@ const ME_PATH: &str = "/device/v1/me";
 const INBOX_PATH: &str = "/device/v1/me/inbox";
 const SAVED_CONTENT_PATH: &str = "/device/v1/me/saved-content";
 const RECOMMENDATIONS_PATH: &str = "/device/v1/me/recommendations/content";
+const RECOMMENDATION_SUBTOPICS_PATH: &str = "/device/v1/me/recommendations/subtopics";
+const RECOMMENDATION_TOPIC_PATH_PREFIX: &str = "/device/v1/me/recommendations/content/by-topic/";
 pub(crate) const BACKEND_PORT: u16 = 443;
 const NETWORK_POLL_MS: u64 = 500;
 const RETRY_BACKOFF_MS: u64 = 10_000;
@@ -213,7 +218,7 @@ struct CollectionFetchSummary {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct CollectionFetchResult {
     summary: CollectionFetchSummary,
-    collection: CollectionManifestState,
+    collection: Box<CollectionManifestState>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -247,6 +252,17 @@ impl CollectionEndpoint {
             Self::Recommendations => "",
         }
     }
+
+    const fn array_key(self) -> &'static str {
+        match self {
+            Self::Inbox => "\"inbox\"",
+            Self::Saved | Self::Recommendations => "\"content\"",
+        }
+    }
+}
+
+fn empty_collection_state_box() -> Box<CollectionManifestState> {
+    crate::memory_policy::external_or_global_box(CollectionManifestState::empty())
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -260,7 +276,7 @@ struct CollectionFetchPage {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct CollectionFetchAccumulator {
     trace: TraceContext,
-    collection: CollectionManifestState,
+    collection: Box<CollectionManifestState>,
     page_count: usize,
     body_bytes_total: usize,
     next_cursor: Option<heapless::String<COLLECTION_CURSOR_MAX_LEN>>,
@@ -273,7 +289,7 @@ impl CollectionFetchAccumulator {
     fn new(trace: TraceContext) -> Self {
         Self {
             trace,
-            collection: CollectionManifestState::empty(),
+            collection: empty_collection_state_box(),
             page_count: 0,
             body_bytes_total: 0,
             next_cursor: None,
@@ -283,48 +299,32 @@ impl CollectionFetchAccumulator {
         }
     }
 
-    fn absorb_page(
+    #[allow(clippy::too_many_arguments)]
+    fn record_page(
         &mut self,
         endpoint: CollectionEndpoint,
         path: &str,
         body_bytes: usize,
         page_index: usize,
-        page: CollectionFetchPage,
+        page_item_count: usize,
+        accepted_items: usize,
+        next_cursor: Option<heapless::String<COLLECTION_CURSOR_MAX_LEN>>,
+        body_preview: Option<heapless::String<INBOX_LOG_PREVIEW_MAX_LEN>>,
+        body_preview_truncated: bool,
     ) {
-        let page_item_count = page.collection.len();
-        let next_cursor_present = page.next_cursor.is_some();
+        let next_cursor_present = next_cursor.is_some();
         let response_headroom = HTTP_RESPONSE_MAX_LEN.saturating_sub(body_bytes);
 
         self.page_count = self.page_count.saturating_add(1);
         self.body_bytes_total = self.body_bytes_total.saturating_add(body_bytes);
 
         if self.body_preview.is_none()
-            && let Some(preview) = page.body_preview.as_ref()
+            && let Some(preview) = body_preview.as_ref()
         {
             self.body_preview = Some(preview.clone());
-            self.body_preview_truncated = page.body_preview_truncated;
+            self.body_preview_truncated = body_preview_truncated;
         }
-
-        if matches!(endpoint, CollectionEndpoint::Recommendations)
-            && self.collection.serve_id.is_empty()
-            && !page.collection.serve_id.is_empty()
-        {
-            self.collection.serve_id = page.collection.serve_id;
-        }
-
-        let mut accepted_items = 0usize;
-        while accepted_items < page.collection.len() {
-            if !self
-                .collection
-                .try_push(page.collection.items[accepted_items])
-            {
-                self.truncated_by_capacity = true;
-                break;
-            }
-            accepted_items += 1;
-        }
-
-        self.next_cursor = page.next_cursor;
+        self.next_cursor = next_cursor;
         log_collection_fetch_page_metrics(
             self.trace,
             endpoint.kind(),
@@ -367,6 +367,8 @@ impl CollectionFetchAccumulator {
 struct StartupSyncResult<'a> {
     refresh_session: RefreshSession,
     saved_result: Result<CollectionFetchResult, CollectionQueryError>,
+    inbox_result: Result<CollectionFetchResult, CollectionQueryError>,
+    recommendation_subtopics: Option<Box<RecommendationSubtopicsState>>,
     reusable_session: Option<ReusableBackendSession<'a>>,
     tls_session_cache: Option<SerializedClientSession>,
 }
@@ -485,6 +487,8 @@ struct BackendRequestContext<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum BackendCommand {
     PrepareContent(PrepareContentRequest),
+    LoadRecommendationSubtopics,
+    LoadRecommendationTopic(RecommendationTopicRequest),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -816,6 +820,18 @@ pub async fn request_prepare_content(request: PrepareContentRequest) {
         .await;
 }
 
+pub async fn request_recommendation_subtopics() {
+    BACKEND_CMD_CH
+        .send(BackendCommand::LoadRecommendationSubtopics)
+        .await;
+}
+
+pub async fn request_recommendation_topic(request: RecommendationTopicRequest) {
+    BACKEND_CMD_CH
+        .send(BackendCommand::LoadRecommendationTopic(request))
+        .await;
+}
+
 #[embassy_executor::task]
 async fn backend_task(
     stack: Stack<'static>,
@@ -882,7 +898,7 @@ async fn backend_task(
                 "sync_id" = startup_sync_id,
                 "req_id" = 0,
             );
-            let startup_sync = perform_startup_refresh_and_saved_sync(
+            let startup_sync = perform_startup_refresh_and_collection_sync(
                 stack,
                 tls.reference(),
                 &ca_chain,
@@ -972,6 +988,23 @@ async fn backend_task(
                 "backend saved",
             )
             .await;
+            sync_one_collection(
+                CollectionKind::Inbox,
+                startup_sync.inbox_result,
+                "backend inbox",
+            )
+            .await;
+            if let Some(subtopics) = startup_sync.recommendation_subtopics {
+                persist_and_publish_recommendation_subtopics(
+                    TraceContext {
+                        sync_id: startup_sync_id,
+                        req_id: 0,
+                    },
+                    *subtopics,
+                    "backend recommendation subtopics",
+                )
+                .await;
+            }
             log_status(SyncStatus::Ready);
             log_heap("backend ready");
             run_backend_command_loop(
@@ -1057,6 +1090,29 @@ async fn run_backend_command_loop<'a>(
         match command {
             BackendCommand::PrepareContent(request) => {
                 handle_prepare_content_request(
+                    context,
+                    current,
+                    access_session,
+                    &mut reusable_session,
+                    &mut tls_session_cache,
+                    request,
+                )
+                .await;
+                log_status(SyncStatus::Ready);
+            }
+            BackendCommand::LoadRecommendationSubtopics => {
+                handle_recommendation_subtopics_request(
+                    context,
+                    current,
+                    access_session,
+                    &mut reusable_session,
+                    &mut tls_session_cache,
+                )
+                .await;
+                log_status(SyncStatus::Ready);
+            }
+            BackendCommand::LoadRecommendationTopic(request) => {
+                handle_recommendation_topic_request(
                     context,
                     current,
                     access_session,
@@ -1267,7 +1323,7 @@ async fn sync_collection_manifests(
     tls_session_cache: &mut Option<SerializedClientSession>,
     access_token: &str,
 ) {
-    info!("backend startup sync mode=saved-only");
+    info!("backend startup sync mode=saved+inbox");
     sync_one_collection(
         CollectionKind::Saved,
         perform_saved_content_fetch(
@@ -1283,9 +1339,24 @@ async fn sync_collection_manifests(
         "backend saved",
     )
     .await;
+    sync_one_collection(
+        CollectionKind::Inbox,
+        perform_inbox_fetch(
+            stack,
+            tls,
+            ca_chain,
+            tcp_state,
+            tls_session_cache,
+            access_token,
+            0,
+        )
+        .await,
+        "backend inbox",
+    )
+    .await;
 }
 
-async fn perform_startup_refresh_and_saved_sync<'a>(
+async fn perform_startup_refresh_and_collection_sync<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
@@ -1297,7 +1368,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
     let mut tls_session_cache = None;
 
     loop {
-        let result = perform_startup_refresh_and_saved_sync_once(
+        let result = perform_startup_refresh_and_collection_sync_once(
             stack,
             tls,
             ca_chain,
@@ -1337,7 +1408,7 @@ async fn perform_startup_refresh_and_saved_sync<'a>(
     }
 }
 
-async fn perform_startup_refresh_and_saved_sync_once<'a>(
+async fn perform_startup_refresh_and_collection_sync_once<'a>(
     stack: Stack<'static>,
     tls: TlsReference<'a>,
     ca_chain: &Certificate<'static>,
@@ -1530,7 +1601,7 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
 
     let refresh_session = parse_refresh_session(refresh_response.body)?;
     log_status(SyncStatus::SyncingContent);
-    info!("backend startup sync mode=saved-only");
+    info!("backend startup sync mode=saved+inbox+recommendation_subtopics");
 
     let mut saved_result = perform_saved_content_fetch_over_session(
         &mut session,
@@ -1540,17 +1611,31 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     )
     .await;
 
-    if let Err(err) = saved_result.as_ref()
-        && let CollectionQueryError::Other(err) = *err
-        && is_transient_transport_error(err)
-    {
+    if let Some(err) = startup_collection_fetch_transport_error(&saved_result) {
         if let Err(close_err) = session.close().await {
             info!("backend tls close failed: {:?}", close_err);
         }
         return Err(RefreshError::Other(err));
     }
 
-    if let Ok(result) = &mut saved_result {
+    let inbox_result = perform_inbox_fetch_over_session(
+        &mut session,
+        refresh_session.access_token.as_str(),
+        false,
+        sync_id,
+    )
+    .await;
+
+    if let Some(err) = startup_collection_fetch_transport_error(&inbox_result) {
+        if let Err(close_err) = session.close().await {
+            info!("backend tls close failed: {:?}", close_err);
+        }
+        return Err(RefreshError::Other(err));
+    }
+
+    if let Ok(result) = &mut saved_result
+        && inbox_result.is_ok()
+    {
         prefetch_startup_saved_content(
             &mut session,
             refresh_session.access_token.as_str(),
@@ -1560,7 +1645,42 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
         .await;
     }
 
-    let reusable_session = if saved_result.is_ok() {
+    let mut recommendation_subtopics = None;
+    let mut reusable_session_failed = false;
+    if saved_result.is_ok() && inbox_result.is_ok() {
+        match perform_recommendation_subtopics_fetch_over_session(
+            &mut session,
+            refresh_session.access_token.as_str(),
+            false,
+            sync_id,
+        )
+        .await
+        {
+            Ok(subtopics) => {
+                recommendation_subtopics = Some(Box::new(subtopics));
+            }
+            Err(CollectionQueryError::Rejected(status)) => {
+                info!(
+                    "backend startup recommendation subtopics rejected status={}",
+                    status
+                );
+            }
+            Err(CollectionQueryError::Other(err)) => {
+                info!(
+                    "backend startup recommendation subtopics failed err={:?}",
+                    err
+                );
+                if is_transient_transport_error(err) {
+                    reusable_session_failed = true;
+                }
+            }
+        }
+    }
+
+    let reusable_session = if saved_result.is_ok()
+        && inbox_result.is_ok()
+        && !reusable_session_failed
+    {
         if let Some(network_address) = current_network_address(stack) {
             info!(
                 "backend startup session retained for steady state network_ip={:?}",
@@ -1578,6 +1698,14 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
             }
             None
         }
+    } else if reusable_session_failed {
+        warn!(
+            "backend startup session closing before steady state reason=recommendation_subtopics_failed"
+        );
+        if let Err(err) = session.close().await {
+            info!("backend tls close failed reason=startup done err={:?}", err);
+        }
+        None
     } else {
         warn!("backend startup session closing before steady state reason=sync_failed");
         if let Err(err) = session.close().await {
@@ -1589,6 +1717,8 @@ async fn perform_startup_refresh_and_saved_sync_once<'a>(
     Ok(StartupSyncResult {
         refresh_session,
         saved_result,
+        inbox_result,
+        recommendation_subtopics,
         reusable_session,
         tls_session_cache: tls_session_cache.clone(),
     })
@@ -1766,17 +1896,21 @@ async fn sync_one_collection(
 ) {
     match result {
         Ok(result) => {
+            let CollectionFetchResult {
+                summary,
+                collection,
+            } = result;
             let collection = match content_storage::persist_snapshot_traced(
-                result.summary.trace,
+                summary.trace,
                 kind,
-                result.collection,
+                *collection.as_ref(),
             )
             .await
             {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     info!("{} persist failed: {:?}", label, err);
-                    result.collection
+                    *collection
                 }
             };
             publish_event(
@@ -1786,18 +1920,18 @@ async fn sync_one_collection(
             info!(
                 "{} ok item_count={} pages={} body_bytes_total={} truncated={} next_cursor={}",
                 label,
-                result.summary.item_count,
-                result.summary.page_count,
-                result.summary.body_bytes_total,
-                result.summary.truncated_by_capacity,
-                if result.summary.next_cursor_present {
+                summary.item_count,
+                summary.page_count,
+                summary.body_bytes_total,
+                summary.truncated_by_capacity,
+                if summary.next_cursor_present {
                     "present"
                 } else {
                     "null"
                 }
             );
-            if let Some(preview) = result.summary.body_preview {
-                if result.summary.body_preview_truncated {
+            if let Some(preview) = summary.body_preview {
+                if summary.body_preview_truncated {
                     info!("{} preview={}...", label, preview);
                 } else {
                     info!("{} preview={}", label, preview);
@@ -1812,6 +1946,235 @@ async fn sync_one_collection(
         }
         Err(CollectionQueryError::Other(err)) => {
             info!("{} failed: {:?}", label, err);
+        }
+    }
+}
+
+async fn persist_and_publish_recommendation_subtopics(
+    trace: TraceContext,
+    subtopics: RecommendationSubtopicsState,
+    label: &str,
+) {
+    if let Err(err) =
+        content_storage::queue_recommendation_subtopics_write_traced(trace, subtopics).await
+    {
+        info!(
+            "{} persist failed count={} err={:?}",
+            label,
+            subtopics.len(),
+            err,
+        );
+    }
+
+    publish_event(
+        Event::RecommendationSubtopicsUpdated(Box::new(subtopics)),
+        now_ms(),
+    );
+    info!("{} ok count={}", label, subtopics.len());
+}
+
+fn startup_collection_fetch_transport_error(
+    result: &Result<CollectionFetchResult, CollectionQueryError>,
+) -> Option<BackendError> {
+    match result {
+        Err(CollectionQueryError::Other(err)) if is_transient_transport_error(*err) => Some(*err),
+        _ => None,
+    }
+}
+
+async fn handle_recommendation_subtopics_request<'a>(
+    context: BackendRequestContext<'a>,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+) {
+    let operation_sync_id = next_sync_id();
+
+    if let Err(err) = ensure_access_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_state,
+        current,
+        access_session,
+        reusable_session,
+        tls_session_cache,
+        operation_sync_id,
+    )
+    .await
+    {
+        handle_recommendation_access_error(err, current, access_session, reusable_session).await;
+        publish_event(
+            Event::RecommendationSubtopicsUpdated(Box::new(RecommendationSubtopicsState::empty())),
+            now_ms(),
+        );
+        return;
+    }
+
+    log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.as_str())
+        .unwrap_or("");
+    match perform_recommendation_subtopics_fetch_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        access_token,
+        operation_sync_id,
+    )
+    .await
+    {
+        Ok(subtopics) => {
+            persist_and_publish_recommendation_subtopics(
+                TraceContext {
+                    sync_id: operation_sync_id,
+                    req_id: 0,
+                },
+                subtopics,
+                "backend recommendation subtopics",
+            )
+            .await;
+        }
+        Err(CollectionQueryError::Rejected(status)) => {
+            if is_auth_status(status) {
+                invalidate_access_state(access_session, reusable_session).await;
+                log_status(SyncStatus::AuthFailed);
+            }
+            publish_event(
+                Event::RecommendationSubtopicsUpdated(Box::new(
+                    RecommendationSubtopicsState::empty(),
+                )),
+                now_ms(),
+            );
+        }
+        Err(CollectionQueryError::Other(err)) => {
+            if is_transient_transport_error(err) {
+                *access_session = None;
+                log_status(SyncStatus::TransportFailed);
+            }
+            publish_event(
+                Event::RecommendationSubtopicsUpdated(Box::new(
+                    RecommendationSubtopicsState::empty(),
+                )),
+                now_ms(),
+            );
+        }
+    }
+}
+
+async fn handle_recommendation_topic_request<'a>(
+    context: BackendRequestContext<'a>,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    request: RecommendationTopicRequest,
+) {
+    if request.topic_slug.is_empty() {
+        publish_event(
+            Event::RecommendationTopicContentUpdated {
+                topic_slug: request.topic_slug,
+                collection: empty_collection_state_box(),
+            },
+            now_ms(),
+        );
+        return;
+    }
+
+    let operation_sync_id = next_sync_id();
+    if let Err(err) = ensure_access_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_state,
+        current,
+        access_session,
+        reusable_session,
+        tls_session_cache,
+        operation_sync_id,
+    )
+    .await
+    {
+        handle_recommendation_access_error(err, current, access_session, reusable_session).await;
+        publish_event(
+            Event::RecommendationTopicContentUpdated {
+                topic_slug: request.topic_slug,
+                collection: empty_collection_state_box(),
+            },
+            now_ms(),
+        );
+        return;
+    }
+
+    log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.as_str())
+        .unwrap_or("");
+    let collection = match perform_recommendation_topic_fetch_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        access_token,
+        request.topic_slug,
+        operation_sync_id,
+    )
+    .await
+    {
+        Ok(result) => result.collection,
+        Err(CollectionQueryError::Rejected(status)) => {
+            if is_auth_status(status) {
+                invalidate_access_state(access_session, reusable_session).await;
+                log_status(SyncStatus::AuthFailed);
+            }
+            empty_collection_state_box()
+        }
+        Err(CollectionQueryError::Other(err)) => {
+            if is_transient_transport_error(err) {
+                *access_session = None;
+                log_status(SyncStatus::TransportFailed);
+            }
+            empty_collection_state_box()
+        }
+    };
+
+    publish_event(
+        Event::RecommendationTopicContentUpdated {
+            topic_slug: request.topic_slug,
+            collection,
+        },
+        now_ms(),
+    );
+}
+
+async fn handle_recommendation_access_error(
+    err: RefreshError,
+    current: &StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'_>>,
+) {
+    match err {
+        RefreshError::Rejected(status) => {
+            invalidate_access_state(access_session, reusable_session).await;
+            log_status(SyncStatus::AuthFailed);
+            warn!(
+                "backend recommendation refresh rejected status={} source={}",
+                status,
+                current.source.label(),
+            );
+        }
+        RefreshError::Other(err) => {
+            *access_session = None;
+            log_status(SyncStatus::TransportFailed);
+            warn!("backend recommendation refresh failed: {:?}", err);
         }
     }
 }
@@ -3521,6 +3884,28 @@ fn build_collection_page_path(
     Ok(path)
 }
 
+fn build_recommendation_topic_page_path(
+    topic_slug: &InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+    cursor: Option<&heapless::String<COLLECTION_CURSOR_MAX_LEN>>,
+) -> Result<heapless::String<COLLECTION_PAGE_PATH_MAX_LEN>, BackendError> {
+    let mut path = heapless::String::<COLLECTION_PAGE_PATH_MAX_LEN>::new();
+    write!(
+        &mut path,
+        "{}{}?limit={}",
+        RECOMMENDATION_TOPIC_PATH_PREFIX,
+        topic_slug.as_str(),
+        COLLECTION_PAGE_LIMIT
+    )
+    .map_err(|_| BackendError::ResponseTooLarge)?;
+    if let Some(cursor) = cursor {
+        path.push_str("&cursor=")
+            .map_err(|_| BackendError::ResponseTooLarge)?;
+        path.push_str(cursor.as_str())
+            .map_err(|_| BackendError::ResponseTooLarge)?;
+    }
+    Ok(path)
+}
+
 fn parse_collection_page_cursor(
     endpoint: CollectionEndpoint,
     body: &str,
@@ -3551,6 +3936,72 @@ fn collection_body_preview(
         let (preview, truncated) = utf8_log_prefix(body, INBOX_LOG_PREVIEW_MAX_LEN);
         Ok((Some(bounded_string(preview)?), truncated))
     }
+}
+
+fn parse_collection_manifest_item(
+    endpoint: CollectionEndpoint,
+    item_json: &str,
+) -> Result<CollectionManifestItem, BackendError> {
+    match endpoint {
+        CollectionEndpoint::Inbox => parse_inbox_article_manifest(item_json),
+        CollectionEndpoint::Saved => parse_saved_article_manifest(item_json),
+        CollectionEndpoint::Recommendations => parse_recommendation_manifest(item_json),
+    }
+}
+
+fn parse_collection_page_into_accumulator(
+    endpoint: CollectionEndpoint,
+    body: &str,
+    path: &str,
+    body_bytes: usize,
+    page_index: usize,
+    accumulator: &mut CollectionFetchAccumulator,
+) -> Result<(), BackendError> {
+    let items =
+        extract_json_top_level_array_items::<MANIFEST_ITEM_CAPACITY>(body, endpoint.array_key())?;
+    if matches!(endpoint, CollectionEndpoint::Recommendations)
+        && accumulator.collection.serve_id.is_empty()
+        && let Some(serve_id) = extract_json_optional_inline_text::<
+            RECOMMENDATION_SERVE_ID_MAX_BYTES,
+        >(body, "\"serve_id\"")?
+    {
+        accumulator.collection.serve_id = serve_id;
+    }
+
+    let mut page_item_count = 0usize;
+    let mut accepted_items = 0usize;
+    let mut index = 0usize;
+    while index < items.len() {
+        if let Some(item_json) = items[index] {
+            page_item_count += 1;
+            let item = parse_collection_manifest_item(endpoint, item_json)?;
+            if accumulator.collection.try_push(item) {
+                accepted_items += 1;
+            } else {
+                accumulator.truncated_by_capacity = true;
+                break;
+            }
+        }
+        index += 1;
+    }
+
+    let next_cursor = parse_collection_page_cursor(endpoint, body)?;
+    if page_item_count == 0 && next_cursor.is_some() {
+        return Err(BackendError::InvalidResponse);
+    }
+    let (body_preview, body_preview_truncated) = collection_body_preview(body, page_item_count)?;
+    accumulator.record_page(
+        endpoint,
+        path,
+        body_bytes,
+        page_index,
+        page_item_count,
+        accepted_items,
+        next_cursor,
+        body_preview,
+        body_preview_truncated,
+    );
+    Ok(())
 }
 
 fn parse_inbox_fetch_page(body: &str) -> Result<CollectionFetchPage, BackendError> {
@@ -3683,7 +4134,9 @@ async fn perform_collection_fetch_paginated(
     sync_id: u32,
     endpoint: CollectionEndpoint,
 ) -> Result<CollectionFetchResult, CollectionQueryError> {
-    let mut accumulator = CollectionFetchAccumulator::new(next_request_trace(sync_id));
+    let mut accumulator = crate::memory_policy::external_or_global_box(
+        CollectionFetchAccumulator::new(next_request_trace(sync_id)),
+    );
     let mut page_index = 0usize;
     let mut cursor = None::<heapless::String<COLLECTION_CURSOR_MAX_LEN>>;
 
@@ -3729,18 +4182,15 @@ async fn perform_collection_fetch_paginated(
             return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
         }
 
-        let page = parse_collection_fetch_page(endpoint, response.body)
-            .map_err(CollectionQueryError::Other)?;
-        if page.collection.is_empty() && page.next_cursor.is_some() {
-            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
-        }
-        accumulator.absorb_page(
+        parse_collection_page_into_accumulator(
             endpoint,
+            response.body,
             path.as_str(),
             response.body.len(),
             page_index,
-            page,
-        );
+            &mut accumulator,
+        )
+        .map_err(CollectionQueryError::Other)?;
         page_index += 1;
 
         if !accumulator.should_continue() {
@@ -3758,19 +4208,22 @@ async fn perform_collection_fetch_paginated(
         accumulator.next_cursor.is_some() || accumulator.truncated_by_capacity,
         accumulator.truncated_by_capacity,
     );
-    Ok(accumulator.into_result())
+    Ok((*accumulator).into_result())
 }
 
-async fn perform_saved_content_fetch_paginated_over_session<T>(
+async fn perform_collection_fetch_paginated_over_session<T>(
     session: &mut Session<'_, T>,
     access_token: &str,
     connection_close: bool,
     sync_id: u32,
+    endpoint: CollectionEndpoint,
 ) -> Result<CollectionFetchResult, CollectionQueryError>
 where
     T: AsyncRead07 + AsyncWrite07,
 {
-    let mut accumulator = CollectionFetchAccumulator::new(next_request_trace(sync_id));
+    let mut accumulator = crate::memory_policy::external_or_global_box(
+        CollectionFetchAccumulator::new(next_request_trace(sync_id)),
+    );
     let mut page_index = 0usize;
     let mut cursor = None::<heapless::String<COLLECTION_CURSOR_MAX_LEN>>;
 
@@ -3779,7 +4232,7 @@ where
             return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
         }
 
-        let path = build_collection_page_path(CollectionEndpoint::Saved, cursor.as_ref())
+        let path = build_collection_page_path(endpoint, cursor.as_ref())
             .map_err(CollectionQueryError::Other)?;
         let request_trace = if page_index == 0 {
             accumulator.trace
@@ -3812,18 +4265,15 @@ where
             return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
         }
 
-        let page =
-            parse_saved_content_fetch_page(response.body).map_err(CollectionQueryError::Other)?;
-        if page.collection.is_empty() && page.next_cursor.is_some() {
-            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
-        }
-        accumulator.absorb_page(
-            CollectionEndpoint::Saved,
+        parse_collection_page_into_accumulator(
+            endpoint,
+            response.body,
             path.as_str(),
             response.body.len(),
             page_index,
-            page,
-        );
+            &mut accumulator,
+        )
+        .map_err(CollectionQueryError::Other)?;
         page_index += 1;
 
         if !accumulator.should_continue() {
@@ -3834,14 +4284,14 @@ where
 
     log_collection_fetch_total_metrics(
         accumulator.trace,
-        CollectionEndpoint::Saved.kind(),
+        endpoint.kind(),
         accumulator.page_count,
         accumulator.body_bytes_total,
         accumulator.collection.len(),
         accumulator.next_cursor.is_some() || accumulator.truncated_by_capacity,
         accumulator.truncated_by_capacity,
     );
-    Ok(accumulator.into_result())
+    Ok((*accumulator).into_result())
 }
 
 async fn perform_inbox_fetch(
@@ -3908,6 +4358,181 @@ async fn perform_recommendation_fetch(
         CollectionEndpoint::Recommendations,
     )
     .await
+}
+
+async fn perform_recommendation_subtopics_fetch_over_session<T>(
+    session: &mut Session<'_, T>,
+    access_token: &str,
+    connection_close: bool,
+    sync_id: u32,
+) -> Result<RecommendationSubtopicsState, CollectionQueryError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    let trace = next_request_trace(sync_id);
+    let mut response_buffer = allocate_standard_response_buffer(RECOMMENDATION_SUBTOPICS_PATH)
+        .map_err(CollectionQueryError::Other)?;
+    let response = send_https_request_over_session(
+        session,
+        HttpRequest {
+            trace,
+            class: RequestClass::BufferedMetadata,
+            method: "GET",
+            path: RECOMMENDATION_SUBTOPICS_PATH,
+            content_type: Some("application/json"),
+            bearer_token: Some(access_token),
+            body: b"",
+            connection_close,
+        },
+        response_buffer.as_mut_slice(),
+    )
+    .await
+    .map_err(CollectionQueryError::Other)?;
+
+    if (400..500).contains(&response.status) {
+        return Err(CollectionQueryError::Rejected(response.status));
+    }
+    if response.status != 200 {
+        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+    }
+
+    parse_recommendation_subtopics(response.body).map_err(CollectionQueryError::Other)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_recommendation_subtopics_fetch_reusing_session<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'a>,
+    ca_chain: &Certificate<'static>,
+    tcp_client: &'a BackendTcpClient<'a>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    access_token: &str,
+    sync_id: u32,
+) -> Result<RecommendationSubtopicsState, CollectionQueryError> {
+    let trace = next_request_trace(sync_id);
+    let mut response_buffer = allocate_standard_response_buffer(RECOMMENDATION_SUBTOPICS_PATH)
+        .map_err(CollectionQueryError::Other)?;
+    let response = send_https_request_reusing_session(
+        stack,
+        tls,
+        ca_chain,
+        tcp_client,
+        reusable_session,
+        tls_session_cache,
+        HttpRequest {
+            trace,
+            class: RequestClass::BufferedMetadata,
+            method: "GET",
+            path: RECOMMENDATION_SUBTOPICS_PATH,
+            content_type: Some("application/json"),
+            bearer_token: Some(access_token),
+            body: b"",
+            connection_close: false,
+        },
+        response_buffer.as_mut_slice(),
+    )
+    .await
+    .map_err(CollectionQueryError::Other)?;
+
+    if (400..500).contains(&response.status) {
+        return Err(CollectionQueryError::Rejected(response.status));
+    }
+    if response.status != 200 {
+        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+    }
+
+    parse_recommendation_subtopics(response.body).map_err(CollectionQueryError::Other)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_recommendation_topic_fetch_reusing_session<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'a>,
+    ca_chain: &Certificate<'static>,
+    tcp_client: &'a BackendTcpClient<'a>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    access_token: &str,
+    topic_slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+    sync_id: u32,
+) -> Result<CollectionFetchResult, CollectionQueryError> {
+    let mut accumulator = crate::memory_policy::external_or_global_box(
+        CollectionFetchAccumulator::new(next_request_trace(sync_id)),
+    );
+    let mut page_index = 0usize;
+    let mut cursor = None::<heapless::String<COLLECTION_CURSOR_MAX_LEN>>;
+
+    loop {
+        if page_index >= COLLECTION_FETCH_MAX_PAGES {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        let path = build_recommendation_topic_page_path(&topic_slug, cursor.as_ref())
+            .map_err(CollectionQueryError::Other)?;
+        let request_trace = if page_index == 0 {
+            accumulator.trace
+        } else {
+            next_request_trace(sync_id)
+        };
+        let mut response_buffer = allocate_standard_response_buffer(path.as_str())
+            .map_err(CollectionQueryError::Other)?;
+        let response = send_https_request_reusing_session(
+            stack,
+            tls,
+            ca_chain,
+            tcp_client,
+            reusable_session,
+            tls_session_cache,
+            HttpRequest {
+                trace: request_trace,
+                class: RequestClass::BufferedMetadata,
+                method: "GET",
+                path: path.as_str(),
+                content_type: Some("application/json"),
+                bearer_token: Some(access_token),
+                body: b"",
+                connection_close: false,
+            },
+            response_buffer.as_mut_slice(),
+        )
+        .await
+        .map_err(CollectionQueryError::Other)?;
+
+        if (400..500).contains(&response.status) {
+            return Err(CollectionQueryError::Rejected(response.status));
+        }
+        if response.status != 200 {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        parse_collection_page_into_accumulator(
+            CollectionEndpoint::Recommendations,
+            response.body,
+            path.as_str(),
+            response.body.len(),
+            page_index,
+            &mut accumulator,
+        )
+        .map_err(CollectionQueryError::Other)?;
+        page_index += 1;
+
+        if !accumulator.should_continue() {
+            break;
+        }
+        cursor = accumulator.next_cursor.clone();
+    }
+
+    log_collection_fetch_total_metrics(
+        accumulator.trace,
+        CollectionKind::Recommendations,
+        accumulator.page_count,
+        accumulator.body_bytes_total,
+        accumulator.collection.len(),
+        accumulator.next_cursor.is_some() || accumulator.truncated_by_capacity,
+        accumulator.truncated_by_capacity,
+    );
+    Ok((*accumulator).into_result())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4744,6 +5369,26 @@ fn parse_http_status(response: &[u8]) -> Result<u16, BackendError> {
         .map_err(|_| BackendError::InvalidResponse)
 }
 
+async fn perform_collection_fetch_over_session<T>(
+    session: &mut Session<'_, T>,
+    access_token: &str,
+    connection_close: bool,
+    sync_id: u32,
+    endpoint: CollectionEndpoint,
+) -> Result<CollectionFetchResult, CollectionQueryError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    perform_collection_fetch_paginated_over_session(
+        session,
+        access_token,
+        connection_close,
+        sync_id,
+        endpoint,
+    )
+    .await
+}
+
 async fn perform_saved_content_fetch_over_session<T>(
     session: &mut Session<'_, T>,
     access_token: &str,
@@ -4753,11 +5398,31 @@ async fn perform_saved_content_fetch_over_session<T>(
 where
     T: AsyncRead07 + AsyncWrite07,
 {
-    perform_saved_content_fetch_paginated_over_session(
+    perform_collection_fetch_over_session(
         session,
         access_token,
         connection_close,
         sync_id,
+        CollectionEndpoint::Saved,
+    )
+    .await
+}
+
+async fn perform_inbox_fetch_over_session<T>(
+    session: &mut Session<'_, T>,
+    access_token: &str,
+    connection_close: bool,
+    sync_id: u32,
+) -> Result<CollectionFetchResult, CollectionQueryError>
+where
+    T: AsyncRead07 + AsyncWrite07,
+{
+    perform_collection_fetch_over_session(
+        session,
+        access_token,
+        connection_close,
+        sync_id,
+        CollectionEndpoint::Inbox,
     )
     .await
 }
@@ -5000,6 +5665,19 @@ fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
     json[start..index].parse().ok()
 }
 
+fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
+    let bytes = json.as_bytes();
+    let index = find_json_value_start(json, key)?;
+
+    if bytes.get(index..index + 4) == Some(b"true") {
+        Some(true)
+    } else if bytes.get(index..index + 5) == Some(b"false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn extract_json_optional_string<'a>(json: &'a str, key: &str) -> Option<Option<&'a str>> {
     let bytes = json.as_bytes();
     let mut index = find_json_value_start(json, key)?;
@@ -5138,7 +5816,7 @@ fn parse_inbox_fetch_result(body: &str) -> Result<CollectionFetchResult, Backend
             body_preview: page.body_preview,
             body_preview_truncated: page.body_preview_truncated,
         },
-        collection: page.collection,
+        collection: crate::memory_policy::external_or_global_box(page.collection),
     })
 }
 
@@ -5158,7 +5836,7 @@ fn parse_saved_content_fetch_result(body: &str) -> Result<CollectionFetchResult,
             body_preview: page.body_preview,
             body_preview_truncated: page.body_preview_truncated,
         },
-        collection: page.collection,
+        collection: crate::memory_policy::external_or_global_box(page.collection),
     })
 }
 
@@ -5178,8 +5856,28 @@ fn parse_recommendation_fetch_result(body: &str) -> Result<CollectionFetchResult
             body_preview: page.body_preview,
             body_preview_truncated: page.body_preview_truncated,
         },
-        collection: page.collection,
+        collection: crate::memory_policy::external_or_global_box(page.collection),
     })
+}
+
+fn parse_recommendation_subtopics(
+    body: &str,
+) -> Result<RecommendationSubtopicsState, BackendError> {
+    let items = extract_json_top_level_array_items::<RECOMMENDATION_SUBTOPIC_CAPACITY>(
+        body,
+        "\"subtopics\"",
+    )?;
+    let mut subtopics = RecommendationSubtopicsState::empty();
+
+    let mut index = 0usize;
+    while index < items.len() {
+        if let Some(item_json) = items[index] {
+            let _ = subtopics.try_push(parse_recommendation_subtopic(item_json)?);
+        }
+        index += 1;
+    }
+
+    Ok(subtopics)
 }
 
 fn parse_saved_content_collection(body: &str) -> Result<CollectionManifestState, BackendError> {
@@ -5231,6 +5929,36 @@ fn parse_recommendation_collection(body: &str) -> Result<CollectionManifestState
     }
 
     Ok(collection)
+}
+
+fn parse_recommendation_subtopic(item_json: &str) -> Result<RecommendationSubtopic, BackendError> {
+    let slug = extract_json_optional_inline_text::<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>(
+        item_json, "\"slug\"",
+    )?
+    .filter(|value| !value.is_empty())
+    .ok_or(BackendError::MissingField)?;
+    let label = extract_json_optional_inline_text::<RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES>(
+        item_json,
+        "\"label\"",
+    )?
+    .filter(|value| !value.is_empty())
+    .ok_or(BackendError::MissingField)?;
+    let parent_topic_label = extract_json_optional_inline_text::<
+        RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES,
+    >(item_json, "\"parent_topic_label\"")?
+    .unwrap_or_default();
+    let is_from_settings =
+        extract_json_bool(item_json, "\"is_from_settings\"").ok_or(BackendError::MissingField)?;
+    let is_from_behavior =
+        extract_json_bool(item_json, "\"is_from_behavior\"").ok_or(BackendError::MissingField)?;
+
+    Ok(RecommendationSubtopic {
+        slug,
+        label,
+        parent_topic_label,
+        is_from_settings,
+        is_from_behavior,
+    })
 }
 
 fn parse_saved_article_manifest(item_json: &str) -> Result<CollectionManifestItem, BackendError> {
@@ -6262,6 +6990,37 @@ mod tests {
             "80ac9044-964c-4067-9de3-0d2476cd7d4a"
         );
         assert_eq!(item.meta.as_str(), "CRA / SAVED");
+        assert_eq!(item.title.as_str(), "Optimizing content for agents");
+    }
+
+    #[test]
+    fn recommendation_page_parser_streams_into_accumulator() {
+        let body = r#"{"content":[{"content":{"id":"content-1","host":"cra.mr","title":"Optimizing content for agents","fetch_status":"succeeded","parse_status":"succeeded","parsed_at":123},"source":{"title":"CRA"}}],"serve_id":"serve-123","next_cursor":"cursor-2"}"#;
+        let mut accumulator = crate::memory_policy::external_or_global_box(
+            CollectionFetchAccumulator::new(TraceContext::none()),
+        );
+
+        parse_collection_page_into_accumulator(
+            CollectionEndpoint::Recommendations,
+            body,
+            "/device/v1/me/recommendations/content/by-topic/e-ink",
+            body.len(),
+            0,
+            &mut accumulator,
+        )
+        .unwrap();
+
+        assert_eq!(accumulator.collection.len(), 1);
+        assert_eq!(accumulator.collection.serve_id.as_str(), "serve-123");
+        assert_eq!(
+            accumulator.next_cursor.as_ref().unwrap().as_str(),
+            "cursor-2"
+        );
+        let item = accumulator.collection.item_at(0).unwrap();
+        assert_eq!(item.content_id.as_str(), "content-1");
+        assert_eq!(item.remote_status, RemoteContentStatus::Ready);
+        assert_eq!(item.remote_revision, 123);
+        assert_eq!(item.meta.as_str(), "CRA / FOR YOU");
         assert_eq!(item.title.as_str(), "Optimizing content for agents");
     }
 

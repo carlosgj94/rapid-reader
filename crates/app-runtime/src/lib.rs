@@ -1,6 +1,9 @@
 #![no_std]
 #![allow(dead_code)]
 
+extern crate alloc;
+
+use alloc::boxed::Box;
 use domain::{runtime::Command, selectors::select_active_screen, store::Store};
 
 pub mod animation;
@@ -31,7 +34,7 @@ pub struct ScreenUpdate {
 #[derive(Debug, Default)]
 pub struct AppRuntime {
     navigation: NavigationState,
-    previous: Option<ScreenUpdate>,
+    previous: Option<Box<ScreenUpdate>>,
 }
 
 impl AppRuntime {
@@ -43,16 +46,15 @@ impl AppRuntime {
     }
 
     pub fn tick(&mut self, store: &Store) -> ScreenUpdate {
-        let active = select_active_screen(store);
-        let (screen, prepared) = components::compose(active);
-        let transition = plan_transition(self.previous, screen, prepared);
+        let (screen, prepared) = components::compose(select_active_screen(store));
+        let transition = plan_transition(self.previous.as_deref(), screen, &prepared);
         let update = ScreenUpdate {
             screen,
             prepared,
             transition,
         };
 
-        self.previous = Some(update);
+        self.previous = Some(Box::new(update));
         update
     }
 
@@ -63,9 +65,9 @@ impl AppRuntime {
 }
 
 fn plan_transition(
-    previous: Option<ScreenUpdate>,
+    previous: Option<&ScreenUpdate>,
     screen: Screen,
-    prepared: PreparedScreen,
+    prepared: &PreparedScreen,
 ) -> TransitionPlan {
     let Some(previous) = previous else {
         return TransitionPlan::none();
@@ -73,14 +75,14 @@ fn plan_transition(
 
     use animation::{AnimationDescriptor as A, MotionDirection as D, TransitionPlan as T};
 
-    match (previous.screen, screen, previous.prepared, prepared) {
+    match (previous.screen, screen, &previous.prepared, prepared) {
         (
             Screen::Dashboard,
             Screen::Dashboard,
             PreparedScreen::Dashboard(old),
             PreparedScreen::Dashboard(new),
         ) if old.items[1].label != new.items[1].label => {
-            T::new(A::BandReveal(direction_for_dashboard(&old, &new)), 3, 50)
+            T::new(A::BandReveal(direction_for_dashboard(old, new)), 3, 50)
         }
         (
             old_screen,
@@ -88,7 +90,7 @@ fn plan_transition(
             PreparedScreen::Collection(old),
             PreparedScreen::Collection(new),
         ) if old_screen == new_screen && old.rows[1].title != new.rows[1].title => {
-            T::new(A::ListStep(direction_for_rows(&old, &new)), 3, 55)
+            T::new(A::ListStep(direction_for_rows(old, new)), 3, 55)
         }
         (old_screen, Screen::Reader, _, PreparedScreen::Reader(_))
             if is_collection_screen(old_screen) =>
@@ -138,7 +140,7 @@ fn plan_transition(
                 .zip(new.rows.iter())
                 .any(|(a, b)| a.selected != b.selected) =>
         {
-            T::new(A::BandReveal(direction_for_settings(&old, &new)), 3, 50)
+            T::new(A::BandReveal(direction_for_settings(old, new)), 3, 50)
         }
         (
             Screen::Settings,

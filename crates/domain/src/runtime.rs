@@ -3,7 +3,9 @@ use alloc::boxed::Box;
 use crate::{
     content::{
         CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestState, PackageState,
-        PrepareContentProgress, PrepareContentRequest, REMOTE_ITEM_ID_MAX_BYTES,
+        PrepareContentProgress, PrepareContentRequest, RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES,
+        REMOTE_ITEM_ID_MAX_BYTES, ReadingProgressState, RecommendationSubtopicsState,
+        RecommendationTopicRequest,
     },
     device::DeviceState,
     input::InputGesture,
@@ -71,6 +73,11 @@ pub enum Event {
     NetworkStatusChanged(NetworkStatus),
     BackendSyncStatusChanged(SyncStatus),
     CollectionContentUpdated(CollectionKind, Box<CollectionManifestState>),
+    RecommendationSubtopicsUpdated(Box<RecommendationSubtopicsState>),
+    RecommendationTopicContentUpdated {
+        topic_slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+        collection: Box<CollectionManifestState>,
+    },
     ReaderContentOpened {
         collection: CollectionKind,
         content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
@@ -105,6 +112,8 @@ pub enum Effect {
     OpenCachedContent(PrepareContentRequest),
     LoadReaderWindow(ReaderWindowLoadRequest),
     PrepareContent(PrepareContentRequest),
+    LoadRecommendationSubtopics,
+    LoadRecommendationTopic(RecommendationTopicRequest),
     PersistSettings(PersistedSettings),
 }
 
@@ -113,16 +122,21 @@ pub struct BootstrapSnapshot {
     pub device: DeviceState,
     pub boot_at_ms: u64,
     pub content: Option<Box<crate::content::ContentState>>,
+    pub reading_progress: Option<Box<ReadingProgressState>>,
+    pub recommendation_subtopics: Option<Box<RecommendationSubtopicsState>>,
     pub settings: Option<PersistedSettings>,
     pub storage: StorageHealth,
     pub network: NetworkState,
 }
 
 impl BootstrapSnapshot {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: DeviceState,
         boot_at_ms: u64,
         content: Option<Box<crate::content::ContentState>>,
+        reading_progress: Option<Box<ReadingProgressState>>,
+        recommendation_subtopics: Option<Box<RecommendationSubtopicsState>>,
         settings: Option<PersistedSettings>,
         storage: StorageHealth,
         network: NetworkState,
@@ -131,6 +145,8 @@ impl BootstrapSnapshot {
             device,
             boot_at_ms,
             content,
+            reading_progress,
+            recommendation_subtopics,
             settings,
             storage,
             network,
@@ -143,6 +159,8 @@ impl Default for BootstrapSnapshot {
         Self::new(
             DeviceState::new(),
             0,
+            None,
+            None,
             None,
             None,
             StorageHealth::new(),

@@ -104,13 +104,14 @@ enum PlatformCommand {
 
 #[embassy_executor::task]
 async fn app_task(snapshot: BootstrapSnapshot) {
-    let mut store = Store::from_bootstrap(snapshot);
-    let mut app = AppRuntime::new();
+    let mut store = Box::new(Store::new());
+    store.hydrate_from_bootstrap(snapshot);
+    let mut app = Box::new(AppRuntime::new());
     let mut pending_event: Option<TimedEvent> = None;
 
     info!("settings loaded={:?}", store.settings);
-    let mut last_update = app.tick(&store);
-    SCREEN_SIGNAL.signal(last_update);
+    let mut last_update = Box::new(app.tick(&store));
+    SCREEN_SIGNAL.signal(*last_update);
 
     loop {
         let timed_event = if let Some(event) = pending_event.take() {
@@ -137,12 +138,13 @@ async fn app_task(snapshot: BootstrapSnapshot) {
         }
 
         apply_effect(&mut store, effect, timed_event.at_ms).await;
+        flush_pending_reading_progress(&mut store).await;
 
         let next_update = app.tick(&store);
         if next_update.screen != last_update.screen || next_update.prepared != last_update.prepared
         {
             SCREEN_SIGNAL.signal(next_update);
-            last_update = next_update;
+            *last_update = next_update;
         }
     }
 }
@@ -245,6 +247,7 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                     store.open_cached_content(
                         request.collection,
                         request.content_id,
+                        request.remote_revision,
                         opened.title,
                         total_units,
                         opened.paragraphs,
@@ -352,6 +355,17 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                 request.remote_item_id.as_str(),
             );
             backend::request_prepare_content(request).await;
+        }
+        Effect::LoadRecommendationSubtopics => {
+            info!("recommendations load subtopics");
+            backend::request_recommendation_subtopics().await;
+        }
+        Effect::LoadRecommendationTopic(request) => {
+            info!(
+                "recommendations load topic topic_slug={}",
+                request.topic_slug.as_str()
+            );
+            backend::request_recommendation_topic(request).await;
         }
         Effect::PersistSettings(settings) => {
             PLATFORM_CMD_CH
@@ -497,6 +511,12 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
     };
     let bootstrap_content =
         content_storage::bootstrap_content_state(content_mount.storage.as_deref_mut());
+    let bootstrap_reading_progress =
+        content_storage::bootstrap_reading_progress_state(content_mount.storage.as_deref_mut());
+    let bootstrap_recommendation_subtopics =
+        content_storage::bootstrap_recommendation_subtopics_state(
+            content_mount.storage.as_deref_mut(),
+        );
     let snapshot = BootstrapSnapshot::new(
         DeviceState {
             pairing: backend::initial_pairing_state(backend_credential),
@@ -504,6 +524,8 @@ pub async fn run_minimal(spawner: Spawner) -> ! {
         },
         boot_ms,
         bootstrap_content,
+        bootstrap_reading_progress,
+        bootstrap_recommendation_subtopics,
         persisted_settings,
         storage_health,
         internet::initial_network_state(),
@@ -830,6 +852,22 @@ pub(crate) async fn persist_backend_credential(credential: crate::storage::Backe
             credential,
         )))
         .await;
+}
+
+async fn flush_pending_reading_progress(store: &mut Store) {
+    while let Some(entry) = store.take_pending_reading_progress_write() {
+        if let Err(err) = content_storage::queue_reading_progress_write(entry).await {
+            info!(
+                "content storage reading progress persist failed content_id={} remote_revision={} paragraph_index={} total_paragraphs={} err={:?}",
+                entry.content_id.as_str(),
+                entry.remote_revision,
+                entry.paragraph_index,
+                entry.total_paragraphs,
+                err,
+            );
+            break;
+        }
+    }
 }
 
 fn current_prepared_screen(
@@ -1331,22 +1369,26 @@ mod tests {
                 },
                 rail: app_runtime::components::VerticalRail { text: "SAVED" },
                 large_rail: true,
+                recommendations_bar: None,
                 rows: [
                     app_runtime::components::ContentRow {
                         meta: "A",
                         title: "A",
+                        progress_badge: None,
                         loading_phase: None,
                         selected: false,
                     },
                     app_runtime::components::ContentRow {
                         meta: "B",
                         title: "B",
+                        progress_badge: None,
                         loading_phase: None,
                         selected: true,
                     },
                     app_runtime::components::ContentRow {
                         meta: "C",
                         title: "C",
+                        progress_badge: None,
                         loading_phase: None,
                         selected: false,
                     },
@@ -1437,22 +1479,26 @@ mod tests {
             },
             rail: app_runtime::components::VerticalRail { text: "SAVED" },
             large_rail: true,
+            recommendations_bar: None,
             rows: [
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Previous",
+                    progress_badge: None,
                     loading_phase: None,
                     selected: false,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Fetching",
+                    progress_badge: None,
                     loading_phase: Some(2),
                     selected: true,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Next",
+                    progress_badge: None,
                     loading_phase: None,
                     selected: false,
                 },
@@ -1476,22 +1522,26 @@ mod tests {
             },
             rail: app_runtime::components::VerticalRail { text: "SAVED" },
             large_rail: true,
+            recommendations_bar: None,
             rows: [
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Previous",
+                    progress_badge: None,
                     loading_phase: None,
                     selected: false,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Current",
+                    progress_badge: None,
                     loading_phase: None,
                     selected: true,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Next",
+                    progress_badge: None,
                     loading_phase: None,
                     selected: false,
                 },

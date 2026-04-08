@@ -4,7 +4,7 @@ use domain::{
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     selectors::{
         ActiveScreenModel, ContentListScreenModel, DashboardScreenModel, ParagraphNavigationModel,
-        ReaderScreenModel, SettingsScreenModel,
+        ReaderScreenModel, RecommendationBarModel, RecommendationTabModel, SettingsScreenModel,
     },
     settings::AppearanceMode,
     ui::{SettingsMode, TopicRegion},
@@ -57,6 +57,7 @@ pub struct DashboardShell {
 pub struct ContentRow {
     pub meta: domain::text::InlineText<CONTENT_META_MAX_BYTES>,
     pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub progress_badge: Option<domain::text::InlineText<8>>,
     pub loading_phase: Option<u8>,
     pub selected: bool,
 }
@@ -67,11 +68,28 @@ pub struct HelpHint {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationTab {
+    pub label: domain::text::InlineText<{ domain::selectors::RECOMMENDATION_TAB_LABEL_MAX_BYTES }>,
+    pub active: bool,
+    pub focused: bool,
+    pub flash: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationBar {
+    pub tabs: [RecommendationTab; domain::selectors::RECOMMENDATION_VISIBLE_TABS],
+    pub visible_count: usize,
+    pub show_left_more: bool,
+    pub show_right_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ContentListShell {
     pub appearance: AppearanceMode,
     pub status: StatusCluster,
     pub rail: VerticalRail,
     pub large_rail: bool,
+    pub recommendations_bar: Option<RecommendationBar>,
     pub rows: [ContentRow; 3],
     pub band: SelectionBand,
     pub help: HelpHint,
@@ -187,6 +205,7 @@ pub struct SettingsShell {
     pub topic_preferences: Option<TopicPreferenceGrid>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PreparedScreen {
     Dashboard(DashboardShell),
@@ -261,6 +280,7 @@ fn compose_dashboard(model: DashboardScreenModel) -> DashboardShell {
 }
 
 fn compose_collection(model: ContentListScreenModel) -> ContentListShell {
+    let recommendations_bar = model.recommendations_bar.map(compose_recommendation_bar);
     ContentListShell {
         appearance: model.appearance,
         status: StatusCluster {
@@ -273,31 +293,64 @@ fn compose_collection(model: ContentListScreenModel) -> ContentListShell {
         large_rail: matches!(
             model.selected_collection,
             domain::content::CollectionKind::Saved
+                | domain::content::CollectionKind::Inbox
+                | domain::content::CollectionKind::Recommendations
         ),
+        recommendations_bar,
         rows: [
             ContentRow {
                 meta: model.rows[0].meta,
                 title: model.rows[0].title,
+                progress_badge: model.rows[0].progress_badge,
                 loading_phase: model.rows[0].loading_phase,
                 selected: false,
             },
             ContentRow {
                 meta: model.rows[1].meta,
                 title: model.rows[1].title,
+                progress_badge: model.rows[1].progress_badge,
                 loading_phase: model.rows[1].loading_phase,
                 selected: true,
             },
             ContentRow {
                 meta: model.rows[2].meta,
                 title: model.rows[2].title,
+                progress_badge: model.rows[2].progress_badge,
                 loading_phase: model.rows[2].loading_phase,
                 selected: false,
             },
         ],
-        band: SelectionBand { y: 106, height: 68 },
+        band: if recommendations_bar.is_some() {
+            SelectionBand { y: 100, height: 64 }
+        } else {
+            SelectionBand { y: 106, height: 68 }
+        },
         help: HelpHint {
             text: "long press_",
         },
+    }
+}
+
+fn compose_recommendation_bar(model: RecommendationBarModel) -> RecommendationBar {
+    RecommendationBar {
+        tabs: [
+            compose_recommendation_tab(model.tabs[0]),
+            compose_recommendation_tab(model.tabs[1]),
+            compose_recommendation_tab(model.tabs[2]),
+            compose_recommendation_tab(model.tabs[3]),
+        ],
+        visible_count: model.visible_count,
+        show_left_more: model.show_left_more,
+        show_right_more: model.show_right_more,
+    }
+}
+
+fn compose_recommendation_tab(model: RecommendationTabModel) -> RecommendationTab {
+    RecommendationTab {
+        label: model.label,
+        active: model.active,
+        focused: model.focused,
+        flash: model.flash,
     }
 }
 

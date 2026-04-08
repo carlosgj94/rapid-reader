@@ -10,6 +10,10 @@ pub const CONTENT_TITLE_MAX_BYTES: usize = 96;
 pub const CONTENT_ID_MAX_BYTES: usize = 36;
 pub const REMOTE_ITEM_ID_MAX_BYTES: usize = 36;
 pub const RECOMMENDATION_SERVE_ID_MAX_BYTES: usize = 36;
+pub const RECOMMENDATION_SUBTOPIC_CAPACITY: usize = 8;
+pub const RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES: usize = 32;
+pub const RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES: usize = 24;
+pub const READING_PROGRESS_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum CollectionKind {
@@ -272,6 +276,374 @@ impl Default for CollectionManifestState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationSubtopic {
+    pub slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+    pub label: InlineText<RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES>,
+    pub parent_topic_label: InlineText<RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES>,
+    pub is_from_settings: bool,
+    pub is_from_behavior: bool,
+}
+
+impl RecommendationSubtopic {
+    pub const fn empty() -> Self {
+        Self {
+            slug: InlineText::new(),
+            label: InlineText::new(),
+            parent_topic_label: InlineText::new(),
+            is_from_settings: false,
+            is_from_behavior: false,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.slug.is_empty()
+    }
+
+    pub const fn is_recommended(self) -> bool {
+        self.is_from_behavior && !self.is_from_settings
+    }
+}
+
+impl Default for RecommendationSubtopic {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationSubtopicsState {
+    pub items: [RecommendationSubtopic; RECOMMENDATION_SUBTOPIC_CAPACITY],
+    len: u8,
+}
+
+impl RecommendationSubtopicsState {
+    pub const fn empty() -> Self {
+        Self {
+            items: [RecommendationSubtopic::empty(); RECOMMENDATION_SUBTOPIC_CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::empty();
+    }
+
+    pub fn try_push(&mut self, item: RecommendationSubtopic) -> bool {
+        let len = self.len();
+        if len >= RECOMMENDATION_SUBTOPIC_CAPACITY || item.is_empty() {
+            return false;
+        }
+
+        self.items[len] = item;
+        self.len = self.len.saturating_add(1);
+        true
+    }
+
+    pub fn item_at(&self, index: usize) -> Option<RecommendationSubtopic> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.items[index % self.len()])
+        }
+    }
+
+    pub fn find_index_by_slug(
+        &self,
+        slug: &InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+    ) -> Option<usize> {
+        let mut index = 0usize;
+        while index < self.len() {
+            if self.items[index].slug == *slug {
+                return Some(index);
+            }
+            index += 1;
+        }
+
+        None
+    }
+}
+
+impl Default for RecommendationSubtopicsState {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationTopicRequest {
+    pub topic_slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+}
+
+impl RecommendationTopicRequest {
+    pub const fn new(topic_slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>) -> Self {
+        Self { topic_slug }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationState {
+    pub subtopics: RecommendationSubtopicsState,
+    pub active_topic_slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+    pub subtopics_loading: bool,
+    pub topic_loading: bool,
+}
+
+impl RecommendationState {
+    pub const fn new() -> Self {
+        Self {
+            subtopics: RecommendationSubtopicsState::empty(),
+            active_topic_slug: InlineText::new(),
+            subtopics_loading: false,
+            topic_loading: false,
+        }
+    }
+
+    pub fn active_topic_index(&self) -> Option<usize> {
+        if self.active_topic_slug.is_empty() {
+            None
+        } else {
+            self.subtopics.find_index_by_slug(&self.active_topic_slug)
+        }
+    }
+
+    pub fn set_subtopics(&mut self, subtopics: RecommendationSubtopicsState) {
+        self.subtopics = subtopics;
+        if self
+            .subtopics
+            .find_index_by_slug(&self.active_topic_slug)
+            .is_none()
+        {
+            self.active_topic_slug = self
+                .subtopics
+                .item_at(0)
+                .map(|item| item.slug)
+                .unwrap_or_default();
+        }
+        if self.subtopics.is_empty() {
+            self.active_topic_slug.clear();
+            self.subtopics_loading = false;
+            self.topic_loading = false;
+        }
+    }
+
+    pub fn set_active_topic(
+        &mut self,
+        topic_slug: InlineText<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>,
+        loading: bool,
+    ) {
+        self.active_topic_slug = topic_slug;
+        self.topic_loading = loading;
+    }
+
+    pub fn begin_subtopics_loading(&mut self) {
+        self.subtopics_loading = true;
+    }
+
+    pub fn finish_subtopics_loading(&mut self) {
+        self.subtopics_loading = false;
+    }
+
+    pub fn active_subtopic(&self) -> Option<RecommendationSubtopic> {
+        self.active_topic_index()
+            .and_then(|index| self.subtopics.item_at(index))
+    }
+}
+
+impl Default for RecommendationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReadingProgressEntry {
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub remote_revision: u64,
+    pub paragraph_index: u16,
+    pub total_paragraphs: u16,
+}
+
+impl ReadingProgressEntry {
+    pub const fn empty() -> Self {
+        Self {
+            content_id: InlineText::new(),
+            remote_revision: 0,
+            paragraph_index: 0,
+            total_paragraphs: 0,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.content_id.is_empty() || self.paragraph_index == 0 || self.total_paragraphs == 0
+    }
+
+    pub const fn sanitized(self) -> Self {
+        if self.content_id.is_empty() {
+            return Self::empty();
+        }
+
+        let total_paragraphs = if self.total_paragraphs == 0 {
+            1
+        } else {
+            self.total_paragraphs
+        };
+        let paragraph_index = if self.paragraph_index == 0 {
+            1
+        } else if self.paragraph_index > total_paragraphs {
+            total_paragraphs
+        } else {
+            self.paragraph_index
+        };
+
+        Self {
+            content_id: self.content_id,
+            remote_revision: self.remote_revision,
+            paragraph_index,
+            total_paragraphs,
+        }
+    }
+
+    pub const fn completion_percent(self) -> u8 {
+        if self.is_empty() {
+            return 0;
+        }
+
+        let total = if self.total_paragraphs > self.paragraph_index {
+            self.total_paragraphs
+        } else {
+            self.paragraph_index
+        } as u32;
+        let paragraph = self.paragraph_index as u32;
+        let percent = ((paragraph * 100) + total.saturating_sub(1)) / total;
+
+        if percent == 0 {
+            1
+        } else if percent >= 100 {
+            100
+        } else {
+            percent as u8
+        }
+    }
+}
+
+impl Default for ReadingProgressEntry {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReadingProgressState {
+    pub entries: [ReadingProgressEntry; READING_PROGRESS_CAPACITY],
+    len: u8,
+}
+
+impl ReadingProgressState {
+    pub const fn empty() -> Self {
+        Self {
+            entries: [ReadingProgressEntry::empty(); READING_PROGRESS_CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn entry_for_item(&self, item: CollectionManifestItem) -> Option<ReadingProgressEntry> {
+        self.find_by_content_id(&item.content_id)
+            .filter(|entry| entry.remote_revision == item.remote_revision)
+    }
+
+    pub fn find_by_content_id(
+        &self,
+        content_id: &InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> Option<ReadingProgressEntry> {
+        let mut index = 0usize;
+        while index < self.len() {
+            let entry = self.entries[index];
+            if entry.content_id == *content_id {
+                return Some(entry);
+            }
+            index += 1;
+        }
+
+        None
+    }
+
+    pub fn record_progress(&mut self, entry: ReadingProgressEntry) -> Option<ReadingProgressEntry> {
+        let entry = entry.sanitized();
+        if entry.is_empty() {
+            return None;
+        }
+
+        if let Some(index) = self.find_index_by_content_id(&entry.content_id) {
+            let existing = self.entries[index];
+            let updated = if existing.remote_revision == entry.remote_revision {
+                ReadingProgressEntry {
+                    content_id: entry.content_id,
+                    remote_revision: entry.remote_revision,
+                    paragraph_index: existing.paragraph_index.max(entry.paragraph_index),
+                    total_paragraphs: entry.total_paragraphs.max(entry.paragraph_index),
+                }
+            } else {
+                entry
+            };
+
+            if existing == updated {
+                return None;
+            }
+
+            self.entries[index] = updated;
+            return Some(updated);
+        }
+
+        if self.len() < READING_PROGRESS_CAPACITY {
+            self.entries[self.len()] = entry;
+            self.len = self.len.saturating_add(1);
+            return Some(entry);
+        }
+
+        self.entries.copy_within(1..READING_PROGRESS_CAPACITY, 0);
+        self.entries[READING_PROGRESS_CAPACITY - 1] = entry;
+        Some(entry)
+    }
+
+    fn find_index_by_content_id(
+        &self,
+        content_id: &InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> Option<usize> {
+        let mut index = 0usize;
+        while index < self.len() {
+            if self.entries[index].content_id == *content_id {
+                return Some(index);
+            }
+            index += 1;
+        }
+
+        None
+    }
+}
+
+impl Default for ReadingProgressState {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 const EMPTY_COLLECTION_STATE: CollectionManifestState = CollectionManifestState::empty();
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -496,6 +868,68 @@ impl PrepareContentProgress {
 impl Default for PrepareContentProgress {
     fn default() -> Self {
         Self::connecting()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress_entry(
+        content_id: &str,
+        remote_revision: u64,
+        paragraph_index: u16,
+        total_paragraphs: u16,
+    ) -> ReadingProgressEntry {
+        let mut entry = ReadingProgressEntry::empty();
+        entry.content_id.set_truncated(content_id);
+        entry.remote_revision = remote_revision;
+        entry.paragraph_index = paragraph_index;
+        entry.total_paragraphs = total_paragraphs;
+        entry
+    }
+
+    #[test]
+    fn reading_progress_keeps_farthest_paragraph_for_same_revision() {
+        let mut progress = ReadingProgressState::empty();
+
+        let first = progress.record_progress(progress_entry("content-1", 7, 3, 12));
+        let second = progress.record_progress(progress_entry("content-1", 7, 2, 12));
+
+        assert_eq!(first.unwrap().paragraph_index, 3);
+        assert_eq!(second, None);
+        assert_eq!(
+            progress
+                .find_by_content_id(&InlineText::from_slice("content-1"))
+                .unwrap(),
+            progress_entry("content-1", 7, 3, 12)
+        );
+    }
+
+    #[test]
+    fn reading_progress_resets_for_new_revision() {
+        let mut progress = ReadingProgressState::empty();
+        let _ = progress.record_progress(progress_entry("content-1", 7, 5, 12));
+
+        let updated = progress
+            .record_progress(progress_entry("content-1", 8, 1, 10))
+            .unwrap();
+
+        assert_eq!(updated.remote_revision, 8);
+        assert_eq!(updated.paragraph_index, 1);
+        assert_eq!(updated.total_paragraphs, 10);
+    }
+
+    #[test]
+    fn reading_progress_completion_percent_rounds_started_articles_up() {
+        assert_eq!(
+            progress_entry("content-1", 1, 1, 23).completion_percent(),
+            5
+        );
+        assert_eq!(
+            progress_entry("content-1", 1, 23, 23).completion_percent(),
+            100
+        );
     }
 }
 

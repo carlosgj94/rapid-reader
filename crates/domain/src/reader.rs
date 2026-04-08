@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use crate::{
     content::{
         ArticleId, CONTENT_ID_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
-        PrepareContentProgress,
+        PrepareContentProgress, ReadingProgressEntry,
     },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, ReadingDocument, ReadingUnit},
     settings::{DEFAULT_READING_SPEED_WPM, MIN_READING_SPEED_WPM, READING_SPEED_STEP_WPM},
@@ -74,6 +74,7 @@ pub struct ReaderSession {
     pub active_article: ArticleId,
     pub active_collection: CollectionKind,
     pub active_content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub active_remote_revision: u64,
     pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
     active_window: Option<Box<ReaderWindow>>,
     prefetched_window: Option<Box<ReaderWindow>>,
@@ -131,6 +132,7 @@ impl ReaderSession {
             active_article: ArticleId(102),
             active_collection: CollectionKind::Saved,
             active_content_id: InlineText::new(),
+            active_remote_revision: 0,
             title: InlineText::new(),
             active_window: None,
             prefetched_window: None,
@@ -165,6 +167,7 @@ impl ReaderSession {
     ) {
         self.active_collection = collection;
         self.active_content_id = content_id;
+        self.active_remote_revision = 0;
         self.title = title;
         self.active_window = None;
         self.prefetched_window = None;
@@ -222,6 +225,7 @@ impl ReaderSession {
             collection,
             article,
             InlineText::new(),
+            0,
             title,
             document.unit_count as u32,
             paragraphs.into_boxed_slice(),
@@ -237,6 +241,7 @@ impl ReaderSession {
         collection: CollectionKind,
         article: ArticleId,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        remote_revision: u64,
         title: InlineText<CONTENT_TITLE_MAX_BYTES>,
         total_units: u32,
         paragraphs: Box<[ReaderParagraphInfo]>,
@@ -247,6 +252,7 @@ impl ReaderSession {
         self.active_collection = collection;
         self.active_article = article;
         self.active_content_id = content_id;
+        self.active_remote_revision = remote_revision;
         self.title = title;
         self.total_units = total_units;
         self.paragraphs = Some(paragraphs);
@@ -296,6 +302,7 @@ impl ReaderSession {
 
     pub fn unload_document(&mut self) {
         self.active_content_id = InlineText::new();
+        self.active_remote_revision = 0;
         self.active_window = None;
         self.prefetched_window = None;
         self.paragraphs = None;
@@ -569,6 +576,25 @@ impl ReaderSession {
 
     pub fn current_unit(&self) -> &ReadingUnit {
         self.active_window().unit_at(self.progress.unit_index)
+    }
+
+    pub fn reading_progress_checkpoint(&self) -> Option<ReadingProgressEntry> {
+        if self.active_content_id.is_empty()
+            || matches!(self.mode, ReaderMode::LoadingContent)
+            || self.active_window().is_empty()
+        {
+            return None;
+        }
+
+        Some(
+            ReadingProgressEntry {
+                content_id: self.active_content_id,
+                remote_revision: self.active_remote_revision,
+                paragraph_index: self.progress.paragraph_index.max(1),
+                total_paragraphs: self.progress.total_paragraphs.max(1),
+            }
+            .sanitized(),
+        )
     }
 
     pub fn preview_for_paragraph(

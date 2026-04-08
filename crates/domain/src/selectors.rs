@@ -2,6 +2,8 @@ use crate::{
     content::{
         CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestItem,
         CollectionManifestState, ContentState, PackageState,
+        RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES, ReadingProgressEntry, ReadingProgressState,
+        RecommendationSubtopic,
     },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     network::NetworkStatus,
@@ -12,11 +14,13 @@ use crate::{
     },
     store::Store,
     text::InlineText,
-    ui::{DashboardFocus, SettingsMode, TopicRegion, UiRoute},
+    ui::{DashboardFocus, RecommendationsRegion, SettingsMode, TopicRegion, UiRoute},
 };
 
 pub const VISIBLE_LIST_ROWS: usize = 3;
 pub const SETTINGS_ROW_COUNT: usize = 6;
+pub const RECOMMENDATION_VISIBLE_TABS: usize = 4;
+pub const RECOMMENDATION_TAB_LABEL_MAX_BYTES: usize = RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES + 1;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct StatusClusterModel {
@@ -51,6 +55,7 @@ pub struct SyncIndicatorModel {
 pub struct ContentRowModel {
     pub meta: InlineText<CONTENT_META_MAX_BYTES>,
     pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
+    pub progress_badge: Option<InlineText<8>>,
     pub loading_phase: Option<u8>,
     pub selected: bool,
 }
@@ -60,9 +65,26 @@ pub struct ContentListScreenModel {
     pub appearance: AppearanceMode,
     pub status: StatusClusterModel,
     pub rail_label: &'static str,
+    pub recommendations_bar: Option<RecommendationBarModel>,
     pub rows: [ContentRowModel; VISIBLE_LIST_ROWS],
     pub selected_collection: CollectionKind,
     pub selected_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationTabModel {
+    pub label: InlineText<RECOMMENDATION_TAB_LABEL_MAX_BYTES>,
+    pub active: bool,
+    pub focused: bool,
+    pub flash: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RecommendationBarModel {
+    pub tabs: [RecommendationTabModel; RECOMMENDATION_VISIBLE_TABS],
+    pub visible_count: usize,
+    pub show_left_more: bool,
+    pub show_right_more: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -213,17 +235,24 @@ pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
 
 pub fn select_collection(store: &Store, kind: CollectionKind) -> ContentListScreenModel {
     let selected_index = store.ui.collection_index(kind);
-    let rows = select_collection_rows(
-        store.content(),
-        kind,
-        selected_index,
-        store.backend_sync.spinner_phase,
-    );
+    let rows = if matches!(kind, CollectionKind::Recommendations) {
+        select_recommendation_rows(store)
+    } else {
+        select_collection_rows(
+            store.content(),
+            &store.reading_progress,
+            kind,
+            selected_index,
+            store.backend_sync.spinner_phase,
+        )
+    };
 
     ContentListScreenModel {
         appearance: store.settings.appearance,
         status: select_status(store),
         rail_label: kind.rail_label(),
+        recommendations_bar: matches!(kind, CollectionKind::Recommendations)
+            .then_some(select_recommendation_bar(store)),
         rows,
         selected_collection: kind,
         selected_index,
@@ -448,20 +477,183 @@ fn select_topic_preferences(store: &Store) -> TopicPreferencesModel {
 
 fn select_collection_rows(
     content: &ContentState,
+    reading_progress: &ReadingProgressState,
     kind: CollectionKind,
     selected_index: usize,
     spinner_phase: u8,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
     select_manifest_collection_rows(
         content.collection_state(kind),
+        reading_progress,
         kind,
         selected_index,
         spinner_phase,
     )
 }
 
+fn select_recommendation_rows(store: &Store) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
+    if store.recommendations.subtopics_loading && store.recommendations.subtopics.is_empty() {
+        return [
+            content_row("", "", false),
+            content_row("MOTIF", "Loading topics...", true),
+            content_row("NETWORK / SYNC", "Building your recommendations", false),
+        ];
+    }
+
+    if store.recommendations.topic_loading {
+        let topic_label = store
+            .recommendations
+            .active_subtopic()
+            .map(recommendation_topic_meta)
+            .unwrap_or_else(|| InlineText::from_slice("FOR YOU"));
+        return [
+            content_row("", "", false),
+            ContentRowModel {
+                meta: topic_label,
+                title: InlineText::from_slice("Loading articles..."),
+                progress_badge: None,
+                loading_phase: None,
+                selected: true,
+            },
+            content_row("MOTIF", "This may take a moment", false),
+        ];
+    }
+
+    let collection = store
+        .content()
+        .collection_state(CollectionKind::Recommendations);
+    if collection.is_empty() {
+        if store.recommendations.subtopics.is_empty() {
+            return [
+                content_row("", "", false),
+                content_row("MOTIF", "No recommendations synced yet", true),
+                content_row("NETWORK / SYNC", "Refresh data after pairing", false),
+            ];
+        }
+
+        let topic_label = store
+            .recommendations
+            .active_subtopic()
+            .map(recommendation_topic_meta)
+            .unwrap_or_else(|| InlineText::from_slice("FOR YOU"));
+        return [
+            content_row("", "", false),
+            ContentRowModel {
+                meta: topic_label,
+                title: InlineText::from_slice("No articles for this topic yet"),
+                progress_badge: None,
+                loading_phase: None,
+                selected: true,
+            },
+            content_row("MOTIF", "Try another subtopic", false),
+        ];
+    }
+
+    select_manifest_collection_rows(
+        collection,
+        &store.reading_progress,
+        CollectionKind::Recommendations,
+        store.ui.recommendations_index,
+        store.backend_sync.spinner_phase,
+    )
+}
+
+fn select_recommendation_bar(store: &Store) -> RecommendationBarModel {
+    let mut tabs = [RecommendationTabModel {
+        label: InlineText::new(),
+        active: false,
+        focused: false,
+        flash: false,
+    }; RECOMMENDATION_VISIBLE_TABS];
+
+    let len = store.recommendations.subtopics.len();
+    if len == 0 {
+        return RecommendationBarModel {
+            tabs,
+            visible_count: 0,
+            show_left_more: false,
+            show_right_more: false,
+        };
+    }
+
+    let focus_index = store
+        .ui
+        .recommendations_subtopic_index
+        .min(len.saturating_sub(1));
+    let window_start = recommendation_tab_window_start(focus_index, len);
+    let visible_count = (len - window_start).min(RECOMMENDATION_VISIBLE_TABS);
+    let active_slug = store.recommendations.active_topic_slug;
+    let mut index = 0usize;
+    while index < visible_count {
+        if let Some(subtopic) = store
+            .recommendations
+            .subtopics
+            .item_at(window_start + index)
+        {
+            let is_active = subtopic.slug == active_slug;
+            let is_focused = matches!(
+                store.ui.recommendations_region,
+                RecommendationsRegion::Subtopics
+            ) && window_start + index == focus_index;
+            tabs[index] = RecommendationTabModel {
+                label: recommendation_tab_label(subtopic),
+                active: is_active,
+                focused: is_focused,
+                flash: is_focused
+                    && store.ui.recommendations_focus_flash_ticks > 0
+                    && store.ui.recommendations_focus_flash_ticks.is_multiple_of(2),
+            };
+        }
+        index += 1;
+    }
+
+    RecommendationBarModel {
+        tabs,
+        visible_count,
+        show_left_more: window_start > 0,
+        show_right_more: window_start + visible_count < len,
+    }
+}
+
+fn recommendation_tab_window_start(focus_index: usize, len: usize) -> usize {
+    if len <= RECOMMENDATION_VISIBLE_TABS {
+        return 0;
+    }
+
+    let preferred = focus_index.saturating_sub(1);
+    preferred.min(len.saturating_sub(RECOMMENDATION_VISIBLE_TABS))
+}
+
+fn recommendation_tab_label(
+    subtopic: RecommendationSubtopic,
+) -> InlineText<RECOMMENDATION_TAB_LABEL_MAX_BYTES> {
+    let mut label = InlineText::new();
+    for ch in subtopic.label.as_str().chars() {
+        if !label.try_push_char(ch.to_ascii_uppercase()) {
+            break;
+        }
+    }
+    if subtopic.is_recommended() {
+        let _ = label.try_push_char('*');
+    }
+    label
+}
+
+fn recommendation_topic_meta(
+    subtopic: RecommendationSubtopic,
+) -> InlineText<CONTENT_META_MAX_BYTES> {
+    let mut meta = InlineText::new();
+    if !subtopic.parent_topic_label.is_empty() {
+        meta.set_truncated(subtopic.parent_topic_label.as_str());
+    } else {
+        meta.set_truncated("FOR YOU");
+    }
+    meta
+}
+
 fn select_manifest_collection_rows(
     collection: &CollectionManifestState,
+    reading_progress: &ReadingProgressState,
     kind: CollectionKind,
     selected_index: usize,
     spinner_phase: u8,
@@ -472,7 +664,7 @@ fn select_manifest_collection_rows(
     if collection.len() == 1 {
         return [
             content_row("", "", false),
-            content_row_from_manifest(selected, kind, true, spinner_phase),
+            content_row_from_manifest(selected, reading_progress, kind, true, spinner_phase),
             content_row("", "", false),
         ];
     }
@@ -484,9 +676,9 @@ fn select_manifest_collection_rows(
         .unwrap_or(selected);
 
     [
-        content_row_from_manifest(previous, kind, false, spinner_phase),
-        content_row_from_manifest(selected, kind, true, spinner_phase),
-        content_row_from_manifest(next, kind, false, spinner_phase),
+        content_row_from_manifest(previous, reading_progress, kind, false, spinner_phase),
+        content_row_from_manifest(selected, reading_progress, kind, true, spinner_phase),
+        content_row_from_manifest(next, reading_progress, kind, false, spinner_phase),
     ]
 }
 
@@ -494,6 +686,7 @@ fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
     ContentRowModel {
         meta: InlineText::from_slice(meta),
         title: InlineText::from_slice(title),
+        progress_badge: None,
         loading_phase: None,
         selected,
     }
@@ -501,14 +694,17 @@ fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
 
 fn content_row_from_manifest(
     item: CollectionManifestItem,
+    reading_progress: &ReadingProgressState,
     kind: CollectionKind,
     selected: bool,
     spinner_phase: u8,
 ) -> ContentRowModel {
+    let loading_phase = row_loading_phase(kind, item.package_state, spinner_phase);
     ContentRowModel {
         meta: content_row_meta(kind, item),
         title: item.title,
-        loading_phase: row_loading_phase(kind, item.package_state, spinner_phase),
+        progress_badge: row_progress_badge(kind, item, loading_phase, reading_progress),
+        loading_phase,
         selected,
     }
 }
@@ -533,17 +729,22 @@ fn collection_row_base_meta(
     kind: CollectionKind,
     meta: InlineText<CONTENT_META_MAX_BYTES>,
 ) -> InlineText<CONTENT_META_MAX_BYTES> {
-    if !matches!(kind, CollectionKind::Saved) {
+    let Some(suffix) = collection_meta_suffix(kind) else {
         return meta;
-    }
+    };
 
     let mut stripped = InlineText::new();
-    let base = meta
-        .as_str()
-        .strip_suffix(" / SAVED")
-        .unwrap_or(meta.as_str());
+    let base = meta.as_str().strip_suffix(suffix).unwrap_or(meta.as_str());
     stripped.set_truncated(base);
     stripped
+}
+
+const fn collection_meta_suffix(kind: CollectionKind) -> Option<&'static str> {
+    match kind {
+        CollectionKind::Saved => Some(" / SAVED"),
+        CollectionKind::Inbox => Some(" / INBOX"),
+        CollectionKind::Recommendations => Some(" / FOR YOU"),
+    }
 }
 
 const fn package_state_hint(kind: CollectionKind, state: PackageState) -> Option<&'static str> {
@@ -565,6 +766,45 @@ const fn row_loading_phase(
         (CollectionKind::Saved, PackageState::Fetching) => Some(spinner_phase),
         _ => None,
     }
+}
+
+fn row_progress_badge(
+    kind: CollectionKind,
+    item: CollectionManifestItem,
+    loading_phase: Option<u8>,
+    reading_progress: &ReadingProgressState,
+) -> Option<InlineText<8>> {
+    if loading_phase.is_some() || !matches!(kind, CollectionKind::Saved) {
+        return None;
+    }
+
+    progress_badge_label(reading_progress.entry_for_item(item)?)
+}
+
+fn progress_badge_label(entry: ReadingProgressEntry) -> Option<InlineText<8>> {
+    let percent = entry.completion_percent();
+    if percent == 0 {
+        return None;
+    }
+
+    let mut label = InlineText::new();
+    push_decimal(&mut label, percent);
+    let _ = label.try_push_char('%');
+    Some(label)
+}
+
+fn push_decimal(target: &mut InlineText<8>, value: u8) {
+    if value >= 100 {
+        let _ = target.try_push_char('1');
+        let _ = target.try_push_char('0');
+        let _ = target.try_push_char('0');
+        return;
+    }
+
+    if value >= 10 {
+        let _ = target.try_push_char((b'0' + (value / 10)) as char);
+    }
+    let _ = target.try_push_char((b'0' + (value % 10)) as char);
 }
 
 fn empty_collection_rows(kind: CollectionKind) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
@@ -597,11 +837,54 @@ fn select_status(store: &Store) -> StatusClusterModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::CollectionManifestItem;
+    use crate::content::{
+        CollectionManifestItem, DetailLocator, ReadingProgressEntry, RecommendationSubtopic,
+        RecommendationSubtopicsState, RemoteContentStatus,
+    };
     use crate::formatter::{article_document_from_script, format_article_document};
     use crate::network::NetworkStatus;
     use crate::store::Store;
     use crate::sync::SyncStatus;
+
+    fn make_recommendation_subtopic(
+        slug: &str,
+        label: &str,
+        from_settings: bool,
+        from_behavior: bool,
+    ) -> RecommendationSubtopic {
+        let mut topic = RecommendationSubtopic::empty();
+        topic.slug.set_truncated(slug);
+        topic.label.set_truncated(label);
+        topic.parent_topic_label.set_truncated("Technology");
+        topic.is_from_settings = from_settings;
+        topic.is_from_behavior = from_behavior;
+        topic
+    }
+
+    fn make_recommendation_subtopics() -> RecommendationSubtopicsState {
+        let mut subtopics = RecommendationSubtopicsState::empty();
+        let _ = subtopics.try_push(make_recommendation_subtopic("e-ink", "E Ink", true, false));
+        let _ = subtopics.try_push(make_recommendation_subtopic(
+            "small-web",
+            "Small Web",
+            false,
+            true,
+        ));
+        let _ = subtopics.try_push(make_recommendation_subtopic("pocket", "Pocket", true, true));
+        subtopics
+    }
+
+    fn make_recommendation_item(meta: &str, title: &str) -> CollectionManifestItem {
+        let mut item = CollectionManifestItem::empty();
+        item.remote_item_id.set_truncated(title);
+        item.content_id.set_truncated(title);
+        item.detail_locator = DetailLocator::Content;
+        item.meta.set_truncated(meta);
+        item.title.set_truncated(title);
+        item.remote_status = RemoteContentStatus::Ready;
+        item.package_state = PackageState::Cached;
+        item
+    }
 
     #[test]
     fn dashboard_defaults_to_saved_focus() {
@@ -630,6 +913,71 @@ mod tests {
                 spinner_phase: 2,
             })
         );
+    }
+
+    #[test]
+    fn recommendations_selector_builds_topic_bar_with_active_and_focused_tabs() {
+        let mut store = Store::new();
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store
+            .recommendations
+            .set_active_topic(crate::text::InlineText::from_slice("e-ink"), false);
+        store.ui.recommendations_region = crate::ui::RecommendationsRegion::Subtopics;
+        store.ui.recommendations_subtopic_index = 1;
+
+        let model = select_collection(&store, CollectionKind::Recommendations);
+        let bar = model.recommendations_bar.expect("recommendation bar");
+
+        assert_eq!(bar.visible_count, 3);
+        assert_eq!(bar.tabs[0].label.as_str(), "E INK");
+        assert!(bar.tabs[0].active);
+        assert!(!bar.tabs[0].focused);
+        assert!(!bar.tabs[0].flash);
+        assert_eq!(bar.tabs[1].label.as_str(), "SMALL WEB*");
+        assert!(!bar.tabs[1].active);
+        assert!(bar.tabs[1].focused);
+        assert!(!bar.tabs[1].flash);
+        assert_eq!(bar.tabs[2].label.as_str(), "POCKET");
+    }
+
+    #[test]
+    fn recommendations_selector_flashes_active_focused_tab_when_returning_to_subtopics() {
+        let mut store = Store::new();
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store
+            .recommendations
+            .set_active_topic(crate::text::InlineText::from_slice("e-ink"), false);
+        store.ui.recommendations_region = crate::ui::RecommendationsRegion::Subtopics;
+        store.ui.recommendations_subtopic_index = 0;
+        store.ui.recommendations_focus_flash_ticks = 8;
+
+        let model = select_collection(&store, CollectionKind::Recommendations);
+        let bar = model.recommendations_bar.expect("recommendation bar");
+
+        assert!(bar.tabs[0].active);
+        assert!(bar.tabs[0].focused);
+        assert!(bar.tabs[0].flash);
+    }
+
+    #[test]
+    fn recommendations_selector_strips_for_you_meta_suffix() {
+        let mut store = Store::new();
+        let mut collection = CollectionManifestState::empty();
+        let _ = collection.try_push(make_recommendation_item(
+            "NOTEBOOKCHECK / FOR YOU",
+            "E Ink screens are finally weird enough to be useful",
+        ));
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Recommendations, collection);
+
+        let model = select_collection(&store, CollectionKind::Recommendations);
+
+        assert_eq!(model.rows[1].meta.as_str(), "NOTEBOOKCHECK");
     }
 
     #[test]
@@ -745,6 +1093,25 @@ mod tests {
     }
 
     #[test]
+    fn inbox_collection_selector_uses_live_manifest_without_inbox_suffix() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.meta.set_truncated("EXAMPLE / INBOX");
+        item.title.set_truncated("Example inbox title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Inbox)
+            .try_push(item);
+        store.ui.inbox_index = 0;
+
+        let model = select_collection(&store, CollectionKind::Inbox);
+
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
+        assert_eq!(model.rows[1].title.as_str(), "Example inbox title");
+        assert_eq!(model.rows[1].loading_phase, None);
+    }
+
+    #[test]
     fn fetching_saved_collection_selector_uses_spinner_instead_of_fetching_label() {
         let mut store = Store::new();
         store.backend_sync.spinner_phase = 3;
@@ -793,6 +1160,8 @@ mod tests {
             0,
             None,
             None,
+            None,
+            None,
             crate::storage::StorageHealth::new(),
             crate::network::NetworkState::disabled(),
         ));
@@ -801,5 +1170,60 @@ mod tests {
 
         assert_eq!(model.rows[1].meta.as_str(), "MOTIF");
         assert_eq!(model.rows[1].title.as_str(), "No saved items synced yet");
+    }
+
+    #[test]
+    fn saved_collection_selector_shows_progress_badge_for_started_article() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.content_id.set_truncated("content-1");
+        item.remote_revision = 7;
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.title.set_truncated("Example saved title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(item);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: item.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert_eq!(model.rows[1].progress_badge.unwrap().as_str(), "25%");
+    }
+
+    #[test]
+    fn saved_collection_selector_hides_progress_badge_for_fetching_row() {
+        let mut store = Store::new();
+        store.backend_sync.spinner_phase = 1;
+        let mut item = CollectionManifestItem::empty();
+        item.content_id.set_truncated("content-1");
+        item.remote_revision = 7;
+        item.meta.set_truncated("EXAMPLE / SAVED");
+        item.title.set_truncated("Example saved title");
+        item.package_state = crate::content::PackageState::Fetching;
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(item);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: item.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        let model = select_collection(&store, CollectionKind::Saved);
+
+        assert_eq!(model.rows[1].loading_phase, Some(1));
+        assert_eq!(model.rows[1].progress_badge, None);
     }
 }

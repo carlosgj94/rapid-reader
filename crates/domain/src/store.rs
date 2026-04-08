@@ -1,7 +1,11 @@
 use alloc::boxed::Box;
 
 use crate::{
-    content::{CollectionKind, ContentState, PackageState, PrepareContentRequest},
+    content::{
+        CollectionKind, CollectionManifestState, ContentState, PackageState, PrepareContentRequest,
+        ReadingProgressEntry, ReadingProgressState, RecommendationState,
+        RecommendationTopicRequest,
+    },
     device::{BootState, DeviceState},
     input::InputState,
     network::{NetworkState, NetworkStatus},
@@ -14,10 +18,11 @@ use crate::{
     sleep::{SleepModel, WakeReason},
     storage::StorageHealth,
     sync::{SyncState, SyncStatus},
-    ui::{SettingsMode, SettingsRow, TopicRegion, UiRoute, UiState},
+    ui::{RecommendationsRegion, SettingsMode, SettingsRow, TopicRegion, UiRoute, UiState},
 };
 
 static EMPTY_CONTENT_STATE: ContentState = ContentState::empty();
+const RECOMMENDATION_SUBTOPIC_FOCUS_FLASH_TICKS: u8 = 8;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum DispatchError {
@@ -39,7 +44,10 @@ struct PendingPrepare {
 pub struct Store {
     pub device: DeviceState,
     content: Option<Box<ContentState>>,
+    pub reading_progress: ReadingProgressState,
+    pub recommendations: RecommendationState,
     pending_prepare: Option<PendingPrepare>,
+    pending_reading_progress_write: Option<ReadingProgressEntry>,
     pub input: InputState,
     pub network: NetworkState,
     pub power: PowerStatus,
@@ -53,17 +61,37 @@ pub struct Store {
 
 impl Store {
     pub fn new() -> Self {
-        Self::from_bootstrap(BootstrapSnapshot::new(
-            DeviceState::new(),
-            0,
-            None,
-            None,
-            StorageHealth::new(),
-            NetworkState::disabled(),
-        ))
+        Self {
+            device: DeviceState::new(),
+            content: None,
+            reading_progress: ReadingProgressState::empty(),
+            recommendations: RecommendationState::new(),
+            pending_prepare: None,
+            pending_reading_progress_write: None,
+            input: InputState::new(),
+            network: NetworkState::disabled(),
+            power: PowerStatus::new(82),
+            reader: ReaderSession::new(),
+            settings: SettingsState::new(crate::sleep::DEFAULT_INACTIVITY_TIMEOUT_MS),
+            sleep: SleepModel {
+                config: crate::sleep::SleepConfig::new(crate::sleep::DEFAULT_INACTIVITY_TIMEOUT_MS),
+                state: crate::sleep::SleepState::Awake,
+                last_activity_ms: 0,
+                last_wake_reason: WakeReason::ColdBoot,
+            },
+            storage: StorageHealth::new(),
+            backend_sync: SyncState::new(),
+            ui: UiState::new(),
+        }
     }
 
     pub fn from_bootstrap(snapshot: BootstrapSnapshot) -> Self {
+        let mut store = Self::new();
+        store.hydrate_from_bootstrap(snapshot);
+        store
+    }
+
+    pub fn hydrate_from_bootstrap(&mut self, snapshot: BootstrapSnapshot) {
         let settings = match snapshot.settings {
             Some(settings) => SettingsState::from_persisted(settings),
             None => SettingsState::new(crate::sleep::DEFAULT_INACTIVITY_TIMEOUT_MS),
@@ -72,26 +100,32 @@ impl Store {
             BootState::DeepSleepWake => WakeReason::ExternalButton,
             BootState::ColdBoot => WakeReason::ColdBoot,
         };
-
-        Self {
-            device: snapshot.device,
-            content: snapshot.content,
-            pending_prepare: None,
-            input: InputState::new(),
-            network: snapshot.network,
-            power: PowerStatus::new(82),
-            reader: ReaderSession::new(),
-            settings,
-            sleep: SleepModel {
-                config: crate::sleep::SleepConfig::new(settings.inactivity_timeout_ms),
-                state: crate::sleep::SleepState::Awake,
-                last_activity_ms: snapshot.boot_at_ms,
-                last_wake_reason: wake_reason,
-            },
-            storage: snapshot.storage,
-            backend_sync: SyncState::new(),
-            ui: UiState::new(),
+        self.device = snapshot.device;
+        self.content = snapshot.content;
+        self.reading_progress = snapshot
+            .reading_progress
+            .map(|progress| *progress)
+            .unwrap_or_else(ReadingProgressState::empty);
+        self.recommendations = RecommendationState::new();
+        if let Some(subtopics) = snapshot.recommendation_subtopics {
+            self.recommendations.set_subtopics(*subtopics);
         }
+        self.pending_prepare = None;
+        self.pending_reading_progress_write = None;
+        self.input = InputState::new();
+        self.network = snapshot.network;
+        self.power = PowerStatus::new(82);
+        self.reader = ReaderSession::new();
+        self.settings = settings;
+        self.sleep = SleepModel {
+            config: crate::sleep::SleepConfig::new(self.settings.inactivity_timeout_ms),
+            state: crate::sleep::SleepState::Awake,
+            last_activity_ms: snapshot.boot_at_ms,
+            last_wake_reason: wake_reason,
+        };
+        self.storage = snapshot.storage;
+        self.backend_sync = SyncState::new();
+        self.ui = UiState::new();
     }
 
     pub fn dispatch(&mut self, command: Command) -> DispatchResult {
@@ -151,6 +185,65 @@ impl Store {
                     self.set_collection_index(kind, 0);
                 }
             }
+            Event::RecommendationSubtopicsUpdated(subtopics) => {
+                let previous_active_topic = self.recommendations.active_topic_slug;
+                self.recommendations.finish_subtopics_loading();
+                self.recommendations.set_subtopics(*subtopics);
+                self.ui.recommendations_subtopic_index =
+                    self.recommendations.active_topic_index().unwrap_or(0);
+
+                if self.recommendations.subtopics.is_empty() {
+                    self.recommendations.topic_loading = false;
+                    self.focus_recommendation_subtopics(false);
+                    self.ui.recommendations_index = 0;
+                    self.content_mut().update_collection(
+                        CollectionKind::Recommendations,
+                        CollectionManifestState::empty(),
+                    );
+                    return Ok(Effect::Noop);
+                }
+
+                let active_topic = self.recommendations.active_topic_slug;
+                let needs_topic_fetch = previous_active_topic != active_topic
+                    || self
+                        .content()
+                        .collection_state(CollectionKind::Recommendations)
+                        .is_empty();
+                let should_prefetch_active_topic = matches!(
+                    self.ui.route,
+                    UiRoute::Collection(CollectionKind::Recommendations)
+                ) && !self.recommendations.topic_loading;
+
+                if needs_topic_fetch && should_prefetch_active_topic {
+                    self.recommendations.set_active_topic(active_topic, true);
+                    self.ui.recommendations_index = 0;
+                    self.content_mut().update_collection(
+                        CollectionKind::Recommendations,
+                        CollectionManifestState::empty(),
+                    );
+                    return Ok(Effect::LoadRecommendationTopic(
+                        RecommendationTopicRequest::new(active_topic),
+                    ));
+                }
+            }
+            Event::RecommendationTopicContentUpdated {
+                topic_slug,
+                collection,
+            } => {
+                if topic_slug != self.recommendations.active_topic_slug {
+                    return Ok(Effect::Noop);
+                }
+
+                let collection_len = collection.len();
+                self.recommendations.topic_loading = false;
+                if self.content.is_some() || collection_len > 0 {
+                    self.content_mut()
+                        .update_boxed_collection(CollectionKind::Recommendations, collection);
+                }
+                if collection_len == 0 || self.ui.recommendations_index >= collection_len {
+                    self.ui.recommendations_index = 0;
+                }
+            }
             Event::ReaderContentOpened {
                 collection,
                 content_id,
@@ -166,9 +259,19 @@ impl Store {
                 });
 
                 if should_open {
+                    let remote_revision = self
+                        .pending_prepare
+                        .as_ref()
+                        .filter(|pending| {
+                            pending.request.collection == collection
+                                && pending.request.content_id == content_id
+                        })
+                        .map(|pending| pending.request.remote_revision)
+                        .unwrap_or(0);
                     self.open_cached_content(
                         collection,
                         content_id,
+                        remote_revision,
                         title,
                         total_units,
                         paragraphs,
@@ -222,6 +325,9 @@ impl Store {
                 if matches!(self.ui.route, UiRoute::Dashboard | UiRoute::Collection(_)) {
                     self.backend_sync.advance_spinner();
                 }
+                if self.ui.recommendations_focus_flash_ticks > 0 {
+                    self.ui.recommendations_focus_flash_ticks -= 1;
+                }
                 if matches!(self.ui.route, UiRoute::Reader)
                     && matches!(self.reader.mode, crate::reader::ReaderMode::LoadingContent)
                 {
@@ -240,9 +346,13 @@ impl Store {
                     if self.reader.is_active_reading() {
                         self.sleep.note_activity(tick_ms);
                     }
+                    let previous_paragraph = self.reader.progress.paragraph_index;
                     let outcome = self
                         .reader
                         .advance_if_due(tick_ms, self.settings.reading_speed_wpm);
+                    if self.reader.progress.paragraph_index != previous_paragraph {
+                        self.track_reader_progress();
+                    }
                     if let Some(request) = outcome.load_request {
                         return Ok(Effect::LoadReaderWindow(request));
                     }
@@ -259,10 +369,12 @@ impl Store {
         Ok(Effect::Noop)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn open_cached_content(
         &mut self,
         collection: CollectionKind,
         content_id: crate::text::InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
+        remote_revision: u64,
         title: crate::text::InlineText<{ crate::content::CONTENT_TITLE_MAX_BYTES }>,
         total_units: u32,
         paragraphs: Box<[crate::reader::ReaderParagraphInfo]>,
@@ -277,6 +389,7 @@ impl Store {
             collection,
             crate::content::ArticleId(0),
             content_id,
+            remote_revision,
             title,
             total_units,
             paragraphs,
@@ -284,11 +397,20 @@ impl Store {
             false,
             self.settings.reading_speed_wpm,
         );
+        if matches!(collection, CollectionKind::Recommendations) {
+            self.show_recommendation_articles();
+        }
         self.ui.route = UiRoute::Reader;
+        self.track_reader_progress();
     }
 
     pub fn load_reader_window(&mut self, window: Box<crate::reader::ReaderWindow>) {
         self.reader.apply_loaded_window(window);
+        self.track_reader_progress();
+    }
+
+    pub fn take_pending_reading_progress_write(&mut self) -> Option<ReadingProgressEntry> {
+        self.pending_reading_progress_write.take()
     }
 
     pub fn content(&self) -> &ContentState {
@@ -299,6 +421,20 @@ impl Store {
         self.content
             .get_or_insert_with(ContentState::boxed_empty)
             .as_mut()
+    }
+
+    fn focus_recommendation_subtopics(&mut self, flash: bool) {
+        self.ui.recommendations_region = RecommendationsRegion::Subtopics;
+        self.ui.recommendations_focus_flash_ticks = if flash {
+            RECOMMENDATION_SUBTOPIC_FOCUS_FLASH_TICKS
+        } else {
+            0
+        };
+    }
+
+    fn show_recommendation_articles(&mut self) {
+        self.ui.recommendations_region = RecommendationsRegion::Articles;
+        self.ui.recommendations_focus_flash_ticks = 0;
     }
 
     fn dispatch_ui(&mut self, command: UiCommand) -> Effect {
@@ -315,7 +451,11 @@ impl Store {
             UiCommand::FocusPrevious => self.ui.move_dashboard_previous(),
             UiCommand::FocusNext => self.ui.move_dashboard_next(),
             UiCommand::Confirm => {
-                self.ui.route = UiRoute::Collection(self.ui.dashboard_focus.as_collection());
+                let collection = self.ui.dashboard_focus.as_collection();
+                self.ui.route = UiRoute::Collection(collection);
+                if matches!(collection, CollectionKind::Recommendations) {
+                    return self.enter_recommendations();
+                }
             }
             UiCommand::Back => {
                 self.ui.route = UiRoute::Settings;
@@ -329,97 +469,16 @@ impl Store {
     }
 
     fn dispatch_collection(&mut self, command: UiCommand, kind: CollectionKind) -> Effect {
+        if matches!(kind, CollectionKind::Recommendations) {
+            return self.dispatch_recommendations(command);
+        }
+
         let collection_len = self.content().collection_len(kind);
 
         match command {
             UiCommand::FocusPrevious => self.ui.move_collection_previous(kind, collection_len),
             UiCommand::FocusNext => self.ui.move_collection_next(kind, collection_len),
-            UiCommand::Confirm => {
-                let Some(item) = self
-                    .content()
-                    .manifest_item_at(kind, self.ui.collection_index(kind))
-                else {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::EmptyCollection,
-                    );
-                };
-
-                if matches!(item.package_state, PackageState::Cached) {
-                    if !self.storage.sd_card_ready {
-                        return self.collection_confirm_ignored(
-                            kind,
-                            CollectionConfirmIgnoredReason::StorageUnavailable,
-                        );
-                    }
-                    return Effect::OpenCachedContent(PrepareContentRequest::from_manifest(
-                        kind, item,
-                    ));
-                }
-
-                if matches!(item.package_state, PackageState::Fetching) {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::AlreadyFetching,
-                    );
-                }
-
-                if self.pending_prepare.is_some() {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::AlreadyFetching,
-                    );
-                }
-
-                if !self.storage.sd_card_ready {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::StorageUnavailable,
-                    );
-                }
-
-                if !item.can_prepare() {
-                    return self.collection_confirm_ignored(
-                        kind,
-                        ignored_reason_for_manifest_item(item.package_state),
-                    );
-                }
-
-                let request = PrepareContentRequest::from_manifest(kind, item);
-                let _ = self.content_mut().update_package_state(
-                    kind,
-                    &request.remote_item_id,
-                    PackageState::Fetching,
-                );
-                if matches!(
-                    self.backend_sync.status,
-                    SyncStatus::AuthFailed | SyncStatus::Disabled
-                ) {
-                    let _ = self.content_mut().update_package_state(
-                        kind,
-                        &request.remote_item_id,
-                        item.package_state,
-                    );
-                    return self.collection_confirm_ignored(
-                        kind,
-                        CollectionConfirmIgnoredReason::BackendUnavailable,
-                    );
-                }
-                let dispatch_now = self.can_dispatch_prepare_now();
-                self.pending_prepare = Some(PendingPrepare {
-                    request,
-                    previous_state: item.package_state,
-                    auto_open_reader: true,
-                    dispatched: dispatch_now,
-                });
-                self.reader
-                    .begin_content_loading(kind, request.content_id, item.title);
-                self.ui.route = UiRoute::Reader;
-                if dispatch_now {
-                    return Effect::PrepareContent(request);
-                }
-                return Effect::Noop;
-            }
+            UiCommand::Confirm => return self.confirm_collection_item(kind),
             UiCommand::Back => {
                 self.ui.route = UiRoute::Dashboard;
                 self.ui.dashboard_focus = match kind {
@@ -431,6 +490,232 @@ impl Store {
             UiCommand::Noop => {}
         }
 
+        Effect::Noop
+    }
+
+    fn enter_recommendations(&mut self) -> Effect {
+        if self.recommendations.subtopics.is_empty() {
+            self.focus_recommendation_subtopics(false);
+            self.ui.recommendations_subtopic_index = 0;
+            self.ui.recommendations_index = 0;
+
+            if !self.recommendations.subtopics_loading {
+                self.recommendations.begin_subtopics_loading();
+                return Effect::LoadRecommendationSubtopics;
+            }
+
+            return Effect::Noop;
+        }
+
+        self.ui.recommendations_subtopic_index =
+            self.recommendations.active_topic_index().unwrap_or(0);
+        let has_active_topic = !self.recommendations.active_topic_slug.is_empty();
+        let has_articles = !self
+            .content()
+            .collection_state(CollectionKind::Recommendations)
+            .is_empty();
+
+        if has_active_topic && (has_articles || self.recommendations.topic_loading) {
+            self.show_recommendation_articles();
+        } else {
+            self.focus_recommendation_subtopics(false);
+        }
+
+        if has_active_topic && !has_articles && !self.recommendations.topic_loading {
+            self.recommendations
+                .set_active_topic(self.recommendations.active_topic_slug, true);
+            self.ui.recommendations_index = 0;
+            self.show_recommendation_articles();
+            return Effect::LoadRecommendationTopic(RecommendationTopicRequest::new(
+                self.recommendations.active_topic_slug,
+            ));
+        }
+
+        Effect::Noop
+    }
+
+    fn dispatch_recommendations(&mut self, command: UiCommand) -> Effect {
+        match self.ui.recommendations_region {
+            RecommendationsRegion::Subtopics => self.dispatch_recommendation_subtopics(command),
+            RecommendationsRegion::Articles => self.dispatch_recommendation_articles(command),
+        }
+    }
+
+    fn dispatch_recommendation_subtopics(&mut self, command: UiCommand) -> Effect {
+        let subtopic_len = self.recommendations.subtopics.len();
+
+        match command {
+            UiCommand::FocusPrevious => {
+                if subtopic_len > 1 {
+                    self.ui.recommendations_subtopic_index =
+                        (self.ui.recommendations_subtopic_index + subtopic_len - 1) % subtopic_len;
+                }
+                self.ui.recommendations_focus_flash_ticks = 0;
+            }
+            UiCommand::FocusNext => {
+                if subtopic_len > 1 {
+                    self.ui.recommendations_subtopic_index =
+                        (self.ui.recommendations_subtopic_index + 1) % subtopic_len;
+                }
+                self.ui.recommendations_focus_flash_ticks = 0;
+            }
+            UiCommand::Confirm => {
+                if subtopic_len == 0 {
+                    if !self.recommendations.subtopics_loading {
+                        self.recommendations.begin_subtopics_loading();
+                        return Effect::LoadRecommendationSubtopics;
+                    }
+                    return Effect::Noop;
+                }
+
+                let Some(subtopic) = self
+                    .recommendations
+                    .subtopics
+                    .item_at(self.ui.recommendations_subtopic_index)
+                else {
+                    return Effect::Noop;
+                };
+
+                if self.recommendations.active_topic_slug != subtopic.slug {
+                    self.recommendations.set_active_topic(subtopic.slug, true);
+                    self.ui.recommendations_index = 0;
+                    self.show_recommendation_articles();
+                    self.content_mut().update_collection(
+                        CollectionKind::Recommendations,
+                        CollectionManifestState::empty(),
+                    );
+                    return Effect::LoadRecommendationTopic(RecommendationTopicRequest::new(
+                        subtopic.slug,
+                    ));
+                }
+
+                self.show_recommendation_articles();
+                if self
+                    .content()
+                    .collection_state(CollectionKind::Recommendations)
+                    .is_empty()
+                    && !self.recommendations.topic_loading
+                {
+                    self.recommendations.set_active_topic(subtopic.slug, true);
+                    return Effect::LoadRecommendationTopic(RecommendationTopicRequest::new(
+                        subtopic.slug,
+                    ));
+                }
+            }
+            UiCommand::Back => {
+                self.ui.route = UiRoute::Dashboard;
+                self.ui.dashboard_focus = crate::ui::DashboardFocus::Recommendations;
+                self.ui.recommendations_focus_flash_ticks = 0;
+            }
+            UiCommand::Noop => {}
+        }
+
+        Effect::Noop
+    }
+
+    fn dispatch_recommendation_articles(&mut self, command: UiCommand) -> Effect {
+        let collection_len = self
+            .content()
+            .collection_len(CollectionKind::Recommendations);
+
+        match command {
+            UiCommand::FocusPrevious => {
+                if collection_len == 0 || self.ui.recommendations_index == 0 {
+                    self.focus_recommendation_subtopics(true);
+                } else {
+                    self.ui.recommendations_index -= 1;
+                }
+            }
+            UiCommand::FocusNext => {
+                self.ui
+                    .move_collection_next(CollectionKind::Recommendations, collection_len);
+            }
+            UiCommand::Confirm => {
+                return self.confirm_collection_item(CollectionKind::Recommendations);
+            }
+            UiCommand::Back => self.focus_recommendation_subtopics(true),
+            UiCommand::Noop => {}
+        }
+
+        Effect::Noop
+    }
+
+    fn confirm_collection_item(&mut self, kind: CollectionKind) -> Effect {
+        let Some(item) = self
+            .content()
+            .manifest_item_at(kind, self.ui.collection_index(kind))
+        else {
+            return self
+                .collection_confirm_ignored(kind, CollectionConfirmIgnoredReason::EmptyCollection);
+        };
+
+        if matches!(item.package_state, PackageState::Cached) {
+            if !self.storage.sd_card_ready {
+                return self.collection_confirm_ignored(
+                    kind,
+                    CollectionConfirmIgnoredReason::StorageUnavailable,
+                );
+            }
+            return Effect::OpenCachedContent(PrepareContentRequest::from_manifest(kind, item));
+        }
+
+        if matches!(item.package_state, PackageState::Fetching) {
+            return self
+                .collection_confirm_ignored(kind, CollectionConfirmIgnoredReason::AlreadyFetching);
+        }
+
+        if self.pending_prepare.is_some() {
+            return self
+                .collection_confirm_ignored(kind, CollectionConfirmIgnoredReason::AlreadyFetching);
+        }
+
+        if !self.storage.sd_card_ready {
+            return self.collection_confirm_ignored(
+                kind,
+                CollectionConfirmIgnoredReason::StorageUnavailable,
+            );
+        }
+
+        if !item.can_prepare() {
+            return self.collection_confirm_ignored(
+                kind,
+                ignored_reason_for_manifest_item(item.package_state),
+            );
+        }
+
+        let request = PrepareContentRequest::from_manifest(kind, item);
+        let _ = self.content_mut().update_package_state(
+            kind,
+            &request.remote_item_id,
+            PackageState::Fetching,
+        );
+        if matches!(
+            self.backend_sync.status,
+            SyncStatus::AuthFailed | SyncStatus::Disabled
+        ) {
+            let _ = self.content_mut().update_package_state(
+                kind,
+                &request.remote_item_id,
+                item.package_state,
+            );
+            return self.collection_confirm_ignored(
+                kind,
+                CollectionConfirmIgnoredReason::BackendUnavailable,
+            );
+        }
+        let dispatch_now = self.can_dispatch_prepare_now();
+        self.pending_prepare = Some(PendingPrepare {
+            request,
+            previous_state: item.package_state,
+            auto_open_reader: true,
+            dispatched: dispatch_now,
+        });
+        self.reader
+            .begin_content_loading(kind, request.content_id, item.title);
+        self.ui.route = UiRoute::Reader;
+        if dispatch_now {
+            return Effect::PrepareContent(request);
+        }
         Effect::Noop
     }
 
@@ -502,22 +787,54 @@ impl Store {
         }
     }
 
+    fn track_reader_progress(&mut self) {
+        let Some(checkpoint) = self.reader.reading_progress_checkpoint() else {
+            return;
+        };
+        let Some(entry) = self.reading_progress.record_progress(checkpoint) else {
+            return;
+        };
+        self.queue_reading_progress_write(entry);
+    }
+
+    fn queue_reading_progress_write(&mut self, entry: ReadingProgressEntry) {
+        match self.pending_reading_progress_write {
+            Some(queued)
+                if queued.content_id == entry.content_id
+                    && queued.remote_revision == entry.remote_revision =>
+            {
+                self.pending_reading_progress_write = Some(ReadingProgressEntry {
+                    content_id: entry.content_id,
+                    remote_revision: entry.remote_revision,
+                    paragraph_index: queued.paragraph_index.max(entry.paragraph_index),
+                    total_paragraphs: queued
+                        .total_paragraphs
+                        .max(entry.total_paragraphs)
+                        .max(entry.paragraph_index),
+                });
+            }
+            _ => self.pending_reading_progress_write = Some(entry),
+        }
+    }
+
     fn dispatch_reader(&mut self, command: UiCommand) -> Effect {
         match self.reader.mode {
             crate::reader::ReaderMode::Normal | crate::reader::ReaderMode::Chat => match command {
                 UiCommand::FocusPrevious => {
-                    if let Some(request) = self
+                    let request = self
                         .reader
-                        .jump_live_previous_paragraph(self.settings.reading_speed_wpm)
-                    {
+                        .jump_live_previous_paragraph(self.settings.reading_speed_wpm);
+                    self.track_reader_progress();
+                    if let Some(request) = request {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
                 UiCommand::FocusNext => {
-                    if let Some(request) = self
+                    let request = self
                         .reader
-                        .jump_live_next_paragraph(self.settings.reading_speed_wpm)
-                    {
+                        .jump_live_next_paragraph(self.settings.reading_speed_wpm);
+                    self.track_reader_progress();
+                    if let Some(request) = request {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
@@ -552,10 +869,11 @@ impl Store {
                 UiCommand::FocusPrevious => self.reader.move_paragraph(true),
                 UiCommand::FocusNext => self.reader.move_paragraph(false),
                 UiCommand::Confirm => {
-                    if let Some(request) = self
+                    let request = self
                         .reader
-                        .commit_paragraph_navigation(self.settings.reading_speed_wpm)
-                    {
+                        .commit_paragraph_navigation(self.settings.reading_speed_wpm);
+                    self.track_reader_progress();
+                    if let Some(request) = request {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
@@ -734,7 +1052,8 @@ mod tests {
     use crate::{
         content::{
             CollectionManifestItem, CollectionManifestState, DetailLocator, PackageState,
-            RemoteContentStatus,
+            RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES, RecommendationSubtopic,
+            RecommendationSubtopicsState, RemoteContentStatus,
         },
         device::{BootState, DeviceState},
         formatter::{article_document_from_script, format_article_document},
@@ -773,11 +1092,52 @@ mod tests {
         window
     }
 
+    fn make_recommendation_subtopic(
+        slug: &str,
+        label: &str,
+        from_settings: bool,
+        from_behavior: bool,
+    ) -> RecommendationSubtopic {
+        let mut topic = RecommendationSubtopic::empty();
+        topic.slug.set_truncated(slug);
+        topic.label.set_truncated(label);
+        topic.parent_topic_label.set_truncated("TECHNOLOGY");
+        topic.is_from_settings = from_settings;
+        topic.is_from_behavior = from_behavior;
+        topic
+    }
+
+    fn make_recommendation_subtopics() -> RecommendationSubtopicsState {
+        let mut subtopics = RecommendationSubtopicsState::empty();
+        let _ = subtopics.try_push(make_recommendation_subtopic("e-ink", "E Ink", true, false));
+        let _ = subtopics.try_push(make_recommendation_subtopic(
+            "small-web",
+            "Small Web",
+            false,
+            true,
+        ));
+        subtopics
+    }
+
+    fn make_recommendation_manifest_item(content_id: &str, title: &str) -> CollectionManifestItem {
+        let mut item = CollectionManifestItem::empty();
+        item.remote_item_id.set_truncated(content_id);
+        item.content_id.set_truncated(content_id);
+        item.detail_locator = DetailLocator::Content;
+        item.meta.set_truncated("A24 / FOR YOU");
+        item.title.set_truncated(title);
+        item.remote_status = RemoteContentStatus::Ready;
+        item.package_state = PackageState::Cached;
+        item
+    }
+
     #[test]
     fn deep_sleep_bootstrap_hydrates_sleep_and_storage() {
         let snapshot = BootstrapSnapshot::new(
             DeviceState::with_boot(BootState::DeepSleepWake),
             42,
+            None,
+            None,
             None,
             Some(PersistedSettings::with_preferences(
                 45_000,
@@ -809,6 +1169,8 @@ mod tests {
             7,
             None,
             None,
+            None,
+            None,
             StorageHealth::new(),
             NetworkState::disabled(),
         );
@@ -825,6 +1187,26 @@ mod tests {
         );
         assert_eq!(store.sleep.last_wake_reason, WakeReason::ColdBoot);
         assert_eq!(store.ui.route, UiRoute::Dashboard);
+    }
+
+    #[test]
+    fn bootstrap_hydrates_recommendation_subtopics() {
+        let snapshot = BootstrapSnapshot::new(
+            DeviceState::with_boot(BootState::ColdBoot),
+            7,
+            None,
+            None,
+            Some(Box::new(make_recommendation_subtopics())),
+            None,
+            StorageHealth::new(),
+            NetworkState::disabled(),
+        );
+
+        let store = Store::from_bootstrap(snapshot);
+
+        assert_eq!(store.recommendations.subtopics.len(), 3);
+        assert_eq!(store.recommendations.active_topic_slug.as_str(), "e-ink");
+        assert_eq!(store.recommendations.active_topic_index(), Some(0));
     }
 
     #[test]
@@ -1565,5 +1947,179 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(store.ui.saved_index, 0);
+    }
+
+    #[test]
+    fn dashboard_enter_recommendations_uses_article_region_when_topic_is_ready() {
+        let mut store = Store::new();
+        store.ui.dashboard_focus = crate::ui::DashboardFocus::Recommendations;
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store.recommendations.set_active_topic(
+            crate::text::InlineText::<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>::from_slice("e-ink"),
+            false,
+        );
+        let mut collection = CollectionManifestState::empty();
+        let _ = collection.try_push(make_recommendation_manifest_item(
+            "rec-1",
+            "Why single-purpose readers feel radical again",
+        ));
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Recommendations, collection);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(
+            store.ui.route,
+            UiRoute::Collection(CollectionKind::Recommendations)
+        );
+        assert_eq!(
+            store.ui.recommendations_region,
+            RecommendationsRegion::Articles
+        );
+        assert_eq!(store.ui.recommendations_subtopic_index, 0);
+    }
+
+    #[test]
+    fn dashboard_warm_subtopics_do_not_prefetch_articles() {
+        let mut store = Store::new();
+
+        let effect = store
+            .handle_event(
+                Event::RecommendationSubtopicsUpdated(Box::new(make_recommendation_subtopics())),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(store.recommendations.subtopics.len(), 3);
+        assert_eq!(store.recommendations.active_topic_slug.as_str(), "e-ink");
+        assert!(
+            store
+                .content()
+                .collection_state(CollectionKind::Recommendations)
+                .is_empty()
+        );
+        assert!(!store.recommendations.topic_loading);
+    }
+
+    #[test]
+    fn recommendations_back_moves_from_articles_to_subtopics_then_dashboard() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Recommendations);
+        store.ui.recommendations_region = RecommendationsRegion::Articles;
+        store.ui.dashboard_focus = crate::ui::DashboardFocus::Saved;
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store.recommendations.set_active_topic(
+            crate::text::InlineText::<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>::from_slice("e-ink"),
+            false,
+        );
+
+        let first = store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
+
+        assert_eq!(first, Effect::Noop);
+        assert_eq!(
+            store.ui.recommendations_region,
+            RecommendationsRegion::Subtopics
+        );
+        assert_eq!(
+            store.ui.route,
+            UiRoute::Collection(CollectionKind::Recommendations)
+        );
+        assert_eq!(store.ui.recommendations_focus_flash_ticks, 8);
+
+        let second = store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
+
+        assert_eq!(second, Effect::Noop);
+        assert_eq!(store.ui.route, UiRoute::Dashboard);
+        assert_eq!(
+            store.ui.dashboard_focus,
+            crate::ui::DashboardFocus::Recommendations
+        );
+        assert_eq!(store.ui.recommendations_focus_flash_ticks, 0);
+    }
+
+    #[test]
+    fn recommendations_confirm_on_new_subtopic_loads_that_topic() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Recommendations);
+        store.ui.recommendations_region = RecommendationsRegion::Subtopics;
+        store.ui.recommendations_subtopic_index = 1;
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store.recommendations.set_active_topic(
+            crate::text::InlineText::<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>::from_slice("e-ink"),
+            false,
+        );
+        let mut existing = CollectionManifestState::empty();
+        let _ = existing.try_push(make_recommendation_manifest_item("rec-1", "Existing topic"));
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Recommendations, existing);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::LoadRecommendationTopic(RecommendationTopicRequest::new(
+                crate::text::InlineText::<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>::from_slice(
+                    "small-web",
+                ),
+            ))
+        );
+        assert_eq!(
+            store.recommendations.active_topic_slug.as_str(),
+            "small-web"
+        );
+        assert!(store.recommendations.topic_loading);
+        assert_eq!(
+            store.ui.recommendations_region,
+            RecommendationsRegion::Articles
+        );
+        assert!(
+            store
+                .content()
+                .collection_state(CollectionKind::Recommendations)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recommendations_previous_from_first_article_returns_to_subtopics() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Collection(CollectionKind::Recommendations);
+        store.ui.recommendations_region = RecommendationsRegion::Articles;
+        store.ui.recommendations_index = 0;
+        store
+            .recommendations
+            .set_subtopics(make_recommendation_subtopics());
+        store.recommendations.set_active_topic(
+            crate::text::InlineText::<RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES>::from_slice("e-ink"),
+            false,
+        );
+        let mut collection = CollectionManifestState::empty();
+        let _ = collection.try_push(make_recommendation_manifest_item("rec-1", "First"));
+        let _ = collection.try_push(make_recommendation_manifest_item("rec-2", "Second"));
+        store
+            .content_mut()
+            .update_collection(CollectionKind::Recommendations, collection);
+
+        let effect = store
+            .dispatch(Command::Ui(UiCommand::FocusPrevious))
+            .unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(
+            store.ui.recommendations_region,
+            RecommendationsRegion::Subtopics
+        );
+        assert_eq!(store.ui.recommendations_index, 0);
+        assert_eq!(store.ui.recommendations_focus_flash_ticks, 8);
     }
 }

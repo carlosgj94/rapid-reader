@@ -16,8 +16,9 @@ use domain::{
     content::{
         CONTENT_ID_MAX_BYTES, CONTENT_META_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
         CollectionManifestItem, CollectionManifestState, ContentState, DetailLocator,
-        MANIFEST_ITEM_CAPACITY, PackageState, RECOMMENDATION_SERVE_ID_MAX_BYTES,
-        REMOTE_ITEM_ID_MAX_BYTES, RemoteContentStatus,
+        MANIFEST_ITEM_CAPACITY, PackageState, READING_PROGRESS_CAPACITY,
+        RECOMMENDATION_SERVE_ID_MAX_BYTES, REMOTE_ITEM_ID_MAX_BYTES, ReadingProgressEntry,
+        ReadingProgressState, RecommendationSubtopicsState, RemoteContentStatus,
     },
     formatter::{
         MAX_PARAGRAPH_PREVIEW_BYTES, MAX_READING_PARAGRAPHS, MAX_READING_TOKEN_BYTES,
@@ -52,12 +53,16 @@ const MAX_VOLUMES: usize = 1;
 const STORAGE_CMD_QUEUE_CAPACITY: usize = 8;
 const MANIFEST_MAGIC: u32 = 0x4D43_4F4C;
 const CACHE_INDEX_MAGIC: u32 = 0x4D43_4944;
+const READING_PROGRESS_MAGIC: u32 = 0x4D43_5250;
+const RECOMMENDATION_SUBTOPICS_MAGIC: u32 = 0x4D43_5254;
 const PACKAGE_META_MAGIC: u32 = 0x4D43_504D;
 const READER_PACKAGE_MAGIC: u32 = u32::from_le_bytes(*b"MTRP");
 const READER_PACKAGE_FORMAT_VERSION: u16 = 1;
 const FORMAT_VERSION: u16 = 1;
 const MAX_MANIFEST_SNAPSHOT_LEN: usize = 4096;
 const MAX_CACHE_INDEX_LEN: usize = 4096;
+const MAX_READING_PROGRESS_INDEX_LEN: usize = 4096;
+const MAX_RECOMMENDATION_SUBTOPICS_LEN: usize = 1024;
 const MAX_PACKAGE_META_LEN: usize = 128;
 const READER_PACKAGE_HEADER_LEN: usize = 32;
 const READER_PACKAGE_PARAGRAPH_ENTRY_LEN: usize = 72;
@@ -92,6 +97,8 @@ const SAVED_MANIFEST_FILE_NAME: &str = "SAVED.BIN";
 const INBOX_MANIFEST_FILE_NAME: &str = "INBOX.BIN";
 const RECOMMENDATION_MANIFEST_FILE_NAME: &str = "RECS.BIN";
 const CACHE_INDEX_FILE_NAME: &str = "PKGIDX.BIN";
+const READING_PROGRESS_FILE_NAME: &str = "READPOS.BIN";
+const RECOMMENDATION_SUBTOPICS_FILE_NAME: &str = "TOPICS.BIN";
 
 type SdBus<'d> = Spi<'d, Blocking>;
 type SdSpiDevice<'d> = ExclusiveDevice<SdBus<'d>, Output<'d>, NoDelay>;
@@ -131,6 +138,8 @@ pub struct SdContentStorage<'d> {
     total_bytes: u64,
     snapshots: [Option<Box<CollectionManifestState>>; 3],
     cache_index: CacheIndex,
+    reading_progress: ReadingProgressState,
+    recommendation_subtopics: RecommendationSubtopicsState,
     pending_stage: Option<PendingStage>,
     pending_stage_error: Option<StorageError>,
 }
@@ -406,6 +415,14 @@ enum StorageCommand {
         kind: CollectionKind,
         snapshot: Box<CollectionManifestState>,
     },
+    PersistRecommendationSubtopics {
+        trace: TraceContext,
+        subtopics: Box<RecommendationSubtopicsState>,
+    },
+    PersistReadingProgress {
+        trace: TraceContext,
+        entry: ReadingProgressEntry,
+    },
     BeginPackageStage {
         trace: TraceContext,
         content_id: InlineText<CONTENT_ID_MAX_BYTES>,
@@ -503,6 +520,7 @@ pub(crate) fn log_static_inventory(
         "reader_window_bytes" = size_of::<ReaderWindow>(),
         "reading_document_bytes" = size_of::<ReadingDocument>(),
         "collection_manifest_state_bytes" = size_of::<CollectionManifestState>(),
+        "recommendation_subtopics_state_bytes" = size_of::<RecommendationSubtopicsState>(),
         "storage_queue_capacity" = STORAGE_CMD_QUEUE_CAPACITY,
         "storage_queue_resident_bytes" = STORAGE_CMD_QUEUE_CAPACITY * size_of::<StorageCommand>(),
         "transfer_receive_chunk_len" = crate::transfer_tuning::PACKAGE_TRANSFER_CHUNK_LEN,
@@ -534,6 +552,8 @@ fn storage_command_payload_len(command: &StorageCommand) -> usize {
 fn storage_command_label(command: &StorageCommand) -> &'static str {
     match command {
         StorageCommand::PersistSnapshot { .. } => "persist_snapshot",
+        StorageCommand::PersistRecommendationSubtopics { .. } => "persist_recommendation_subtopics",
+        StorageCommand::PersistReadingProgress { .. } => "persist_reading_progress",
         StorageCommand::BeginPackageStage { .. } => "begin_stage",
         StorageCommand::WritePackageChunk { .. } => "write_chunk",
         StorageCommand::CommitPackageStage { .. } => "commit_stage",
@@ -549,6 +569,8 @@ fn storage_command_label(command: &StorageCommand) -> &'static str {
 fn storage_command_trace(command: &StorageCommand) -> TraceContext {
     match command {
         StorageCommand::PersistSnapshot { trace, .. }
+        | StorageCommand::PersistRecommendationSubtopics { trace, .. }
+        | StorageCommand::PersistReadingProgress { trace, .. }
         | StorageCommand::BeginPackageStage { trace, .. }
         | StorageCommand::WritePackageChunk { trace, .. }
         | StorageCommand::CommitPackageStage { trace, .. }
@@ -738,6 +760,9 @@ pub fn mount<'d>(
         addr_of_mut!((*storage_ptr).total_bytes).write(total_bytes);
         addr_of_mut!((*storage_ptr).snapshots).write([None, None, None]);
         addr_of_mut!((*storage_ptr).cache_index).write(CacheIndex::empty());
+        addr_of_mut!((*storage_ptr).reading_progress).write(ReadingProgressState::empty());
+        addr_of_mut!((*storage_ptr).recommendation_subtopics)
+            .write(RecommendationSubtopicsState::empty());
         addr_of_mut!((*storage_ptr).pending_stage).write(None);
         addr_of_mut!((*storage_ptr).pending_stage_error).write(None);
     }
@@ -811,6 +836,8 @@ pub fn mount<'d>(
         } else {
             storage.snapshots = [None, None, None];
             storage.cache_index = CacheIndex::empty();
+            storage.reading_progress = ReadingProgressState::empty();
+            storage.recommendation_subtopics = RecommendationSubtopicsState::empty();
             let _ = storage.cleanup_active_stage_file();
         };
     }
@@ -847,20 +874,56 @@ pub fn install(spawner: Spawner, storage: Option<Box<SdContentStorage<'static>>>
 pub(crate) fn bootstrap_content_state(
     storage: Option<&mut SdContentStorage<'_>>,
 ) -> Option<Box<ContentState>> {
-    let (saved, source) = storage?.bootstrap_saved_snapshot();
-    if saved.is_empty() {
+    let storage = storage?;
+    let saved = storage.snapshot(CollectionKind::Saved);
+    let inbox = storage.snapshot(CollectionKind::Inbox);
+
+    if saved.is_empty() && inbox.is_empty() {
         return None;
     }
 
     info!(
-        "content storage bootstrap saved snapshot item_count={} source={}",
+        "content storage bootstrap collections saved_count={} inbox_count={}",
         saved.len(),
-        source,
+        inbox.len(),
     );
 
+    bootstrap_content_state_from_snapshots(saved, inbox)
+}
+
+pub(crate) fn bootstrap_reading_progress_state(
+    storage: Option<&mut SdContentStorage<'_>>,
+) -> Option<Box<ReadingProgressState>> {
+    let progress = storage?.reading_progress;
+    (!progress.is_empty()).then_some(Box::new(progress))
+}
+
+pub(crate) fn bootstrap_recommendation_subtopics_state(
+    storage: Option<&mut SdContentStorage<'_>>,
+) -> Option<Box<RecommendationSubtopicsState>> {
+    let subtopics = storage?.recommendation_subtopics;
+    (!subtopics.is_empty()).then_some(Box::new(subtopics))
+}
+
+fn bootstrap_content_state_from_snapshots(
+    saved: CollectionManifestState,
+    inbox: CollectionManifestState,
+) -> Option<Box<ContentState>> {
+    if saved.is_empty() && inbox.is_empty() {
+        return None;
+    }
+
     Some(Box::new(ContentState {
-        saved: Some(Box::new(saved)),
-        inbox: None,
+        saved: if saved.is_empty() {
+            None
+        } else {
+            Some(Box::new(saved))
+        },
+        inbox: if inbox.is_empty() {
+            None
+        } else {
+            Some(Box::new(inbox))
+        },
         recommendations: None,
     }))
 }
@@ -896,6 +959,47 @@ pub async fn persist_snapshot_traced(
         | StorageResponse::LoadedWindow(_)
         | StorageResponse::Unit(_) => Err(StorageError::Unavailable),
     }
+}
+
+pub async fn queue_reading_progress_write(entry: ReadingProgressEntry) -> Result<(), StorageError> {
+    queue_reading_progress_write_traced(TraceContext::none(), entry).await
+}
+
+pub async fn queue_recommendation_subtopics_write(
+    subtopics: RecommendationSubtopicsState,
+) -> Result<(), StorageError> {
+    queue_recommendation_subtopics_write_traced(TraceContext::none(), subtopics).await
+}
+
+pub async fn queue_recommendation_subtopics_write_traced(
+    trace: TraceContext,
+    subtopics: RecommendationSubtopicsState,
+) -> Result<(), StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+
+    let command = StorageCommand::PersistRecommendationSubtopics {
+        trace,
+        subtopics: Box::new(subtopics),
+    };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "persist_recommendation_subtopics", 0);
+    Ok(())
+}
+
+pub async fn queue_reading_progress_write_traced(
+    trace: TraceContext,
+    entry: ReadingProgressEntry,
+) -> Result<(), StorageError> {
+    if !STORAGE_AVAILABLE.load(AtomicOrdering::Relaxed) {
+        return Err(StorageError::Unavailable);
+    }
+
+    let command = StorageCommand::PersistReadingProgress { trace, entry };
+    STORAGE_CMD_CH.send(command).await;
+    storage_queue_on_enqueue(trace, "persist_reading_progress", 0);
+    Ok(())
 }
 
 pub async fn commit_package_stage_and_open_cached_reader_package_traced(
@@ -1372,6 +1476,29 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
                     .persist_snapshot(trace, kind, *snapshot)
                     .map(Box::new),
             ),
+            StorageCommand::PersistRecommendationSubtopics { trace, subtopics } => {
+                if let Err(err) = storage.persist_recommendation_subtopics(trace, *subtopics) {
+                    info!(
+                        "content storage persist recommendation subtopics failed count={} err={:?}",
+                        subtopics.len(),
+                        err,
+                    );
+                }
+                continue;
+            }
+            StorageCommand::PersistReadingProgress { trace, entry } => {
+                if let Err(err) = storage.persist_reading_progress(trace, entry) {
+                    info!(
+                        "content storage persist reading progress failed content_id={} remote_revision={} paragraph_index={} total_paragraphs={} err={:?}",
+                        entry.content_id.as_str(),
+                        entry.remote_revision,
+                        entry.paragraph_index,
+                        entry.total_paragraphs,
+                        err,
+                    );
+                }
+                continue;
+            }
             StorageCommand::BeginPackageStage {
                 trace,
                 content_id,
@@ -1451,18 +1578,18 @@ async fn content_storage_task(mut storage: Box<SdContentStorage<'static>>) {
 }
 
 impl<'d> SdContentStorage<'d> {
-    fn bootstrap_saved_snapshot(&mut self) -> (CollectionManifestState, &'static str) {
-        if let Some(saved) = self.snapshots[collection_index(CollectionKind::Saved)]
-            .as_deref()
-            .copied()
-            .filter(|snapshot| !snapshot.is_empty())
-        {
-            return (saved, "manifest_snapshot");
+    fn bootstrap_collection_snapshot(
+        &mut self,
+        kind: CollectionKind,
+        persisted: Option<CollectionManifestState>,
+    ) -> (CollectionManifestState, &'static str) {
+        if let Some(snapshot) = persisted.filter(|snapshot| !snapshot.is_empty()) {
+            return (snapshot, "manifest_snapshot");
         }
 
-        let rebuilt = self.rebuild_saved_snapshot_from_cache();
+        let rebuilt = self.rebuild_collection_snapshot_from_cache(kind);
         if rebuilt.is_empty() {
-            (rebuilt, "none")
+            (CollectionManifestState::empty(), "none")
         } else {
             (rebuilt, "cache_index")
         }
@@ -1489,15 +1616,18 @@ impl<'d> SdContentStorage<'d> {
         };
     }
 
-    fn rebuild_saved_snapshot_from_cache(&mut self) -> CollectionManifestState {
-        let entries = saved_cache_entries_for_bootstrap(&self.cache_index);
+    fn rebuild_collection_snapshot_from_cache(
+        &mut self,
+        kind: CollectionKind,
+    ) -> CollectionManifestState {
+        let entries = cache_entries_for_bootstrap(&self.cache_index, kind);
         let mut snapshot = CollectionManifestState::empty();
 
         for entry in entries {
             let Ok(title) = self.read_cached_package_title(entry) else {
                 continue;
             };
-            if !snapshot.try_push(minimal_saved_manifest_item(entry, title)) {
+            if !snapshot.try_push(minimal_bootstrap_manifest_item(entry, title)) {
                 break;
             }
         }
@@ -1523,17 +1653,44 @@ impl<'d> SdContentStorage<'d> {
     fn load_state(&mut self) -> Result<(), StorageError> {
         self.cleanup_active_stage_file()?;
         self.cache_index = self.read_cache_index()?.unwrap_or(CacheIndex::empty());
+        self.reading_progress = self
+            .read_reading_progress()?
+            .unwrap_or(ReadingProgressState::empty());
+        self.recommendation_subtopics = self
+            .read_recommendation_subtopics()?
+            .unwrap_or(RecommendationSubtopicsState::empty());
         self.cleanup_orphan_package_slots()?;
 
-        let saved = self
-            .read_manifest_snapshot(CollectionKind::Saved)?
-            .unwrap_or(CollectionManifestState::empty());
-        let inbox = self
-            .read_manifest_snapshot(CollectionKind::Inbox)?
-            .unwrap_or(CollectionManifestState::empty());
+        let saved_snapshot = self.read_manifest_snapshot(CollectionKind::Saved)?;
+        let (saved, saved_source) =
+            self.bootstrap_collection_snapshot(CollectionKind::Saved, saved_snapshot);
+        let inbox_snapshot = self.read_manifest_snapshot(CollectionKind::Inbox)?;
+        let (inbox, inbox_source) =
+            self.bootstrap_collection_snapshot(CollectionKind::Inbox, inbox_snapshot);
         let recommendations = self
             .read_manifest_snapshot(CollectionKind::Recommendations)?
             .unwrap_or(CollectionManifestState::empty());
+
+        if !saved.is_empty() {
+            info!(
+                "content storage load_state collection=saved item_count={} source={}",
+                saved.len(),
+                saved_source,
+            );
+        }
+        if !inbox.is_empty() {
+            info!(
+                "content storage load_state collection=inbox item_count={} source={}",
+                inbox.len(),
+                inbox_source,
+            );
+        }
+        if !self.recommendation_subtopics.is_empty() {
+            info!(
+                "content storage load_state recommendation_subtopics count={}",
+                self.recommendation_subtopics.len(),
+            );
+        }
 
         self.set_snapshot(CollectionKind::Saved, saved);
         self.set_snapshot(CollectionKind::Inbox, inbox);
@@ -1561,6 +1718,7 @@ impl<'d> SdContentStorage<'d> {
 
         self.snapshots = [None, None, None];
         self.cache_index = CacheIndex::empty();
+        self.reading_progress = ReadingProgressState::empty();
         self.pending_stage = None;
         Ok(())
     }
@@ -1598,6 +1756,48 @@ impl<'d> SdContentStorage<'d> {
             "cache_budget_remaining" = metrics.cache_budget_remaining,
         );
         Ok(snapshot)
+    }
+
+    fn persist_recommendation_subtopics(
+        &mut self,
+        trace: TraceContext,
+        subtopics: RecommendationSubtopicsState,
+    ) -> Result<(), StorageError> {
+        self.recommendation_subtopics = subtopics;
+        self.write_recommendation_subtopics()?;
+        crate::memtrace!(
+            "storage_recommendation_subtopics",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "count" = self.recommendation_subtopics.len(),
+        );
+        Ok(())
+    }
+
+    fn persist_reading_progress(
+        &mut self,
+        trace: TraceContext,
+        entry: ReadingProgressEntry,
+    ) -> Result<(), StorageError> {
+        let Some(updated) = self.reading_progress.record_progress(entry) else {
+            return Ok(());
+        };
+        self.write_reading_progress()?;
+        crate::memtrace!(
+            "storage_reading_progress",
+            "component" = "storage",
+            "at_ms" = storage_now_ms(),
+            "sync_id" = trace.sync_id,
+            "req_id" = trace.req_id,
+            "content_id" = updated.content_id.as_str(),
+            "remote_revision" = updated.remote_revision,
+            "paragraph_index" = updated.paragraph_index,
+            "total_paragraphs" = updated.total_paragraphs,
+            "completion_percent" = updated.completion_percent(),
+        );
+        Ok(())
     }
 
     fn begin_stage(
@@ -2481,6 +2681,46 @@ impl<'d> SdContentStorage<'d> {
         decode_cache_index(&bytes[..read_len]).map(Some)
     }
 
+    fn write_reading_progress(&mut self) -> Result<(), StorageError> {
+        let mut bytes = Box::new([0u8; MAX_READING_PROGRESS_INDEX_LEN]);
+        let encoded_len = encode_reading_progress(&self.reading_progress, &mut bytes[..])?;
+        self.write_named_file_in_manif_dir(READING_PROGRESS_FILE_NAME, &bytes[..encoded_len])
+    }
+
+    fn read_reading_progress(&mut self) -> Result<Option<ReadingProgressState>, StorageError> {
+        let mut bytes = Box::new([0u8; MAX_READING_PROGRESS_INDEX_LEN]);
+        let Some(read_len) =
+            self.read_named_file_in_manif_dir(READING_PROGRESS_FILE_NAME, &mut bytes[..])?
+        else {
+            return Ok(None);
+        };
+
+        decode_reading_progress(&bytes[..read_len]).map(Some)
+    }
+
+    fn write_recommendation_subtopics(&mut self) -> Result<(), StorageError> {
+        let mut bytes = Box::new([0u8; MAX_RECOMMENDATION_SUBTOPICS_LEN]);
+        let encoded_len =
+            encode_recommendation_subtopics(&self.recommendation_subtopics, &mut bytes[..])?;
+        self.write_named_file_in_manif_dir(
+            RECOMMENDATION_SUBTOPICS_FILE_NAME,
+            &bytes[..encoded_len],
+        )
+    }
+
+    fn read_recommendation_subtopics(
+        &mut self,
+    ) -> Result<Option<RecommendationSubtopicsState>, StorageError> {
+        let mut bytes = Box::new([0u8; MAX_RECOMMENDATION_SUBTOPICS_LEN]);
+        let Some(read_len) =
+            self.read_named_file_in_manif_dir(RECOMMENDATION_SUBTOPICS_FILE_NAME, &mut bytes[..])?
+        else {
+            return Ok(None);
+        };
+
+        decode_recommendation_subtopics(&bytes[..read_len]).map(Some)
+    }
+
     fn write_package_meta(
         &mut self,
         slot_id: u8,
@@ -3048,13 +3288,12 @@ fn manifest_file_name(kind: CollectionKind) -> &'static str {
     }
 }
 
-fn saved_cache_entries_for_bootstrap(cache_index: &CacheIndex) -> Vec<CacheEntry> {
+fn cache_entries_for_bootstrap(cache_index: &CacheIndex, kind: CollectionKind) -> Vec<CacheEntry> {
     let mut entries = Vec::new();
     let mut index = 0;
     while index < cache_index.len() {
         let entry = cache_index.entries[index];
-        if !entry.is_empty() && entry.collection_flags & collection_flag(CollectionKind::Saved) != 0
-        {
+        if !entry.is_empty() && entry.collection_flags & collection_flag(kind) != 0 {
             entries.push(entry);
         }
         index += 1;
@@ -3070,7 +3309,7 @@ fn saved_cache_entries_for_bootstrap(cache_index: &CacheIndex) -> Vec<CacheEntry
     entries
 }
 
-fn minimal_saved_manifest_item(
+fn minimal_bootstrap_manifest_item(
     entry: CacheEntry,
     title: InlineText<CONTENT_TITLE_MAX_BYTES>,
 ) -> CollectionManifestItem {
@@ -3334,6 +3573,242 @@ fn decode_cache_index(bytes: &[u8]) -> Result<CacheIndex, StorageError> {
         entry_index += 1;
     }
     Ok(index)
+}
+
+fn encode_reading_progress(
+    progress: &ReadingProgressState,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    if out.len() < 16 {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    write_u32(out, 0, READING_PROGRESS_MAGIC);
+    write_u16(out, 4, FORMAT_VERSION);
+    out[6] = progress.len() as u8;
+
+    let mut offset = 16usize;
+    let mut entry_index = 0usize;
+    while entry_index < progress.len() {
+        offset +=
+            encode_reading_progress_entry(&progress.entries[entry_index], &mut out[offset..])?;
+        entry_index += 1;
+    }
+
+    Ok(offset)
+}
+
+fn decode_reading_progress(bytes: &[u8]) -> Result<ReadingProgressState, StorageError> {
+    if bytes.len() < 16 {
+        return Err(StorageError::CorruptData);
+    }
+    if read_u32(bytes, 0) != READING_PROGRESS_MAGIC || read_u16(bytes, 4) != FORMAT_VERSION {
+        return Err(StorageError::CorruptData);
+    }
+
+    let len = bytes[6] as usize;
+    if len > READING_PROGRESS_CAPACITY {
+        return Err(StorageError::CorruptData);
+    }
+
+    let mut progress = ReadingProgressState::empty();
+    let mut offset = 16usize;
+    let mut entry_index = 0usize;
+    while entry_index < len {
+        let (entry, consumed) = decode_reading_progress_entry(&bytes[offset..])?;
+        let _ = progress.record_progress(entry);
+        offset += consumed;
+        entry_index += 1;
+    }
+
+    Ok(progress)
+}
+
+fn encode_recommendation_subtopics(
+    subtopics: &RecommendationSubtopicsState,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    if out.len() < 16 {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    write_u32(out, 0, RECOMMENDATION_SUBTOPICS_MAGIC);
+    write_u16(out, 4, FORMAT_VERSION);
+    out[6] = subtopics.len() as u8;
+
+    let mut offset = 16usize;
+    let mut index = 0usize;
+    while index < subtopics.len() {
+        offset += encode_recommendation_subtopic(&subtopics.items[index], &mut out[offset..])?;
+        index += 1;
+    }
+
+    Ok(offset)
+}
+
+fn decode_recommendation_subtopics(
+    bytes: &[u8],
+) -> Result<RecommendationSubtopicsState, StorageError> {
+    if bytes.len() < 16 {
+        return Err(StorageError::CorruptData);
+    }
+    if read_u32(bytes, 0) != RECOMMENDATION_SUBTOPICS_MAGIC || read_u16(bytes, 4) != FORMAT_VERSION
+    {
+        return Err(StorageError::CorruptData);
+    }
+
+    let len = bytes[6] as usize;
+    if len > domain::content::RECOMMENDATION_SUBTOPIC_CAPACITY {
+        return Err(StorageError::CorruptData);
+    }
+
+    let mut subtopics = RecommendationSubtopicsState::empty();
+    let mut offset = 16usize;
+    let mut index = 0usize;
+    while index < len {
+        let (subtopic, consumed) = decode_recommendation_subtopic(&bytes[offset..])?;
+        let _ = subtopics.try_push(subtopic);
+        offset += consumed;
+        index += 1;
+    }
+
+    Ok(subtopics)
+}
+
+const fn reading_progress_entry_encoded_len() -> usize {
+    1 + CONTENT_ID_MAX_BYTES + 8 + 2 + 2
+}
+
+const fn recommendation_subtopic_encoded_len() -> usize {
+    1 + domain::content::RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES
+        + 1
+        + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES
+        + 1
+        + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES
+        + 1
+        + 1
+}
+
+fn encode_recommendation_subtopic(
+    subtopic: &domain::content::RecommendationSubtopic,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    let needed = recommendation_subtopic_encoded_len();
+    if out.len() < needed {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    out.fill(0);
+    out[0] = subtopic.slug.len() as u8;
+    write_inline_text(
+        &mut out[1..1 + domain::content::RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES],
+        &subtopic.slug,
+    );
+    let label_offset = 1 + domain::content::RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES;
+    out[label_offset] = subtopic.label.len() as u8;
+    write_inline_text(
+        &mut out[label_offset + 1
+            ..label_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES],
+        &subtopic.label,
+    );
+    let parent_offset = label_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES;
+    out[parent_offset] = subtopic.parent_topic_label.len() as u8;
+    write_inline_text(
+        &mut out[parent_offset + 1
+            ..parent_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES],
+        &subtopic.parent_topic_label,
+    );
+    let flags_offset = parent_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES;
+    out[flags_offset] = u8::from(subtopic.is_from_settings);
+    out[flags_offset + 1] = u8::from(subtopic.is_from_behavior);
+    Ok(needed)
+}
+
+fn decode_recommendation_subtopic(
+    bytes: &[u8],
+) -> Result<(domain::content::RecommendationSubtopic, usize), StorageError> {
+    let needed = recommendation_subtopic_encoded_len();
+    if bytes.len() < needed {
+        return Err(StorageError::CorruptData);
+    }
+
+    let mut subtopic = domain::content::RecommendationSubtopic::empty();
+    read_inline_text(
+        &mut subtopic.slug,
+        bytes[0] as usize,
+        &bytes[1..1 + domain::content::RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES],
+    );
+    let label_offset = 1 + domain::content::RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES;
+    read_inline_text(
+        &mut subtopic.label,
+        bytes[label_offset] as usize,
+        &bytes[label_offset + 1
+            ..label_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES],
+    );
+    let parent_offset = label_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES;
+    read_inline_text(
+        &mut subtopic.parent_topic_label,
+        bytes[parent_offset] as usize,
+        &bytes[parent_offset + 1
+            ..parent_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES],
+    );
+    let flags_offset = parent_offset + 1 + domain::content::RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES;
+    subtopic.is_from_settings = bytes[flags_offset] != 0;
+    subtopic.is_from_behavior = bytes[flags_offset + 1] != 0;
+
+    if subtopic.is_empty() {
+        return Err(StorageError::CorruptData);
+    }
+
+    Ok((subtopic, needed))
+}
+
+fn encode_reading_progress_entry(
+    entry: &ReadingProgressEntry,
+    out: &mut [u8],
+) -> Result<usize, StorageError> {
+    let needed = reading_progress_entry_encoded_len();
+    if out.len() < needed {
+        return Err(StorageError::PayloadTooLarge);
+    }
+
+    let entry = entry.sanitized();
+    out.fill(0);
+    out[0] = entry.content_id.len() as u8;
+    write_inline_text(&mut out[1..1 + CONTENT_ID_MAX_BYTES], &entry.content_id);
+    let offset = 1 + CONTENT_ID_MAX_BYTES;
+    write_u64(out, offset, entry.remote_revision);
+    write_u16(out, offset + 8, entry.paragraph_index);
+    write_u16(out, offset + 10, entry.total_paragraphs);
+    Ok(needed)
+}
+
+fn decode_reading_progress_entry(
+    bytes: &[u8],
+) -> Result<(ReadingProgressEntry, usize), StorageError> {
+    let needed = reading_progress_entry_encoded_len();
+    if bytes.len() < needed {
+        return Err(StorageError::CorruptData);
+    }
+
+    let offset = 1 + CONTENT_ID_MAX_BYTES;
+    let mut entry = ReadingProgressEntry::empty();
+    read_inline_text(
+        &mut entry.content_id,
+        bytes[0] as usize,
+        &bytes[1..1 + CONTENT_ID_MAX_BYTES],
+    );
+    entry.remote_revision = read_u64(bytes, offset);
+    entry.paragraph_index = read_u16(bytes, offset + 8);
+    entry.total_paragraphs = read_u16(bytes, offset + 10);
+    let entry = entry.sanitized();
+    if entry.is_empty() {
+        return Err(StorageError::CorruptData);
+    }
+
+    Ok((entry, needed))
 }
 
 const fn cache_entry_encoded_len() -> usize {
@@ -4516,6 +4991,26 @@ mod tests {
     use alloc::format;
     use core::mem::size_of;
 
+    fn make_recommendation_subtopics() -> RecommendationSubtopicsState {
+        let mut subtopics = RecommendationSubtopicsState::empty();
+
+        let mut first = domain::content::RecommendationSubtopic::empty();
+        first.slug.set_truncated("e-ink");
+        first.label.set_truncated("E-INK");
+        first.parent_topic_label.set_truncated("DEVICES");
+        first.is_from_settings = true;
+        let _ = subtopics.try_push(first);
+
+        let mut second = domain::content::RecommendationSubtopic::empty();
+        second.slug.set_truncated("small-web");
+        second.label.set_truncated("SMALL WEB");
+        second.parent_topic_label.set_truncated("MEDIA");
+        second.is_from_behavior = true;
+        let _ = subtopics.try_push(second);
+
+        subtopics
+    }
+
     #[test]
     fn manifest_snapshot_round_trips() {
         let mut snapshot = CollectionManifestState::empty();
@@ -4562,7 +5057,35 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_saved_cache_entries_prefer_recent_saved_items() {
+    fn reading_progress_round_trips() {
+        let mut progress = ReadingProgressState::empty();
+        let mut entry = ReadingProgressEntry::empty();
+        entry.content_id.set_truncated("content-1");
+        entry.remote_revision = 42;
+        entry.paragraph_index = 3;
+        entry.total_paragraphs = 12;
+        let _ = progress.record_progress(entry);
+
+        let mut encoded = [0u8; MAX_READING_PROGRESS_INDEX_LEN];
+        let encoded_len = encode_reading_progress(&progress, &mut encoded).unwrap();
+        let decoded = decode_reading_progress(&encoded[..encoded_len]).unwrap();
+
+        assert_eq!(decoded, progress);
+    }
+
+    #[test]
+    fn recommendation_subtopics_round_trip() {
+        let subtopics = make_recommendation_subtopics();
+
+        let mut encoded = [0u8; MAX_RECOMMENDATION_SUBTOPICS_LEN];
+        let encoded_len = encode_recommendation_subtopics(&subtopics, &mut encoded).unwrap();
+        let decoded = decode_recommendation_subtopics(&encoded[..encoded_len]).unwrap();
+
+        assert_eq!(decoded, subtopics);
+    }
+
+    #[test]
+    fn bootstrap_cache_entries_filter_and_sort_per_collection() {
         let mut index = CacheIndex::empty();
         let mut saved_older_id = InlineText::new();
         saved_older_id.set_truncated("saved-older");
@@ -4600,19 +5123,22 @@ mod tests {
         };
         index.len = 3;
 
-        let entries = saved_cache_entries_for_bootstrap(&index);
+        let saved_entries = cache_entries_for_bootstrap(&index, CollectionKind::Saved);
+        let inbox_entries = cache_entries_for_bootstrap(&index, CollectionKind::Inbox);
 
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].content_id.as_str(), "saved-newer");
-        assert_eq!(entries[1].content_id.as_str(), "saved-older");
+        assert_eq!(saved_entries.len(), 2);
+        assert_eq!(saved_entries[0].content_id.as_str(), "saved-newer");
+        assert_eq!(saved_entries[1].content_id.as_str(), "saved-older");
+        assert_eq!(inbox_entries.len(), 1);
+        assert_eq!(inbox_entries[0].content_id.as_str(), "inbox");
     }
 
     #[test]
-    fn minimal_saved_manifest_item_is_cached_and_content_addressable() {
+    fn minimal_bootstrap_manifest_item_is_cached_and_content_addressable() {
         let mut content_id = InlineText::new();
         content_id.set_truncated("content-42");
         let title = InlineText::from_slice("Cached title");
-        let item = minimal_saved_manifest_item(
+        let item = minimal_bootstrap_manifest_item(
             CacheEntry {
                 slot_id: 1,
                 content_id,
@@ -4631,6 +5157,26 @@ mod tests {
         assert_eq!(item.package_state, PackageState::Cached);
         assert_eq!(item.remote_status, RemoteContentStatus::Ready);
         assert_eq!(item.title.as_str(), "Cached title");
+    }
+
+    #[test]
+    fn bootstrap_content_state_keeps_inbox_when_saved_is_empty() {
+        let saved = CollectionManifestState::empty();
+        let mut inbox = CollectionManifestState::empty();
+        let mut item = CollectionManifestItem::empty();
+        item.remote_item_id.set_truncated("inbox-1");
+        item.content_id.set_truncated("content-1");
+        item.title.set_truncated("Inbox article");
+        assert!(inbox.try_push(item));
+
+        let state = bootstrap_content_state_from_snapshots(saved, inbox).unwrap();
+
+        assert!(state.saved.is_none());
+        assert_eq!(
+            state.inbox.as_ref().map(|collection| collection.len()),
+            Some(1)
+        );
+        assert!(state.recommendations.is_none());
     }
 
     #[test]

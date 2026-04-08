@@ -108,6 +108,13 @@ pub enum TopicRegion {
     Chips,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum RecommendationsRegion {
+    #[default]
+    Articles,
+    Subtopics,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct TopicFocus {
     pub region: TopicRegion,
@@ -138,6 +145,9 @@ pub struct UiState {
     pub saved_index: usize,
     pub inbox_index: usize,
     pub recommendations_index: usize,
+    pub recommendations_subtopic_index: usize,
+    pub recommendations_focus_flash_ticks: u8,
+    pub recommendations_region: RecommendationsRegion,
     pub settings_mode: SettingsMode,
     pub settings_row: SettingsRow,
     pub topic_focus: TopicFocus,
@@ -151,6 +161,9 @@ impl UiState {
             saved_index: 0,
             inbox_index: 0,
             recommendations_index: 0,
+            recommendations_subtopic_index: 0,
+            recommendations_focus_flash_ticks: 0,
+            recommendations_region: RecommendationsRegion::Articles,
             settings_mode: SettingsMode::Master,
             settings_row: SettingsRow::ReadingSpeed,
             topic_focus: TopicFocus::new(),

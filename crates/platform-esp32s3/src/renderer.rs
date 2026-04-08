@@ -4,7 +4,8 @@ use app_runtime::{
     AnimationDescriptor, MotionDirection, PreparedScreen, Screen, ScreenUpdate, TransitionPlan,
     components::{
         ContentListShell, ContentRow, DashboardShell, LoadingModal, ParagraphNavigationShell,
-        PauseModal, ReaderModal, ReaderShell, SettingsShell, TopicPreferenceGrid,
+        PauseModal, ReaderModal, ReaderShell, RecommendationBar, SettingsShell,
+        TopicPreferenceGrid,
     },
 };
 use domain::formatter::StageFont;
@@ -50,8 +51,32 @@ const COLLECTION_SELECTED_SLOT_Y: i32 = 106;
 const COLLECTION_SELECTED_SLOT_HEIGHT: i32 = 68;
 const COLLECTION_BOTTOM_SLOT_Y: i32 = 179;
 const COLLECTION_BOTTOM_SLOT_HEIGHT: i32 = 42;
+const RECOMMENDATION_COLLECTION_TOP_SLOT_Y: i32 = 56;
+const RECOMMENDATION_COLLECTION_TOP_SLOT_HEIGHT: i32 = 42;
+const RECOMMENDATION_COLLECTION_SELECTED_SLOT_Y: i32 = 100;
+const RECOMMENDATION_COLLECTION_SELECTED_SLOT_HEIGHT: i32 = 64;
+const RECOMMENDATION_COLLECTION_BOTTOM_SLOT_Y: i32 = 167;
+const RECOMMENDATION_COLLECTION_BOTTOM_SLOT_HEIGHT: i32 = 42;
 const COLLECTION_SPINNER_CENTER_X: i32 = 350;
 const COLLECTION_SPINNER_CLIP_RIGHT_PAD: i32 = 24;
+const COLLECTION_BADGE_RIGHT_EDGE_X: i32 = 332;
+const COLLECTION_SELECTED_BADGE_RIGHT_EDGE_X: i32 = 296;
+const COLLECTION_BADGE_GAP_PX: i32 = 8;
+const COLLECTION_BADGE_MIN_WIDTH: i32 = 22;
+const COLLECTION_BADGE_HEIGHT: i32 = 15;
+const COLLECTION_BADGE_TEXT_Y_OFFSET: i32 = 2;
+const RECOMMENDATION_BAR_LEFT_BUTTON_X: i32 = 18;
+const RECOMMENDATION_BAR_RIGHT_BUTTON_X: i32 = 316;
+const RECOMMENDATION_BAR_BUTTON_Y: i32 = 28;
+const RECOMMENDATION_BAR_BUTTON_WIDTH: i32 = 20;
+const RECOMMENDATION_BAR_BUTTON_HEIGHT: i32 = 22;
+const RECOMMENDATION_BAR_X: i32 = 44;
+const RECOMMENDATION_BAR_Y: i32 = 27;
+const RECOMMENDATION_BAR_HEIGHT: i32 = 24;
+const RECOMMENDATION_BAR_GAP_X: i32 = 6;
+const RECOMMENDATION_BAR_RIGHT_EDGE_X: i32 = 310;
+const RECOMMENDATION_BAR_TEXT_Y_OFFSET: i32 = 7;
+const RECOMMENDATION_BAR_MIN_WIDTH: i32 = 64;
 const PARAGRAPH_SLOT_TRAVEL_PX: i32 = 18;
 const PARAGRAPH_TOP_SLOT_Y: i32 = 52;
 const PARAGRAPH_TOP_SLOT_HEIGHT: i32 = 24;
@@ -522,10 +547,7 @@ fn draw_dashboard_slot_transition(
     );
 }
 
-fn draw_dashboard_selected_band_accent(frame: &mut FrameBuffer) {
-    fill_rect(frame, 303, 105, 28, 5, BinaryColor::Off);
-    fill_rect(frame, 307, 116, 22, 5, BinaryColor::Off);
-}
+fn draw_dashboard_selected_band_accent(_frame: &mut FrameBuffer) {}
 
 fn sync_spinner_frame(spinner_phase: u8) -> &'static str {
     match spinner_phase % 4 {
@@ -569,6 +591,17 @@ const fn collection_top_slot() -> CollectionRowSlot {
     )
 }
 
+const fn recommendation_collection_top_slot() -> CollectionRowSlot {
+    collection_slot(
+        20,
+        62,
+        80,
+        BinaryColor::On,
+        RECOMMENDATION_COLLECTION_TOP_SLOT_Y,
+        RECOMMENDATION_COLLECTION_TOP_SLOT_HEIGHT,
+    )
+}
+
 const fn collection_selected_slot() -> CollectionRowSlot {
     collection_slot(
         28,
@@ -577,6 +610,17 @@ const fn collection_selected_slot() -> CollectionRowSlot {
         BinaryColor::Off,
         COLLECTION_SELECTED_SLOT_Y,
         COLLECTION_SELECTED_SLOT_HEIGHT,
+    )
+}
+
+const fn recommendation_collection_selected_slot() -> CollectionRowSlot {
+    collection_slot(
+        28,
+        118,
+        135,
+        BinaryColor::Off,
+        RECOMMENDATION_COLLECTION_SELECTED_SLOT_Y,
+        RECOMMENDATION_COLLECTION_SELECTED_SLOT_HEIGHT,
     )
 }
 
@@ -589,6 +633,41 @@ const fn collection_bottom_slot() -> CollectionRowSlot {
         COLLECTION_BOTTOM_SLOT_Y,
         COLLECTION_BOTTOM_SLOT_HEIGHT,
     )
+}
+
+const fn recommendation_collection_bottom_slot() -> CollectionRowSlot {
+    collection_slot(
+        20,
+        176,
+        194,
+        BinaryColor::On,
+        RECOMMENDATION_COLLECTION_BOTTOM_SLOT_Y,
+        RECOMMENDATION_COLLECTION_BOTTOM_SLOT_HEIGHT,
+    )
+}
+
+fn collection_top_slot_for(shell: &ContentListShell) -> CollectionRowSlot {
+    if shell.recommendations_bar.is_some() {
+        recommendation_collection_top_slot()
+    } else {
+        collection_top_slot()
+    }
+}
+
+fn collection_selected_slot_for(shell: &ContentListShell) -> CollectionRowSlot {
+    if shell.recommendations_bar.is_some() {
+        recommendation_collection_selected_slot()
+    } else {
+        collection_selected_slot()
+    }
+}
+
+fn collection_bottom_slot_for(shell: &ContentListShell) -> CollectionRowSlot {
+    if shell.recommendations_bar.is_some() {
+        recommendation_collection_bottom_slot()
+    } else {
+        collection_bottom_slot()
+    }
 }
 
 const fn dashboard_slot(
@@ -676,13 +755,17 @@ fn draw_collection(
     total_steps: u8,
     slide_offset: i32,
 ) {
+    let top_slot = collection_top_slot_for(shell);
+    let selected_slot = collection_selected_slot_for(shell);
+    let bottom_slot = collection_bottom_slot_for(shell);
+
     draw_collection_chrome(frame, shell);
     draw_collection_row_at(
         frame,
         &shell.rows[0],
-        Point::new(20, 48 + slide_offset),
-        Point::new(20, 66 + slide_offset),
-        BinaryColor::On,
+        Point::new(top_slot.text_x, top_slot.meta_y + slide_offset),
+        Point::new(top_slot.text_x, top_slot.title_y + slide_offset),
+        top_slot.color,
     );
 
     draw_selection_band(
@@ -697,9 +780,9 @@ fn draw_collection(
     draw_collection_row_at(
         frame,
         &shell.rows[1],
-        Point::new(28, 118 + slide_offset),
-        Point::new(28, 135 + slide_offset),
-        BinaryColor::Off,
+        Point::new(selected_slot.text_x, selected_slot.meta_y + slide_offset),
+        Point::new(selected_slot.text_x, selected_slot.title_y + slide_offset),
+        selected_slot.color,
     );
 
     if step >= total_steps {
@@ -709,9 +792,9 @@ fn draw_collection(
     draw_collection_row_at(
         frame,
         &shell.rows[2],
-        Point::new(20, 185 + slide_offset),
-        Point::new(20, 203 + slide_offset),
-        BinaryColor::On,
+        Point::new(bottom_slot.text_x, bottom_slot.meta_y + slide_offset),
+        Point::new(bottom_slot.text_x, bottom_slot.title_y + slide_offset),
+        bottom_slot.color,
     );
 }
 
@@ -738,6 +821,7 @@ fn draw_collection_chrome(frame: &mut FrameBuffer, shell: &ContentListShell) {
         shell.status.battery_percent,
         shell.status.wifi_online,
     );
+    draw_back_chevron(frame, 20, 12);
     draw_text(
         frame,
         shell.help.text,
@@ -746,7 +830,9 @@ fn draw_collection_chrome(frame: &mut FrameBuffer, shell: &ContentListShell) {
         BinaryColor::On,
         Alignment::Left,
     );
-    draw_back_chevron(frame, 20, 12);
+    if let Some(bar) = shell.recommendations_bar {
+        draw_recommendation_bar(frame, &bar);
+    }
     if shell.large_rail {
         draw_vertical_rail_scaled(
             frame,
@@ -757,6 +843,131 @@ fn draw_collection_chrome(frame: &mut FrameBuffer, shell: &ContentListShell) {
         );
     } else {
         draw_vertical_rail(frame, shell.rail.text, RAIL_RIGHT_EDGE_X, 26);
+    }
+}
+
+fn draw_recommendation_bar(frame: &mut FrameBuffer, bar: &RecommendationBar) {
+    if bar.show_left_more {
+        draw_recommendation_more_button(frame, RECOMMENDATION_BAR_LEFT_BUTTON_X, false);
+    }
+
+    let mut x = RECOMMENDATION_BAR_X;
+    let mut index = 0usize;
+    while index < bar.visible_count {
+        let tab = bar.tabs[index];
+        let width = recommendation_tab_width(tab.label.as_str());
+        if x + width > RECOMMENDATION_BAR_RIGHT_EDGE_X {
+            break;
+        }
+
+        if tab.active {
+            draw_pill(
+                frame,
+                x,
+                RECOMMENDATION_BAR_Y,
+                width,
+                RECOMMENDATION_BAR_HEIGHT,
+                true,
+            );
+        } else {
+            draw_pill(
+                frame,
+                x,
+                RECOMMENDATION_BAR_Y,
+                width,
+                RECOMMENDATION_BAR_HEIGHT,
+                false,
+            );
+        }
+
+        if tab.focused {
+            draw_recommendation_focus_ring(
+                frame,
+                x,
+                RECOMMENDATION_BAR_Y,
+                width,
+                RECOMMENDATION_BAR_HEIGHT,
+                tab.flash,
+            );
+        }
+
+        draw_text_ellipsized(
+            frame,
+            tab.label.as_str(),
+            Point::new(
+                x + 10,
+                RECOMMENDATION_BAR_Y + RECOMMENDATION_BAR_TEXT_Y_OFFSET,
+            ),
+            ui_font_small(),
+            if tab.active {
+                BinaryColor::Off
+            } else {
+                BinaryColor::On
+            },
+            Alignment::Left,
+            width - 16,
+        );
+
+        x += width + RECOMMENDATION_BAR_GAP_X;
+        index += 1;
+    }
+
+    if bar.show_right_more {
+        draw_recommendation_more_button(frame, RECOMMENDATION_BAR_RIGHT_BUTTON_X, true);
+    }
+}
+
+fn recommendation_tab_width(label: &str) -> i32 {
+    (mono_text_width_px(label, ui_font_small(), 1) + 24).max(RECOMMENDATION_BAR_MIN_WIDTH)
+}
+
+fn draw_recommendation_focus_ring(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    flashing: bool,
+) {
+    stroke_rect(frame, x - 2, y - 2, width + 4, height + 4, BinaryColor::On);
+    if flashing {
+        stroke_rect(frame, x - 4, y - 4, width + 8, height + 8, BinaryColor::On);
+    }
+}
+
+fn draw_recommendation_more_button(frame: &mut FrameBuffer, x: i32, pointing_right: bool) {
+    stroke_rect(
+        frame,
+        x,
+        RECOMMENDATION_BAR_BUTTON_Y,
+        RECOMMENDATION_BAR_BUTTON_WIDTH,
+        RECOMMENDATION_BAR_BUTTON_HEIGHT,
+        BinaryColor::On,
+    );
+    draw_recommendation_button_chevron(
+        frame,
+        x + 7,
+        RECOMMENDATION_BAR_BUTTON_Y + 5,
+        pointing_right,
+    );
+}
+
+fn draw_recommendation_button_chevron(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    pointing_right: bool,
+) {
+    let mut offset = 0;
+    while offset < 6 {
+        let chevron_x = if pointing_right {
+            x + 5 - offset
+        } else {
+            x + offset
+        };
+        set_pixel(frame, chevron_x, y + 5 - offset);
+        set_pixel(frame, chevron_x, y + 5 + offset);
+        offset += 1;
     }
 }
 
@@ -774,29 +985,32 @@ fn draw_collection_list_step_slots(
         MotionDirection::Forward => incoming_offset - COLLECTION_LIST_STEP_TRAVEL_PX,
         MotionDirection::Backward => incoming_offset + COLLECTION_LIST_STEP_TRAVEL_PX,
     };
+    let top_slot = collection_top_slot_for(to);
+    let selected_slot = collection_selected_slot_for(to);
+    let bottom_slot = collection_bottom_slot_for(to);
 
     draw_collection_row_slot_transition(
         frame,
         &from.rows[0],
         &to.rows[0],
-        collection_top_slot(),
+        top_slot,
         incoming_offset,
         outgoing_offset,
     );
     fill_rect(
         frame,
         16,
-        COLLECTION_SELECTED_SLOT_Y,
+        selected_slot.clip.y,
         320,
-        COLLECTION_SELECTED_SLOT_HEIGHT,
+        selected_slot.clip.height,
         BinaryColor::On,
     );
     draw_selection_band(
         frame,
         16,
-        COLLECTION_SELECTED_SLOT_Y,
+        selected_slot.clip.y,
         320,
-        COLLECTION_SELECTED_SLOT_HEIGHT,
+        selected_slot.clip.height,
         1,
         1,
     );
@@ -804,7 +1018,7 @@ fn draw_collection_list_step_slots(
         frame,
         &from.rows[1],
         &to.rows[1],
-        collection_selected_slot(),
+        selected_slot,
         incoming_offset,
         outgoing_offset,
     );
@@ -813,7 +1027,7 @@ fn draw_collection_list_step_slots(
         frame,
         &from.rows[2],
         &to.rows[2],
-        collection_bottom_slot(),
+        bottom_slot,
         incoming_offset,
         outgoing_offset,
     );
@@ -868,7 +1082,7 @@ fn draw_collection_row_at(
         ui_font_body(),
         color,
         Alignment::Left,
-        COLLECTION_TEXT_RIGHT_EDGE_X - title_position.x,
+        collection_title_right_edge(row) - title_position.x,
     );
 
     if let Some(spinner_phase) = row.loading_phase {
@@ -879,13 +1093,12 @@ fn draw_collection_row_at(
             color,
             None,
         );
+    } else if let Some(label) = row.progress_badge {
+        draw_collection_progress_badge(frame, label.as_str(), title_position, row, None);
     }
 }
 
-fn draw_collection_selected_band_accent(frame: &mut FrameBuffer) {
-    fill_rect(frame, 303, 129, 28, 5, BinaryColor::Off);
-    fill_rect(frame, 307, 140, 22, 5, BinaryColor::Off);
-}
+fn draw_collection_selected_band_accent(_frame: &mut FrameBuffer) {}
 
 fn draw_collection_row_at_clipped(
     frame: &mut FrameBuffer,
@@ -915,7 +1128,7 @@ fn draw_collection_row_at_clipped(
             position: title_position,
             color,
             alignment: Alignment::Left,
-            max_width_px: COLLECTION_TEXT_RIGHT_EDGE_X - title_position.x,
+            max_width_px: collection_title_right_edge(row) - title_position.x,
         },
         clip,
     );
@@ -927,6 +1140,14 @@ fn draw_collection_row_at_clipped(
             collection_spinner_center(meta_position, title_position),
             color,
             Some(collection_spinner_clip(clip)),
+        );
+    } else if let Some(label) = row.progress_badge {
+        draw_collection_progress_badge(
+            frame,
+            label.as_str(),
+            title_position,
+            row,
+            Some(collection_badge_clip(clip)),
         );
     }
 }
@@ -944,6 +1165,82 @@ const fn collection_spinner_clip(clip: ClipRect) -> ClipRect {
         y: clip.y,
         width: clip.width + COLLECTION_SPINNER_CLIP_RIGHT_PAD,
         height: clip.height,
+    }
+}
+
+fn collection_title_right_edge(row: &ContentRow) -> i32 {
+    let Some(label) = row.progress_badge else {
+        return COLLECTION_TEXT_RIGHT_EDGE_X;
+    };
+    if row.loading_phase.is_some() {
+        return COLLECTION_TEXT_RIGHT_EDGE_X;
+    }
+
+    collection_badge_left_x(row, label.as_str()) - COLLECTION_BADGE_GAP_PX
+}
+
+const fn collection_badge_clip(clip: ClipRect) -> ClipRect {
+    ClipRect {
+        x: clip.x,
+        y: clip.y,
+        width: clip.width + 48,
+        height: clip.height,
+    }
+}
+
+fn draw_collection_progress_badge(
+    frame: &mut FrameBuffer,
+    label: &str,
+    title_position: Point,
+    row: &ContentRow,
+    clip: Option<ClipRect>,
+) {
+    let width = collection_badge_width(label);
+    let x = collection_badge_left_x(row, label);
+    let y = title_position.y - 1;
+
+    fill_rect_clipped(
+        frame,
+        x,
+        y,
+        width,
+        COLLECTION_BADGE_HEIGHT,
+        BinaryColor::Off,
+        clip,
+    );
+    stroke_rect_clipped(
+        frame,
+        x,
+        y,
+        width,
+        COLLECTION_BADGE_HEIGHT,
+        BinaryColor::On,
+        clip,
+    );
+    draw_text_clipped(
+        frame,
+        label,
+        Point::new(x + (width / 2), y + COLLECTION_BADGE_TEXT_Y_OFFSET),
+        ui_font_small(),
+        BinaryColor::On,
+        Alignment::Center,
+        clip,
+    );
+}
+
+fn collection_badge_width(label: &str) -> i32 {
+    (mono_text_width_px(label, ui_font_small(), 1) + 10).max(COLLECTION_BADGE_MIN_WIDTH)
+}
+
+fn collection_badge_left_x(row: &ContentRow, label: &str) -> i32 {
+    collection_badge_right_edge(row) - collection_badge_width(label)
+}
+
+const fn collection_badge_right_edge(row: &ContentRow) -> i32 {
+    if row.selected {
+        COLLECTION_SELECTED_BADGE_RIGHT_EDGE_X
+    } else {
+        COLLECTION_BADGE_RIGHT_EDGE_X
     }
 }
 
@@ -2274,6 +2571,25 @@ fn fill_rect_clipped(
     fill_rect(frame, left, top, right - left, bottom - top, color);
 }
 
+fn stroke_rect_clipped(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: BinaryColor,
+    clip: Option<ClipRect>,
+) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    fill_rect_clipped(frame, x, y, width, 1, color, clip);
+    fill_rect_clipped(frame, x, y + height - 1, width, 1, color, clip);
+    fill_rect_clipped(frame, x, y, 1, height, color, clip);
+    fill_rect_clipped(frame, x + width - 1, y, 1, height, color, clip);
+}
+
 fn intersect_clip_rects(a: ClipRect, b: ClipRect) -> Option<ClipRect> {
     let left = a.x.max(b.x);
     let top = a.y.max(b.y);
@@ -2330,6 +2646,36 @@ fn draw_text(
 
     Text::with_text_style(normalized.as_str(), position, style, text_style)
         .draw(frame)
+        .ok();
+}
+
+fn draw_text_clipped(
+    frame: &mut FrameBuffer,
+    text: &str,
+    position: Point,
+    font: &embedded_graphics::mono_font::MonoFont<'static>,
+    color: BinaryColor,
+    alignment: Alignment,
+    clip: Option<ClipRect>,
+) {
+    let Some(clip) = clip else {
+        draw_text(frame, text, position, font, color, alignment);
+        return;
+    };
+
+    let normalized = normalized_text(text);
+    let style = MonoTextStyleBuilder::new()
+        .font(font)
+        .text_color(color)
+        .build();
+    let text_style = TextStyleBuilder::new()
+        .alignment(alignment)
+        .baseline(Baseline::Top)
+        .build();
+    let mut clipped_frame = ClippedFrameBuffer::new(frame, clip);
+
+    Text::with_text_style(normalized.as_str(), position, style, text_style)
+        .draw(&mut clipped_frame)
         .ok();
 }
 
@@ -2852,22 +3198,26 @@ mod tests {
                 text: "S\nA\nV\nE\nD",
             },
             large_rail: true,
+            recommendations_bar: None,
             rows: [
                 ContentRow {
                     meta: InlineText::from_slice(rows[0].0),
                     title: InlineText::from_slice(rows[0].1),
+                    progress_badge: None,
                     loading_phase: None,
                     selected: false,
                 },
                 ContentRow {
                     meta: InlineText::from_slice(rows[1].0),
                     title: InlineText::from_slice(rows[1].1),
+                    progress_badge: None,
                     loading_phase: selected_spinner_phase,
                     selected: true,
                 },
                 ContentRow {
                     meta: InlineText::from_slice(rows[2].0),
                     title: InlineText::from_slice(rows[2].1),
+                    progress_badge: None,
                     loading_phase: None,
                     selected: false,
                 },
@@ -3133,6 +3483,10 @@ mod tests {
     fn large_rails_are_bottom_aligned() {
         assert_eq!(
             vertical_rail_bottom_start_y("M\nO\nT\nI\nF", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
+            64
+        );
+        assert_eq!(
+            vertical_rail_bottom_start_y("I\nN\nB\nO\nX", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
             64
         );
         assert_eq!(
