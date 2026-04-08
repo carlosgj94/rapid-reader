@@ -1063,7 +1063,7 @@ mod tests {
     use crate::{
         content::{
             CollectionManifestItem, CollectionManifestState, DetailLocator, PackageState,
-            RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES, RecommendationSubtopic,
+            RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES, ReadingProgressEntry, RecommendationSubtopic,
             RecommendationSubtopicsState, RemoteContentStatus,
         },
         device::{BootState, DeviceState},
@@ -1787,12 +1787,85 @@ mod tests {
     }
 
     #[test]
+    fn opening_inbox_content_queues_reading_progress_write() {
+        let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
+
+        store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            7,
+            crate::text::InlineText::from_slice("Example inbox title"),
+            120,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 64),
+        );
+
+        assert_eq!(
+            store.take_pending_reading_progress_write(),
+            Some(ReadingProgressEntry {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                remote_revision: 7,
+                paragraph_index: 1,
+                total_paragraphs: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn opening_recommendation_content_queues_reading_progress_write() {
+        let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
+
+        store.open_cached_content(
+            CollectionKind::Recommendations,
+            crate::text::InlineText::from_slice("content-1"),
+            7,
+            crate::text::InlineText::from_slice("Example recommendation title"),
+            120,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 64),
+        );
+
+        assert_eq!(
+            store.take_pending_reading_progress_write(),
+            Some(ReadingProgressEntry {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                remote_revision: 7,
+                paragraph_index: 1,
+                total_paragraphs: 2,
+            })
+        );
+    }
+
+    #[test]
     fn live_reader_scroll_back_jumps_to_current_paragraph_start() {
         let mut store = Store::new();
         store.settings.reading_speed_wpm = 300;
         store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
+            7,
             crate::text::InlineText::from_slice("Example"),
             120,
             alloc::vec![
@@ -1838,6 +1911,7 @@ mod tests {
         store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
+            7,
             crate::text::InlineText::from_slice("Example"),
             200,
             alloc::vec![

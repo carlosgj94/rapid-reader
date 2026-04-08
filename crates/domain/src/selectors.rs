@@ -21,7 +21,6 @@ pub const VISIBLE_LIST_ROWS: usize = 3;
 pub const SETTINGS_ROW_COUNT: usize = 6;
 pub const RECOMMENDATION_VISIBLE_TABS: usize = 4;
 pub const RECOMMENDATION_TAB_LABEL_MAX_BYTES: usize = RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES + 1;
-const END_OF_LIST_LABEL: &str = "END";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct StatusClusterModel {
@@ -57,7 +56,7 @@ pub struct ContentRowModel {
     pub meta: InlineText<CONTENT_META_MAX_BYTES>,
     pub title: InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub progress_badge: Option<InlineText<8>>,
-    pub loading_phase: Option<u8>,
+    pub is_fetching: bool,
     pub selected: bool,
 }
 
@@ -224,7 +223,7 @@ pub fn select_dashboard(store: &Store) -> DashboardScreenModel {
                     false,
                 )
             } else {
-                dashboard_end_item()
+                dashboard_empty_item()
             },
         ],
         focused,
@@ -241,7 +240,6 @@ pub fn select_collection(store: &Store, kind: CollectionKind) -> ContentListScre
             &store.reading_progress,
             kind,
             selected_index,
-            store.backend_sync.spinner_phase,
         )
     };
 
@@ -478,14 +476,12 @@ fn select_collection_rows(
     reading_progress: &ReadingProgressState,
     kind: CollectionKind,
     selected_index: usize,
-    spinner_phase: u8,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
     select_manifest_collection_rows(
         content.collection_state(kind),
         reading_progress,
         kind,
         selected_index,
-        spinner_phase,
     )
 }
 
@@ -510,7 +506,7 @@ fn select_recommendation_rows(store: &Store) -> [ContentRowModel; VISIBLE_LIST_R
                 meta: topic_label,
                 title: InlineText::from_slice("Loading articles..."),
                 progress_badge: None,
-                loading_phase: None,
+                is_fetching: false,
                 selected: true,
             },
             content_row("MOTIF", "This may take a moment", false),
@@ -540,7 +536,7 @@ fn select_recommendation_rows(store: &Store) -> [ContentRowModel; VISIBLE_LIST_R
                 meta: topic_label,
                 title: InlineText::from_slice("No articles for this topic yet"),
                 progress_badge: None,
-                loading_phase: None,
+                is_fetching: false,
                 selected: true,
             },
             content_row("MOTIF", "Try another subtopic", false),
@@ -552,7 +548,6 @@ fn select_recommendation_rows(store: &Store) -> [ContentRowModel; VISIBLE_LIST_R
         &store.reading_progress,
         CollectionKind::Recommendations,
         store.ui.recommendations_index,
-        store.backend_sync.spinner_phase,
     )
 }
 
@@ -654,7 +649,6 @@ fn select_manifest_collection_rows(
     reading_progress: &ReadingProgressState,
     kind: CollectionKind,
     selected_index: usize,
-    spinner_phase: u8,
 ) -> [ContentRowModel; VISIBLE_LIST_ROWS] {
     let Some(selected) = collection.item_at(selected_index.min(collection.len().saturating_sub(1)))
     else {
@@ -668,15 +662,11 @@ fn select_manifest_collection_rows(
 
     [
         previous
-            .map(|item| {
-                content_row_from_manifest(item, reading_progress, kind, false, spinner_phase)
-            })
+            .map(|item| content_row_from_manifest(item, reading_progress, kind, false))
             .unwrap_or_else(empty_content_row),
-        content_row_from_manifest(selected, reading_progress, kind, true, spinner_phase),
-        next.map(|item| {
-            content_row_from_manifest(item, reading_progress, kind, false, spinner_phase)
-        })
-        .unwrap_or_else(end_content_row),
+        content_row_from_manifest(selected, reading_progress, kind, true),
+        next.map(|item| content_row_from_manifest(item, reading_progress, kind, false))
+            .unwrap_or_else(empty_content_row),
     ]
 }
 
@@ -685,17 +675,13 @@ fn content_row(meta: &str, title: &str, selected: bool) -> ContentRowModel {
         meta: InlineText::from_slice(meta),
         title: InlineText::from_slice(title),
         progress_badge: None,
-        loading_phase: None,
+        is_fetching: false,
         selected,
     }
 }
 
 fn empty_content_row() -> ContentRowModel {
     content_row("", "", false)
-}
-
-fn end_content_row() -> ContentRowModel {
-    content_row("", END_OF_LIST_LABEL, false)
 }
 
 fn dashboard_item(collection: CollectionKind, selected: bool) -> DashboardItemModel {
@@ -714,27 +700,18 @@ fn dashboard_empty_item() -> DashboardItemModel {
     }
 }
 
-fn dashboard_end_item() -> DashboardItemModel {
-    DashboardItemModel {
-        label: END_OF_LIST_LABEL,
-        live_dot: false,
-        selected: false,
-    }
-}
-
 fn content_row_from_manifest(
     item: CollectionManifestItem,
     reading_progress: &ReadingProgressState,
     kind: CollectionKind,
     selected: bool,
-    spinner_phase: u8,
 ) -> ContentRowModel {
-    let loading_phase = row_loading_phase(kind, item.package_state, spinner_phase);
+    let is_fetching = matches!(item.package_state, PackageState::Fetching);
     ContentRowModel {
         meta: content_row_meta(kind, item),
         title: item.title,
-        progress_badge: row_progress_badge(kind, item, loading_phase, reading_progress),
-        loading_phase,
+        progress_badge: row_progress_badge(kind, item, reading_progress),
+        is_fetching,
         selected,
     }
 }
@@ -744,7 +721,7 @@ fn content_row_meta(
     item: CollectionManifestItem,
 ) -> InlineText<CONTENT_META_MAX_BYTES> {
     let mut meta = collection_row_base_meta(kind, item.meta);
-    let Some(label) = package_state_hint(kind, item.package_state) else {
+    let Some(label) = package_state_hint(item.package_state) else {
         return meta;
     };
 
@@ -777,34 +754,23 @@ const fn collection_meta_suffix(kind: CollectionKind) -> Option<&'static str> {
     }
 }
 
-const fn package_state_hint(kind: CollectionKind, state: PackageState) -> Option<&'static str> {
-    match (kind, state) {
-        (CollectionKind::Saved, PackageState::Fetching) => None,
-        (_, PackageState::Fetching) => Some("FETCHING"),
-        (_, PackageState::PendingRemote) => Some("REMOTE"),
-        (_, PackageState::Failed) => Some("FAILED"),
-        (_, PackageState::Missing | PackageState::Cached | PackageState::Stale) => None,
-    }
-}
-
-const fn row_loading_phase(
-    kind: CollectionKind,
-    state: PackageState,
-    spinner_phase: u8,
-) -> Option<u8> {
-    match (kind, state) {
-        (CollectionKind::Saved, PackageState::Fetching) => Some(spinner_phase),
-        _ => None,
+const fn package_state_hint(state: PackageState) -> Option<&'static str> {
+    match state {
+        PackageState::Fetching => Some("FETCHING"),
+        PackageState::PendingRemote => Some("REMOTE"),
+        PackageState::Failed => Some("FAILED"),
+        PackageState::Missing | PackageState::Cached | PackageState::Stale => None,
     }
 }
 
 fn row_progress_badge(
-    kind: CollectionKind,
+    _kind: CollectionKind,
     item: CollectionManifestItem,
-    loading_phase: Option<u8>,
     reading_progress: &ReadingProgressState,
 ) -> Option<InlineText<8>> {
-    if loading_phase.is_some() || !matches!(kind, CollectionKind::Saved) {
+    // Progress is article-scoped across collections; any row with a matching
+    // content id + revision should show the same badge unless it is still fetching.
+    if matches!(item.package_state, PackageState::Fetching) {
         return None;
     }
 
@@ -941,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_last_focus_uses_end_bottom_slot() {
+    fn dashboard_last_focus_uses_empty_bottom_slot() {
         let mut store = Store::new();
         store.ui.dashboard_focus = DashboardFocus::Recommendations;
 
@@ -949,7 +915,7 @@ mod tests {
 
         assert_eq!(model.items[0].label, "SAVED");
         assert_eq!(model.items[1].label, "FOR YOU");
-        assert_eq!(model.items[2].label, "END");
+        assert_eq!(model.items[2].label, "");
     }
 
     #[test]
@@ -1143,7 +1109,7 @@ mod tests {
 
         assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
         assert_eq!(model.rows[1].title.as_str(), "Example saved title");
-        assert_eq!(model.rows[1].loading_phase, None);
+        assert!(!model.rows[1].is_fetching);
     }
 
     #[test]
@@ -1162,13 +1128,12 @@ mod tests {
 
         assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
         assert_eq!(model.rows[1].title.as_str(), "Example inbox title");
-        assert_eq!(model.rows[1].loading_phase, None);
+        assert!(!model.rows[1].is_fetching);
     }
 
     #[test]
-    fn fetching_saved_collection_selector_uses_spinner_instead_of_fetching_label() {
+    fn fetching_saved_collection_selector_shows_fetching_label_without_spinner() {
         let mut store = Store::new();
-        store.backend_sync.spinner_phase = 3;
         let mut item = CollectionManifestItem::empty();
         item.meta.set_truncated("EXAMPLE / SAVED");
         item.title.set_truncated("Example saved title");
@@ -1181,8 +1146,8 @@ mod tests {
 
         let model = select_collection(&store, CollectionKind::Saved);
 
-        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
-        assert_eq!(model.rows[1].loading_phase, Some(3));
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / FETCHING");
+        assert!(model.rows[1].is_fetching);
     }
 
     #[test]
@@ -1202,13 +1167,13 @@ mod tests {
         assert!(model.rows[0].title.is_empty());
         assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE");
         assert_eq!(model.rows[1].title.as_str(), "Example saved title");
-        assert_eq!(model.rows[1].loading_phase, None);
+        assert!(!model.rows[1].is_fetching);
         assert!(model.rows[2].meta.is_empty());
-        assert_eq!(model.rows[2].title.as_str(), "END");
+        assert!(model.rows[2].title.is_empty());
     }
 
     #[test]
-    fn saved_collection_selector_stops_at_last_item_and_shows_end_row() {
+    fn saved_collection_selector_stops_at_last_item_and_uses_empty_bottom_row() {
         let mut store = Store::new();
         let mut first = CollectionManifestItem::empty();
         first.meta.set_truncated("EXAMPLE / SAVED");
@@ -1230,7 +1195,7 @@ mod tests {
 
         assert_eq!(model.rows[0].title.as_str(), "First saved title");
         assert_eq!(model.rows[1].title.as_str(), "Second saved title");
-        assert_eq!(model.rows[2].title.as_str(), "END");
+        assert!(model.rows[2].title.is_empty());
     }
 
     #[test]
@@ -1305,9 +1270,62 @@ mod tests {
     }
 
     #[test]
+    fn inbox_collection_selector_shows_progress_badge_for_started_article() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.content_id.set_truncated("content-1");
+        item.remote_revision = 7;
+        item.meta.set_truncated("EXAMPLE / INBOX");
+        item.title.set_truncated("Example inbox title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Inbox)
+            .try_push(item);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: item.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        let model = select_collection(&store, CollectionKind::Inbox);
+
+        assert_eq!(model.rows[1].progress_badge.unwrap().as_str(), "25%");
+    }
+
+    #[test]
+    fn recommendations_collection_selector_shows_progress_badge_for_started_article() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.content_id.set_truncated("content-1");
+        item.remote_item_id.set_truncated("content-1");
+        item.remote_revision = 7;
+        item.detail_locator = DetailLocator::Content;
+        item.meta.set_truncated("EXAMPLE / FOR YOU");
+        item.title.set_truncated("Example recommendation title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Recommendations)
+            .try_push(item);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: item.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        let model = select_collection(&store, CollectionKind::Recommendations);
+
+        assert_eq!(model.rows[1].progress_badge.unwrap().as_str(), "25%");
+    }
+
+    #[test]
     fn saved_collection_selector_hides_progress_badge_for_fetching_row() {
         let mut store = Store::new();
-        store.backend_sync.spinner_phase = 1;
         let mut item = CollectionManifestItem::empty();
         item.content_id.set_truncated("content-1");
         item.remote_revision = 7;
@@ -1329,7 +1347,191 @@ mod tests {
 
         let model = select_collection(&store, CollectionKind::Saved);
 
-        assert_eq!(model.rows[1].loading_phase, Some(1));
+        assert!(model.rows[1].is_fetching);
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / FETCHING");
         assert_eq!(model.rows[1].progress_badge, None);
+    }
+
+    #[test]
+    fn inbox_collection_selector_hides_progress_badge_for_fetching_row() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.content_id.set_truncated("content-1");
+        item.remote_revision = 7;
+        item.meta.set_truncated("EXAMPLE / INBOX");
+        item.title.set_truncated("Example inbox title");
+        item.package_state = crate::content::PackageState::Fetching;
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Inbox)
+            .try_push(item);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: item.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        let model = select_collection(&store, CollectionKind::Inbox);
+
+        assert!(model.rows[1].is_fetching);
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / FETCHING");
+        assert_eq!(model.rows[1].progress_badge, None);
+    }
+
+    #[test]
+    fn recommendations_collection_selector_hides_progress_badge_for_fetching_row() {
+        let mut store = Store::new();
+        let mut item = CollectionManifestItem::empty();
+        item.content_id.set_truncated("content-1");
+        item.remote_item_id.set_truncated("content-1");
+        item.remote_revision = 7;
+        item.detail_locator = DetailLocator::Content;
+        item.meta.set_truncated("EXAMPLE / FOR YOU");
+        item.title.set_truncated("Example recommendation title");
+        item.package_state = crate::content::PackageState::Fetching;
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Recommendations)
+            .try_push(item);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: item.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        let model = select_collection(&store, CollectionKind::Recommendations);
+
+        assert!(model.rows[1].is_fetching);
+        assert_eq!(model.rows[1].meta.as_str(), "EXAMPLE / FETCHING");
+        assert_eq!(model.rows[1].progress_badge, None);
+    }
+
+    #[test]
+    fn collection_selector_hides_progress_badge_for_revision_mismatch_across_collections() {
+        let mut store = Store::new();
+        let mut saved = CollectionManifestItem::empty();
+        saved.content_id.set_truncated("content-1");
+        saved.remote_revision = 8;
+        saved.meta.set_truncated("EXAMPLE / SAVED");
+        saved.title.set_truncated("Example saved title");
+        let mut inbox = CollectionManifestItem::empty();
+        inbox.content_id = saved.content_id;
+        inbox.remote_revision = 8;
+        inbox.meta.set_truncated("EXAMPLE / INBOX");
+        inbox.title.set_truncated("Example inbox title");
+        let mut recommendation = CollectionManifestItem::empty();
+        recommendation.content_id = saved.content_id;
+        recommendation.remote_item_id = saved.content_id;
+        recommendation.remote_revision = 8;
+        recommendation.detail_locator = DetailLocator::Content;
+        recommendation.meta.set_truncated("EXAMPLE / FOR YOU");
+        recommendation
+            .title
+            .set_truncated("Example recommendation title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(saved);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Inbox)
+            .try_push(inbox);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Recommendations)
+            .try_push(recommendation);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: saved.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        assert_eq!(
+            select_collection(&store, CollectionKind::Saved).rows[1].progress_badge,
+            None
+        );
+        assert_eq!(
+            select_collection(&store, CollectionKind::Inbox).rows[1].progress_badge,
+            None
+        );
+        assert_eq!(
+            select_collection(&store, CollectionKind::Recommendations).rows[1].progress_badge,
+            None
+        );
+    }
+
+    #[test]
+    fn matching_progress_entry_shows_badge_across_all_collections_for_same_article() {
+        let mut store = Store::new();
+        let mut saved = CollectionManifestItem::empty();
+        saved.content_id.set_truncated("content-1");
+        saved.remote_revision = 7;
+        saved.meta.set_truncated("EXAMPLE / SAVED");
+        saved.title.set_truncated("Example saved title");
+        let mut inbox = CollectionManifestItem::empty();
+        inbox.content_id = saved.content_id;
+        inbox.remote_revision = 7;
+        inbox.meta.set_truncated("EXAMPLE / INBOX");
+        inbox.title.set_truncated("Example inbox title");
+        let mut recommendation = CollectionManifestItem::empty();
+        recommendation.content_id = saved.content_id;
+        recommendation.remote_item_id = saved.content_id;
+        recommendation.remote_revision = 7;
+        recommendation.detail_locator = DetailLocator::Content;
+        recommendation.meta.set_truncated("EXAMPLE / FOR YOU");
+        recommendation
+            .title
+            .set_truncated("Example recommendation title");
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Saved)
+            .try_push(saved);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Inbox)
+            .try_push(inbox);
+        let _ = store
+            .content_mut()
+            .collection_state_mut(CollectionKind::Recommendations)
+            .try_push(recommendation);
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: saved.content_id,
+                remote_revision: 7,
+                paragraph_index: 3,
+                total_paragraphs: 12,
+            });
+
+        assert_eq!(
+            select_collection(&store, CollectionKind::Saved).rows[1]
+                .progress_badge
+                .unwrap()
+                .as_str(),
+            "25%"
+        );
+        assert_eq!(
+            select_collection(&store, CollectionKind::Inbox).rows[1]
+                .progress_badge
+                .unwrap()
+                .as_str(),
+            "25%"
+        );
+        assert_eq!(
+            select_collection(&store, CollectionKind::Recommendations).rows[1]
+                .progress_badge
+                .unwrap()
+                .as_str(),
+            "25%"
+        );
     }
 }

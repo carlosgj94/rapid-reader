@@ -31,20 +31,22 @@ const RSVP_STAGE_LEFT_ANCHOR_X: i32 = 169;
 const RSVP_STAGE_RIGHT_ANCHOR_X: i32 = 173;
 const RSVP_STAGE_SCALED_LEFT_ANCHOR_X: i32 = 168;
 const RSVP_STAGE_SCALED_RIGHT_ANCHOR_X: i32 = 172;
-const LARGE_RAIL_SCALE: u32 = 2;
-const RAIL_RIGHT_EDGE_X: i32 = 400;
-const LARGE_RAIL_RIGHT_EDGE_X: i32 = RAIL_RIGHT_EDGE_X;
-const RAIL_BOTTOM_EDGE_Y: i32 = 240;
-const DASHBOARD_TEXT_RIGHT_EDGE_X: i32 = 296;
-const DASHBOARD_SLOT_TRAVEL_PX: i32 = 14;
+const LIST_REGION_X: i32 = 16;
+const LIST_REGION_WIDTH: i32 = 368;
+const DASHBOARD_TEXT_RIGHT_EDGE_X: i32 = 380;
+const DASHBOARD_SLOT_TRAVEL_PX: i32 = 18;
+const DASHBOARD_SLOT_SWAY_PX: i32 = 10;
+const DASHBOARD_BAND_RIGHT_SLOPE_PX: i32 = 18;
 const DASHBOARD_TOP_SLOT_Y: i32 = 42;
 const DASHBOARD_TOP_SLOT_HEIGHT: i32 = 40;
 const DASHBOARD_SELECTED_SLOT_Y: i32 = 82;
 const DASHBOARD_SELECTED_SLOT_HEIGHT: i32 = 60;
 const DASHBOARD_BOTTOM_SLOT_Y: i32 = 149;
 const DASHBOARD_BOTTOM_SLOT_HEIGHT: i32 = 42;
-const COLLECTION_TEXT_RIGHT_EDGE_X: i32 = 316;
-const COLLECTION_LIST_STEP_TRAVEL_PX: i32 = 16;
+const COLLECTION_TEXT_RIGHT_EDGE_X: i32 = 368;
+const COLLECTION_LIST_STEP_TRAVEL_PX: i32 = 18;
+const COLLECTION_SLOT_SWAY_PX: i32 = 6;
+const COLLECTION_BAND_RIGHT_SLOPE_PX: i32 = 12;
 const COLLECTION_TOP_SLOT_Y: i32 = 42;
 const COLLECTION_TOP_SLOT_HEIGHT: i32 = 42;
 const COLLECTION_SELECTED_SLOT_Y: i32 = 106;
@@ -57,16 +59,14 @@ const RECOMMENDATION_COLLECTION_SELECTED_SLOT_Y: i32 = 100;
 const RECOMMENDATION_COLLECTION_SELECTED_SLOT_HEIGHT: i32 = 64;
 const RECOMMENDATION_COLLECTION_BOTTOM_SLOT_Y: i32 = 167;
 const RECOMMENDATION_COLLECTION_BOTTOM_SLOT_HEIGHT: i32 = 42;
-const COLLECTION_SPINNER_CENTER_X: i32 = 350;
-const COLLECTION_SPINNER_CLIP_RIGHT_PAD: i32 = 24;
-const COLLECTION_BADGE_RIGHT_EDGE_X: i32 = 332;
-const COLLECTION_SELECTED_BADGE_RIGHT_EDGE_X: i32 = 296;
+const COLLECTION_BADGE_RIGHT_EDGE_X: i32 = 380;
+const COLLECTION_SELECTED_BADGE_RIGHT_EDGE_X: i32 = 372;
 const COLLECTION_BADGE_GAP_PX: i32 = 8;
 const COLLECTION_BADGE_MIN_WIDTH: i32 = 22;
 const COLLECTION_BADGE_HEIGHT: i32 = 15;
 const COLLECTION_BADGE_TEXT_Y_OFFSET: i32 = 2;
 const RECOMMENDATION_BAR_LEFT_BUTTON_X: i32 = 18;
-const RECOMMENDATION_BAR_RIGHT_BUTTON_X: i32 = 316;
+const RECOMMENDATION_BAR_RIGHT_BUTTON_X: i32 = 356;
 const RECOMMENDATION_BAR_BUTTON_Y: i32 = 28;
 const RECOMMENDATION_BAR_BUTTON_WIDTH: i32 = 20;
 const RECOMMENDATION_BAR_BUTTON_HEIGHT: i32 = 22;
@@ -74,7 +74,7 @@ const RECOMMENDATION_BAR_X: i32 = 44;
 const RECOMMENDATION_BAR_Y: i32 = 27;
 const RECOMMENDATION_BAR_HEIGHT: i32 = 24;
 const RECOMMENDATION_BAR_GAP_X: i32 = 6;
-const RECOMMENDATION_BAR_RIGHT_EDGE_X: i32 = 310;
+const RECOMMENDATION_BAR_RIGHT_EDGE_X: i32 = 350;
 const RECOMMENDATION_BAR_TEXT_Y_OFFSET: i32 = 7;
 const RECOMMENDATION_BAR_MIN_WIDTH: i32 = 64;
 const PARAGRAPH_SLOT_TRAVEL_PX: i32 = 18;
@@ -132,6 +132,14 @@ struct CollectionRowSlot {
     title_y: i32,
     color: BinaryColor,
     clip: ClipRect,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RowTransitionOffsets {
+    incoming_x: i32,
+    outgoing_x: i32,
+    incoming_y: i32,
+    outgoing_y: i32,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -378,14 +386,12 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
 fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, total_steps: u8) {
     draw_dashboard_chrome(frame, shell);
     draw_dashboard_row_at(frame, shell.items[0].label, dashboard_top_slot());
-    draw_selection_band(
+    draw_dashboard_selection_band(
         frame,
-        16,
+        LIST_REGION_X,
         shell.band.y,
-        320,
+        LIST_REGION_WIDTH,
         shell.band.height as i32,
-        step,
-        total_steps,
     );
     draw_dashboard_row_at(frame, shell.items[1].label, dashboard_selected_slot());
 
@@ -437,22 +443,12 @@ fn draw_dashboard_band_transition(
         step,
         total_steps,
     );
-    fill_rect(
+    draw_dashboard_selection_band(
         frame,
-        16,
+        LIST_REGION_X,
         DASHBOARD_SELECTED_SLOT_Y,
-        320,
+        LIST_REGION_WIDTH,
         DASHBOARD_SELECTED_SLOT_HEIGHT,
-        BinaryColor::On,
-    );
-    draw_selection_band(
-        frame,
-        16,
-        DASHBOARD_SELECTED_SLOT_Y,
-        320,
-        DASHBOARD_SELECTED_SLOT_HEIGHT,
-        1,
-        1,
     );
     draw_dashboard_slot_transition(
         frame,
@@ -481,13 +477,6 @@ fn draw_dashboard_chrome(frame: &mut FrameBuffer, shell: &DashboardShell) {
         shell.status.battery_percent,
         shell.status.wifi_online,
     );
-    draw_vertical_rail_scaled(
-        frame,
-        shell.rail.text,
-        LARGE_RAIL_RIGHT_EDGE_X,
-        vertical_rail_bottom_start_y(shell.rail.text, LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
-        LARGE_RAIL_SCALE,
-    );
 
     if let Some(sync_indicator) = shell.sync_indicator {
         draw_dashboard_sync_indicator(frame, sync_indicator.label, sync_indicator.spinner_phase);
@@ -515,18 +504,20 @@ fn draw_dashboard_slot_transition(
     step: u8,
     total_steps: u8,
 ) {
-    let incoming_offset = slide_offset(direction, step, total_steps, DASHBOARD_SLOT_TRAVEL_PX);
-    let outgoing_offset = match direction {
-        MotionDirection::Forward => incoming_offset - DASHBOARD_SLOT_TRAVEL_PX,
-        MotionDirection::Backward => incoming_offset + DASHBOARD_SLOT_TRAVEL_PX,
-    };
+    let (incoming_offset, outgoing_offset) =
+        paired_slide_offsets(direction, step, total_steps, DASHBOARD_SLOT_TRAVEL_PX);
+    let (incoming_x_offset, outgoing_x_offset) =
+        paired_slide_offsets(direction, step, total_steps, DASHBOARD_SLOT_SWAY_PX);
 
     draw_text_ellipsized_clipped(
         frame,
         from,
         ui_font_title(),
         ClippedTextSpec {
-            position: Point::new(slot.text_x, slot.meta_y + outgoing_offset),
+            position: Point::new(
+                slot.text_x + outgoing_x_offset,
+                slot.meta_y + outgoing_offset,
+            ),
             color: slot.color,
             alignment: Alignment::Left,
             max_width_px: DASHBOARD_TEXT_RIGHT_EDGE_X - slot.text_x,
@@ -538,7 +529,10 @@ fn draw_dashboard_slot_transition(
         to,
         ui_font_title(),
         ClippedTextSpec {
-            position: Point::new(slot.text_x, slot.meta_y + incoming_offset),
+            position: Point::new(
+                slot.text_x + incoming_x_offset,
+                slot.meta_y + incoming_offset,
+            ),
             color: slot.color,
             alignment: Alignment::Left,
             max_width_px: DASHBOARD_TEXT_RIGHT_EDGE_X - slot.text_x,
@@ -572,9 +566,9 @@ const fn collection_slot(
         title_y,
         color,
         clip: ClipRect {
-            x: 16,
+            x: LIST_REGION_X,
             y: clip_y,
-            width: 320,
+            width: LIST_REGION_WIDTH,
             height: clip_height,
         },
     }
@@ -605,8 +599,8 @@ const fn recommendation_collection_top_slot() -> CollectionRowSlot {
 const fn collection_selected_slot() -> CollectionRowSlot {
     collection_slot(
         28,
-        118,
-        135,
+        116,
+        132,
         BinaryColor::Off,
         COLLECTION_SELECTED_SLOT_Y,
         COLLECTION_SELECTED_SLOT_HEIGHT,
@@ -616,8 +610,8 @@ const fn collection_selected_slot() -> CollectionRowSlot {
 const fn recommendation_collection_selected_slot() -> CollectionRowSlot {
     collection_slot(
         28,
-        118,
-        135,
+        112,
+        128,
         BinaryColor::Off,
         RECOMMENDATION_COLLECTION_SELECTED_SLOT_Y,
         RECOMMENDATION_COLLECTION_SELECTED_SLOT_HEIGHT,
@@ -768,14 +762,12 @@ fn draw_collection(
         top_slot.color,
     );
 
-    draw_selection_band(
+    draw_collection_selection_band(
         frame,
-        16,
+        LIST_REGION_X,
         shell.band.y,
-        320,
+        LIST_REGION_WIDTH,
         shell.band.height as i32,
-        step,
-        total_steps,
     );
     draw_collection_row_at(
         frame,
@@ -832,17 +824,6 @@ fn draw_collection_chrome(frame: &mut FrameBuffer, shell: &ContentListShell) {
     );
     if let Some(bar) = shell.recommendations_bar {
         draw_recommendation_bar(frame, &bar);
-    }
-    if shell.large_rail {
-        draw_vertical_rail_scaled(
-            frame,
-            shell.rail.text,
-            LARGE_RAIL_RIGHT_EDGE_X,
-            vertical_rail_bottom_start_y(shell.rail.text, LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
-            LARGE_RAIL_SCALE,
-        );
-    } else {
-        draw_vertical_rail(frame, shell.rail.text, RAIL_RIGHT_EDGE_X, 26);
     }
 }
 
@@ -979,58 +960,31 @@ fn draw_collection_list_step_slots(
     step: u8,
     total_steps: u8,
 ) {
-    let incoming_offset =
-        slide_offset(direction, step, total_steps, COLLECTION_LIST_STEP_TRAVEL_PX);
-    let outgoing_offset = match direction {
-        MotionDirection::Forward => incoming_offset - COLLECTION_LIST_STEP_TRAVEL_PX,
-        MotionDirection::Backward => incoming_offset + COLLECTION_LIST_STEP_TRAVEL_PX,
+    let (incoming_offset, outgoing_offset) =
+        paired_slide_offsets(direction, step, total_steps, COLLECTION_LIST_STEP_TRAVEL_PX);
+    let (incoming_x_offset, outgoing_x_offset) =
+        paired_slide_offsets(direction, step, total_steps, COLLECTION_SLOT_SWAY_PX);
+    let offsets = RowTransitionOffsets {
+        incoming_x: incoming_x_offset,
+        outgoing_x: outgoing_x_offset,
+        incoming_y: incoming_offset,
+        outgoing_y: outgoing_offset,
     };
     let top_slot = collection_top_slot_for(to);
     let selected_slot = collection_selected_slot_for(to);
     let bottom_slot = collection_bottom_slot_for(to);
 
-    draw_collection_row_slot_transition(
+    draw_collection_row_slot_transition(frame, &from.rows[0], &to.rows[0], top_slot, offsets);
+    draw_collection_selection_band(
         frame,
-        &from.rows[0],
-        &to.rows[0],
-        top_slot,
-        incoming_offset,
-        outgoing_offset,
-    );
-    fill_rect(
-        frame,
-        16,
+        LIST_REGION_X,
         selected_slot.clip.y,
-        320,
+        LIST_REGION_WIDTH,
         selected_slot.clip.height,
-        BinaryColor::On,
     );
-    draw_selection_band(
-        frame,
-        16,
-        selected_slot.clip.y,
-        320,
-        selected_slot.clip.height,
-        1,
-        1,
-    );
-    draw_collection_row_slot_transition(
-        frame,
-        &from.rows[1],
-        &to.rows[1],
-        selected_slot,
-        incoming_offset,
-        outgoing_offset,
-    );
+    draw_collection_row_slot_transition(frame, &from.rows[1], &to.rows[1], selected_slot, offsets);
     draw_collection_selected_band_accent(frame);
-    draw_collection_row_slot_transition(
-        frame,
-        &from.rows[2],
-        &to.rows[2],
-        bottom_slot,
-        incoming_offset,
-        outgoing_offset,
-    );
+    draw_collection_row_slot_transition(frame, &from.rows[2], &to.rows[2], bottom_slot, offsets);
 }
 
 fn draw_collection_row_slot_transition(
@@ -1038,22 +992,33 @@ fn draw_collection_row_slot_transition(
     from: &ContentRow,
     to: &ContentRow,
     slot: CollectionRowSlot,
-    incoming_offset: i32,
-    outgoing_offset: i32,
+    offsets: RowTransitionOffsets,
 ) {
     draw_collection_row_at_clipped(
         frame,
         from,
-        Point::new(slot.text_x, slot.meta_y + outgoing_offset),
-        Point::new(slot.text_x, slot.title_y + outgoing_offset),
+        Point::new(
+            slot.text_x + offsets.outgoing_x,
+            slot.meta_y + offsets.outgoing_y,
+        ),
+        Point::new(
+            slot.text_x + offsets.outgoing_x,
+            slot.title_y + offsets.outgoing_y,
+        ),
         slot.color,
         slot.clip,
     );
     draw_collection_row_at_clipped(
         frame,
         to,
-        Point::new(slot.text_x, slot.meta_y + incoming_offset),
-        Point::new(slot.text_x, slot.title_y + incoming_offset),
+        Point::new(
+            slot.text_x + offsets.incoming_x,
+            slot.meta_y + offsets.incoming_y,
+        ),
+        Point::new(
+            slot.text_x + offsets.incoming_x,
+            slot.title_y + offsets.incoming_y,
+        ),
         slot.color,
         slot.clip,
     );
@@ -1066,11 +1031,13 @@ fn draw_collection_row_at(
     title_position: Point,
     color: BinaryColor,
 ) {
+    let meta_font = collection_meta_font(row);
+    let title_font = collection_title_font(row);
     draw_text_ellipsized(
         frame,
         row.meta.as_str(),
         meta_position,
-        ui_font_body(),
+        meta_font,
         color,
         Alignment::Left,
         COLLECTION_TEXT_RIGHT_EDGE_X - meta_position.x,
@@ -1079,21 +1046,13 @@ fn draw_collection_row_at(
         frame,
         row.title.as_str(),
         title_position,
-        ui_font_body(),
+        title_font,
         color,
         Alignment::Left,
         collection_title_right_edge(row) - title_position.x,
     );
 
-    if let Some(spinner_phase) = row.loading_phase {
-        draw_collection_loading_spinner(
-            frame,
-            spinner_phase,
-            collection_spinner_center(meta_position, title_position),
-            color,
-            None,
-        );
-    } else if let Some(label) = row.progress_badge {
+    if let Some(label) = row.progress_badge {
         draw_collection_progress_badge(frame, label.as_str(), title_position, row, None);
     }
 }
@@ -1108,10 +1067,12 @@ fn draw_collection_row_at_clipped(
     color: BinaryColor,
     clip: ClipRect,
 ) {
+    let meta_font = collection_meta_font(row);
+    let title_font = collection_title_font(row);
     draw_text_ellipsized_clipped(
         frame,
         row.meta.as_str(),
-        ui_font_body(),
+        meta_font,
         ClippedTextSpec {
             position: meta_position,
             color,
@@ -1123,7 +1084,7 @@ fn draw_collection_row_at_clipped(
     draw_text_ellipsized_clipped(
         frame,
         row.title.as_str(),
-        ui_font_body(),
+        title_font,
         ClippedTextSpec {
             position: title_position,
             color,
@@ -1133,15 +1094,7 @@ fn draw_collection_row_at_clipped(
         clip,
     );
 
-    if let Some(spinner_phase) = row.loading_phase {
-        draw_collection_loading_spinner(
-            frame,
-            spinner_phase,
-            collection_spinner_center(meta_position, title_position),
-            color,
-            Some(collection_spinner_clip(clip)),
-        );
-    } else if let Some(label) = row.progress_badge {
+    if let Some(label) = row.progress_badge {
         draw_collection_progress_badge(
             frame,
             label.as_str(),
@@ -1152,19 +1105,15 @@ fn draw_collection_row_at_clipped(
     }
 }
 
-fn collection_spinner_center(meta_position: Point, title_position: Point) -> Point {
-    Point::new(
-        COLLECTION_SPINNER_CENTER_X,
-        meta_position.y + ((title_position.y - meta_position.y) / 2) + 2,
-    )
+fn collection_meta_font(_row: &ContentRow) -> &'static MonoFont<'static> {
+    ui_font_small()
 }
 
-const fn collection_spinner_clip(clip: ClipRect) -> ClipRect {
-    ClipRect {
-        x: clip.x,
-        y: clip.y,
-        width: clip.width + COLLECTION_SPINNER_CLIP_RIGHT_PAD,
-        height: clip.height,
+fn collection_title_font(row: &ContentRow) -> &'static MonoFont<'static> {
+    if row.selected {
+        ui_font_title()
+    } else {
+        ui_font_body()
     }
 }
 
@@ -1172,10 +1121,6 @@ fn collection_title_right_edge(row: &ContentRow) -> i32 {
     let Some(label) = row.progress_badge else {
         return COLLECTION_TEXT_RIGHT_EDGE_X;
     };
-    if row.loading_phase.is_some() {
-        return COLLECTION_TEXT_RIGHT_EDGE_X;
-    }
-
     collection_badge_left_x(row, label.as_str()) - COLLECTION_BADGE_GAP_PX
 }
 
@@ -1197,7 +1142,7 @@ fn draw_collection_progress_badge(
 ) {
     let width = collection_badge_width(label);
     let x = collection_badge_left_x(row, label);
-    let y = title_position.y - 1;
+    let y = collection_badge_y(row, title_position);
 
     fill_rect_clipped(
         frame,
@@ -1228,6 +1173,14 @@ fn draw_collection_progress_badge(
     );
 }
 
+const fn collection_badge_y(row: &ContentRow, title_position: Point) -> i32 {
+    if row.selected {
+        title_position.y + 2
+    } else {
+        title_position.y - 1
+    }
+}
+
 fn collection_badge_width(label: &str) -> i32 {
     (mono_text_width_px(label, ui_font_small(), 1) + 10).max(COLLECTION_BADGE_MIN_WIDTH)
 }
@@ -1241,32 +1194,6 @@ const fn collection_badge_right_edge(row: &ContentRow) -> i32 {
         COLLECTION_SELECTED_BADGE_RIGHT_EDGE_X
     } else {
         COLLECTION_BADGE_RIGHT_EDGE_X
-    }
-}
-
-fn draw_collection_loading_spinner(
-    frame: &mut FrameBuffer,
-    spinner_phase: u8,
-    center: Point,
-    color: BinaryColor,
-    clip: Option<ClipRect>,
-) {
-    fill_rect_clipped(frame, center.x - 1, center.y - 1, 3, 3, color, clip);
-
-    for (x, y) in [
-        (center.x, center.y - 4),
-        (center.x + 4, center.y),
-        (center.x, center.y + 4),
-        (center.x - 4, center.y),
-    ] {
-        fill_rect_clipped(frame, x, y, 1, 1, color, clip);
-    }
-
-    match spinner_phase % 4 {
-        0 => fill_rect_clipped(frame, center.x - 1, center.y - 6, 3, 3, color, clip),
-        1 => fill_rect_clipped(frame, center.x + 4, center.y - 1, 3, 3, color, clip),
-        2 => fill_rect_clipped(frame, center.x - 1, center.y + 4, 3, 3, color, clip),
-        _ => fill_rect_clipped(frame, center.x - 6, center.y - 1, 3, 3, color, clip),
     }
 }
 
@@ -2332,80 +2259,6 @@ fn draw_text_pair_slot_clipped(
     }
 }
 
-fn draw_vertical_rail(frame: &mut FrameBuffer, text: &str, right_edge: i32, y: i32) {
-    draw_vertical_rail_lines(frame, text, right_edge, y, 1);
-}
-
-fn draw_vertical_rail_scaled(
-    frame: &mut FrameBuffer,
-    text: &str,
-    right_edge: i32,
-    y: i32,
-    scale: u32,
-) {
-    draw_vertical_rail_lines(frame, text, right_edge, y, scale.max(1));
-}
-
-fn draw_vertical_rail_lines(
-    frame: &mut FrameBuffer,
-    text: &str,
-    right_edge: i32,
-    start_y: i32,
-    scale: u32,
-) {
-    let scale = scale.max(1);
-    let mut y = start_y;
-    let line_step = vertical_rail_line_step(scale);
-
-    for line in text.lines() {
-        if !line.is_empty() {
-            if scale == 1 {
-                draw_text_right(
-                    frame,
-                    line,
-                    Point::new(right_edge, y),
-                    ui_font_title(),
-                    BinaryColor::On,
-                );
-            } else {
-                draw_text_right_scaled(
-                    frame,
-                    line,
-                    Point::new(right_edge, y),
-                    ui_font_title(),
-                    BinaryColor::On,
-                    scale,
-                );
-            }
-        }
-
-        y += line_step;
-    }
-}
-
-fn vertical_rail_line_step(scale: u32) -> i32 {
-    let scale = scale.max(1) as i32;
-    let base_height = ui_font_title().character_size.height as i32 * scale;
-    (base_height - (3 * scale)).max(scale)
-}
-
-fn vertical_rail_block_height(text: &str, scale: u32) -> i32 {
-    let line_count = text.lines().count() as i32;
-    if line_count <= 0 {
-        return 0;
-    }
-
-    let scale = scale.max(1);
-    let glyph_height = ui_font_title().character_size.height as i32 * scale as i32;
-    let line_step = vertical_rail_line_step(scale);
-
-    glyph_height + (line_count - 1) * line_step
-}
-
-fn vertical_rail_bottom_start_y(text: &str, scale: u32, bottom_edge: i32) -> i32 {
-    bottom_edge - vertical_rail_block_height(text, scale)
-}
-
 const fn paragraph_tick_offset(index: u8) -> i32 {
     match index {
         0 => 0,
@@ -2470,7 +2323,14 @@ fn draw_value_pulse(frame: &mut FrameBuffer, step: u8, total_steps: u8) {
 
 fn draw_row_flash(frame: &mut FrameBuffer, y: i32, height: i32, step: u8, total_steps: u8) {
     if step == total_steps / 2 {
-        fill_rect(frame, 20, y, 320, height, BinaryColor::On);
+        fill_rect(
+            frame,
+            LIST_REGION_X,
+            y,
+            LIST_REGION_WIDTH,
+            height,
+            BinaryColor::On,
+        );
     }
 }
 
@@ -2507,6 +2367,30 @@ fn draw_back_chevron(frame: &mut FrameBuffer, x: i32, y: i32) {
 fn draw_live_dot(frame: &mut FrameBuffer, x: i32, y: i32, visible: bool) {
     if visible {
         fill_rect(frame, x, y, 6, 6, BinaryColor::On);
+    }
+}
+
+fn draw_dashboard_selection_band(frame: &mut FrameBuffer, x: i32, y: i32, width: i32, height: i32) {
+    fill_slanted_band(frame, x, y, width, height, DASHBOARD_BAND_RIGHT_SLOPE_PX);
+}
+
+fn draw_collection_selection_band(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    fill_slanted_band(frame, x, y, width, height, COLLECTION_BAND_RIGHT_SLOPE_PX);
+}
+
+fn fill_slanted_band(frame: &mut FrameBuffer, x: i32, y: i32, width: i32, height: i32, slope: i32) {
+    let rows = height.max(1);
+    let mut row = 0;
+    while row < height {
+        let right_cut = (slope * row) / rows;
+        frame.fill_span(x, y + row, width - right_cut, true);
+        row += 1;
     }
 }
 
@@ -2984,15 +2868,46 @@ fn mono_text_width_px(
     normalized_text(text).chars().count() as i32 * char_width
 }
 
+fn paired_slide_offsets(
+    direction: MotionDirection,
+    step: u8,
+    total_steps: u8,
+    amplitude: i32,
+) -> (i32, i32) {
+    let incoming = slide_offset(direction, step, total_steps, amplitude);
+    let outgoing = match direction {
+        MotionDirection::Forward => incoming - amplitude,
+        MotionDirection::Backward => incoming + amplitude,
+    };
+
+    (incoming, outgoing)
+}
+
 fn slide_offset(direction: MotionDirection, step: u8, total_steps: u8, amplitude: i32) -> i32 {
-    let remaining = total_steps.saturating_sub(step) as i32;
-    let total = total_steps.max(1) as i32;
-    let offset = (amplitude * remaining) / total;
+    let progress = ease_out_quad_permille(step, total_steps) as i32;
+    let remaining = 1000 - progress;
+    let offset = (amplitude * remaining) / 1000;
 
     match direction {
         MotionDirection::Forward => offset,
         MotionDirection::Backward => -offset,
     }
+}
+
+const fn ease_out_quad_permille(step: u8, total_steps: u8) -> u16 {
+    if total_steps == 0 {
+        return 1000;
+    }
+
+    let clamped_step = if step > total_steps {
+        total_steps
+    } else {
+        step
+    } as u32;
+    let total = total_steps as u32;
+    let t = (clamped_step * 1000) / total;
+    let inv = 1000 - t;
+    (1000 - ((inv * inv) / 1000)) as u16
 }
 
 const fn lerp_u32(start: u32, end: u32, step: u8, total_steps: u8) -> u32 {
@@ -3181,13 +3096,6 @@ mod tests {
     }
 
     fn make_collection_shell(rows: [(&str, &str); 3]) -> ContentListShell {
-        make_collection_shell_with_spinner(rows, None)
-    }
-
-    fn make_collection_shell_with_spinner(
-        rows: [(&str, &str); 3],
-        selected_spinner_phase: Option<u8>,
-    ) -> ContentListShell {
         ContentListShell {
             appearance: AppearanceMode::Light,
             status: StatusCluster {
@@ -3204,31 +3112,27 @@ mod tests {
                     meta: InlineText::from_slice(rows[0].0),
                     title: InlineText::from_slice(rows[0].1),
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: false,
                 },
                 ContentRow {
                     meta: InlineText::from_slice(rows[1].0),
                     title: InlineText::from_slice(rows[1].1),
                     progress_badge: None,
-                    loading_phase: selected_spinner_phase,
+                    is_fetching: false,
                     selected: true,
                 },
                 ContentRow {
                     meta: InlineText::from_slice(rows[2].0),
                     title: InlineText::from_slice(rows[2].1),
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: false,
                 },
             ],
             band: SelectionBand { y: 106, height: 68 },
             help: HelpHint { text: "BACK" },
         }
-    }
-
-    fn column_has_lit_pixel(frame: &FrameBuffer, x: usize) -> bool {
-        (0..240).any(|y| frame.pixel(x, y) == Some(true))
     }
 
     #[test]
@@ -3385,18 +3289,6 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_rail_reaches_right_edge() {
-        let mut frame = FrameBuffer::new();
-
-        draw_prepared_screen(
-            &mut frame,
-            &PreparedScreen::Dashboard(make_dashboard_shell(0)),
-        );
-
-        assert!(column_has_lit_pixel(&frame, 399));
-    }
-
-    #[test]
     fn dashboard_transition_frames_stay_within_visible_rows() {
         let from = make_dashboard_shell_with_labels(0, ["INBOX", "SAVED", "RECS"]);
         let to = make_dashboard_shell_with_labels(0, ["SAVED", "RECS", "SETTINGS"]);
@@ -3436,63 +3328,27 @@ mod tests {
     }
 
     #[test]
-    fn collection_row_spinner_dirty_rows_stay_localized() {
-        let rows = [
-            ("SOURCE", "Previous item"),
-            ("SOURCE", "Fetching item"),
-            ("SOURCE", "Next item"),
-        ];
-        let mut committed = FrameBuffer::new();
-        let mut working = FrameBuffer::new();
-
-        draw_prepared_screen(
-            &mut committed,
-            &PreparedScreen::Collection(make_collection_shell_with_spinner(rows, Some(0))),
-        );
-        draw_prepared_screen(
-            &mut working,
-            &PreparedScreen::Collection(make_collection_shell_with_spinner(rows, Some(1))),
-        );
-
-        let dirty = diff_dirty_rows(&committed, &working);
-
-        assert!(dirty.count() <= 16);
-        for row in dirty.iter() {
-            assert!((122..136).contains(&row), "unexpected dirty row {row}");
-        }
-    }
-
-    #[test]
-    fn saved_rail_reaches_right_edge() {
+    fn dashboard_transition_keeps_selected_band_slanted() {
+        let from = make_dashboard_shell_with_labels(0, ["INBOX", "SAVED", "RECS"]);
+        let to = make_dashboard_shell_with_labels(0, ["SAVED", "RECS", "SETTINGS"]);
+        let step_2 = AnimationPlayback {
+            from: PreparedScreen::Dashboard(from),
+            to: PreparedScreen::Dashboard(to),
+            screen: Screen::Dashboard,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::BandReveal(MotionDirection::Forward),
+                4,
+                42,
+            ),
+            step: 2,
+        };
         let mut frame = FrameBuffer::new();
-        let rows = [
-            ("SOURCE", "Previous item"),
-            ("SOURCE", "Current item"),
-            ("SOURCE", "Next item"),
-        ];
 
-        draw_prepared_screen(
-            &mut frame,
-            &PreparedScreen::Collection(make_collection_shell(rows)),
-        );
+        draw_transition_frame(&mut frame, &step_2);
 
-        assert!(column_has_lit_pixel(&frame, 399));
-    }
-
-    #[test]
-    fn large_rails_are_bottom_aligned() {
-        assert_eq!(
-            vertical_rail_bottom_start_y("M\nO\nT\nI\nF", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
-            64
-        );
-        assert_eq!(
-            vertical_rail_bottom_start_y("I\nN\nB\nO\nX", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
-            64
-        );
-        assert_eq!(
-            vertical_rail_bottom_start_y("S\nA\nV\nE\nD", LARGE_RAIL_SCALE, RAIL_BOTTOM_EDGE_Y),
-            64
-        );
+        assert_eq!(frame.pixel(380, 88), Some(true));
+        assert_eq!(frame.pixel(380, 136), Some(false));
+        assert_eq!(frame.pixel(366, 136), Some(true));
     }
 
     #[test]
@@ -3522,6 +3378,38 @@ mod tests {
         for row in dirty.iter() {
             assert!((42..221).contains(&row), "unexpected dirty row {row}");
         }
+    }
+
+    #[test]
+    fn collection_transition_keeps_selected_band_slanted() {
+        let from = make_collection_shell([("meta-a", "A"), ("meta-b", "B"), ("meta-c", "C")]);
+        let to = make_collection_shell([("meta-b", "B"), ("meta-c", "C"), ("meta-d", "D")]);
+        let step_2 = AnimationPlayback {
+            from: PreparedScreen::Collection(from),
+            to: PreparedScreen::Collection(to),
+            screen: Screen::Saved,
+            plan: TransitionPlan::new(
+                AnimationDescriptor::ListStep(MotionDirection::Forward),
+                4,
+                46,
+            ),
+            step: 2,
+        };
+        let mut frame = FrameBuffer::new();
+
+        draw_transition_frame(&mut frame, &step_2);
+
+        assert_eq!(frame.pixel(380, 112), Some(true));
+        assert_eq!(frame.pixel(380, 168), Some(false));
+        assert_eq!(frame.pixel(372, 168), Some(true));
+    }
+
+    #[test]
+    fn list_layout_expands_into_removed_rail_space() {
+        assert_eq!(LIST_REGION_WIDTH, 368);
+        assert_eq!(DASHBOARD_TEXT_RIGHT_EDGE_X, 380);
+        assert_eq!(COLLECTION_TEXT_RIGHT_EDGE_X, 368);
+        assert_eq!(COLLECTION_BADGE_RIGHT_EDGE_X, 380);
     }
 
     #[test]

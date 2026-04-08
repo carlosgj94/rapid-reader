@@ -58,7 +58,7 @@ pub struct ContentRow {
     pub meta: domain::text::InlineText<CONTENT_META_MAX_BYTES>,
     pub title: domain::text::InlineText<CONTENT_TITLE_MAX_BYTES>,
     pub progress_badge: Option<domain::text::InlineText<8>>,
-    pub loading_phase: Option<u8>,
+    pub is_fetching: bool,
     pub selected: bool,
 }
 
@@ -302,21 +302,21 @@ fn compose_collection(model: ContentListScreenModel) -> ContentListShell {
                 meta: model.rows[0].meta,
                 title: model.rows[0].title,
                 progress_badge: model.rows[0].progress_badge,
-                loading_phase: model.rows[0].loading_phase,
+                is_fetching: model.rows[0].is_fetching,
                 selected: false,
             },
             ContentRow {
                 meta: model.rows[1].meta,
                 title: model.rows[1].title,
                 progress_badge: model.rows[1].progress_badge,
-                loading_phase: model.rows[1].loading_phase,
+                is_fetching: model.rows[1].is_fetching,
                 selected: true,
             },
             ContentRow {
                 meta: model.rows[2].meta,
                 title: model.rows[2].title,
                 progress_badge: model.rows[2].progress_badge,
-                loading_phase: model.rows[2].loading_phase,
+                is_fetching: model.rows[2].is_fetching,
                 selected: false,
             },
         ],

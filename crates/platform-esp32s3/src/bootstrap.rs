@@ -911,9 +911,7 @@ fn reader_ticks_are_active(
 
 fn prepared_screen_shows_collection_fetch(screen: &PreparedScreen) -> bool {
     match screen {
-        PreparedScreen::Collection(shell) => {
-            shell.rows.iter().any(|row| row.loading_phase.is_some())
-        }
+        PreparedScreen::Collection(shell) => shell.rows.iter().any(|row| row.is_fetching),
         _ => false,
     }
 }
@@ -1375,21 +1373,21 @@ mod tests {
                         meta: "A",
                         title: "A",
                         progress_badge: None,
-                        loading_phase: None,
+                        is_fetching: false,
                         selected: false,
                     },
                     app_runtime::components::ContentRow {
                         meta: "B",
                         title: "B",
                         progress_badge: None,
-                        loading_phase: None,
+                        is_fetching: false,
                         selected: true,
                     },
                     app_runtime::components::ContentRow {
                         meta: "C",
                         title: "C",
                         progress_badge: None,
-                        loading_phase: None,
+                        is_fetching: false,
                         selected: false,
                     },
                 ],
@@ -1485,21 +1483,21 @@ mod tests {
                     meta: "SOURCE",
                     title: "Previous",
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: false,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Fetching",
                     progress_badge: None,
-                    loading_phase: Some(2),
+                    is_fetching: true,
                     selected: true,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Next",
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: false,
                 },
             ],
@@ -1528,21 +1526,21 @@ mod tests {
                     meta: "SOURCE",
                     title: "Previous",
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: false,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Current",
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: true,
                 },
                 app_runtime::components::ContentRow {
                     meta: "SOURCE",
                     title: "Next",
                     progress_badge: None,
-                    loading_phase: None,
+                    is_fetching: false,
                     selected: false,
                 },
             ],

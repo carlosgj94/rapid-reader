@@ -82,7 +82,7 @@ fn plan_transition(
             PreparedScreen::Dashboard(old),
             PreparedScreen::Dashboard(new),
         ) if old.items[1].label != new.items[1].label => {
-            T::new(A::BandReveal(direction_for_dashboard(old, new)), 3, 50)
+            T::new(A::BandReveal(direction_for_dashboard(old, new)), 4, 42)
         }
         (
             old_screen,
@@ -90,7 +90,7 @@ fn plan_transition(
             PreparedScreen::Collection(old),
             PreparedScreen::Collection(new),
         ) if old_screen == new_screen && old.rows[1].title != new.rows[1].title => {
-            T::new(A::ListStep(direction_for_rows(old, new)), 3, 55)
+            T::new(A::ListStep(direction_for_rows(old, new)), 4, 46)
         }
         (old_screen, Screen::Reader, _, PreparedScreen::Reader(_))
             if is_collection_screen(old_screen) =>
