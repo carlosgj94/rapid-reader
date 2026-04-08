@@ -12,6 +12,29 @@ pub enum SyncStatus {
     Uninitialized,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StartupSyncProgress {
+    pub completed_queries: u8,
+    pub total_queries: u8,
+}
+
+impl StartupSyncProgress {
+    pub const fn new(completed_queries: u8, total_queries: u8) -> Self {
+        Self {
+            completed_queries,
+            total_queries,
+        }
+    }
+
+    pub const fn clamped_completed(self) -> u8 {
+        if self.completed_queries > self.total_queries {
+            self.total_queries
+        } else {
+            self.completed_queries
+        }
+    }
+}
+
 impl SyncStatus {
     pub const fn is_active(self) -> bool {
         matches!(

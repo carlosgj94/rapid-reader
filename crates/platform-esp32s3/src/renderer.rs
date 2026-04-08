@@ -4,7 +4,7 @@ use app_runtime::{
     AnimationDescriptor, MotionDirection, PreparedScreen, Screen, ScreenUpdate, TransitionPlan,
     components::{
         ContentListShell, ContentRow, DashboardShell, LoadingModal, ParagraphNavigationShell,
-        PauseModal, ReaderModal, ReaderShell, RecommendationBar, SettingsShell,
+        PauseModal, ReaderModal, ReaderShell, RecommendationBar, SettingsShell, StartupSplashShell,
         TopicPreferenceGrid,
     },
 };
@@ -100,13 +100,23 @@ const PAUSE_MODAL_CENTER_Y: i32 = 118;
 const PAUSE_MODAL_MIN_WIDTH: u32 = 112;
 const PAUSE_MODAL_MIN_HEIGHT: u32 = 52;
 const PAUSE_MODAL_MAX_WIDTH: u32 = 286;
-const PAUSE_MODAL_MAX_HEIGHT: u32 = 166;
+const PAUSE_MODAL_MAX_HEIGHT: u32 = 188;
 const PAUSE_MODAL_CONTENT_OFFSET_PX: i32 = 8;
 const READER_TEXT_LEFT_X: i32 = 20;
 const READER_TEXT_RIGHT_X: i32 = 380;
 const READER_TITLE_MAX_WIDTH_PX: i32 = READER_TEXT_RIGHT_X - READER_TEXT_LEFT_X;
 const READER_FOOTER_WPM_GAP_PX: i32 = 16;
 const READER_PREVIEW_Y: i32 = 214;
+const STARTUP_WORDMARK_X: i32 = 44;
+const STARTUP_WORDMARK_Y: i32 = 54;
+const STARTUP_WORDMARK_HEIGHT: i32 = 88;
+const STARTUP_WORDMARK_GAP_X: i32 = 8;
+const STARTUP_WORDMARK_STROKE_RADIUS: i32 = 13;
+const STARTUP_LOADING_BAR_X: i32 = 82;
+const STARTUP_LOADING_BAR_Y: i32 = 168;
+const STARTUP_LOADING_BAR_WIDTH: i32 = 244;
+const STARTUP_LOADING_BAR_HEIGHT: i32 = 16;
+const STARTUP_SKIP_HINT_Y: i32 = 205;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct StageTextSpec {
@@ -238,6 +248,7 @@ fn draw_prepared_screen_base(frame: &mut FrameBuffer, screen: &PreparedScreen) {
     frame.clear(false);
 
     match screen {
+        PreparedScreen::StartupSplash(shell) => draw_startup_splash(frame, shell),
         PreparedScreen::Dashboard(shell) => draw_dashboard(frame, shell, 1, 1),
         PreparedScreen::Collection(shell) => draw_collection(frame, shell, 1, 1, 0),
         PreparedScreen::Reader(shell) => draw_reader(frame, shell, 1, 1),
@@ -381,6 +392,42 @@ pub fn draw_transition_frame(frame: &mut FrameBuffer, playback: &AnimationPlayba
     }
 
     apply_theme(frame, playback.to.appearance());
+}
+
+fn draw_startup_splash(frame: &mut FrameBuffer, shell: &StartupSplashShell) {
+    draw_startup_wordmark(frame);
+    stroke_rect(
+        frame,
+        STARTUP_LOADING_BAR_X,
+        STARTUP_LOADING_BAR_Y,
+        STARTUP_LOADING_BAR_WIDTH,
+        STARTUP_LOADING_BAR_HEIGHT,
+        BinaryColor::On,
+    );
+    draw_barberpole_fill(
+        frame,
+        STARTUP_LOADING_BAR_X + 4,
+        STARTUP_LOADING_BAR_Y + 4,
+        shell
+            .progress_width
+            .min((STARTUP_LOADING_BAR_WIDTH - 8).max(0) as u16) as i32,
+        STARTUP_LOADING_BAR_HEIGHT - 8,
+        shell.stripe_phase,
+        ClipRect {
+            x: STARTUP_LOADING_BAR_X + 4,
+            y: STARTUP_LOADING_BAR_Y + 4,
+            width: STARTUP_LOADING_BAR_WIDTH - 8,
+            height: STARTUP_LOADING_BAR_HEIGHT - 8,
+        },
+    );
+    draw_text(
+        frame,
+        shell.skip_hint,
+        Point::new(200, STARTUP_SKIP_HINT_Y),
+        ui_font_small(),
+        BinaryColor::On,
+        Alignment::Center,
+    );
 }
 
 fn draw_dashboard(frame: &mut FrameBuffer, shell: &DashboardShell, step: u8, total_steps: u8) {
@@ -1321,12 +1368,17 @@ fn draw_pause_modal_transition(
     total_steps: u8,
     revealing: bool,
 ) {
-    let phase = if revealing {
+    let full_modal_step_count = total_steps.max(3);
+    let phase = if total_steps <= 1 {
+        full_modal_step_count
+    } else if revealing {
         step
     } else {
         total_steps.saturating_sub(step).saturating_add(1)
     };
-    let content_phase = if revealing {
+    let content_phase = if total_steps <= 1 {
+        3
+    } else if revealing {
         phase
     } else {
         total_steps.saturating_sub(step)
@@ -1340,13 +1392,13 @@ fn draw_pause_modal_transition(
         PAUSE_MODAL_MIN_WIDTH,
         PAUSE_MODAL_MAX_WIDTH,
         phase,
-        total_steps,
+        full_modal_step_count,
     );
     let height = lerp_u32(
         PAUSE_MODAL_MIN_HEIGHT,
         PAUSE_MODAL_MAX_HEIGHT,
         phase,
-        total_steps,
+        full_modal_step_count,
     );
     let x = PAUSE_MODAL_CENTER_X - (width as i32 / 2);
     let y = PAUSE_MODAL_CENTER_Y - (height as i32 / 2);
@@ -1359,7 +1411,12 @@ fn draw_pause_modal_transition(
     let content_offset = ((total_steps.saturating_sub(content_phase) as i32)
         * PAUSE_MODAL_CONTENT_OFFSET_PX)
         / total_steps.max(1) as i32;
-    let divider_width = lerp_u32(0, width.saturating_sub(32), content_phase, total_steps) as i32;
+    let divider_width = lerp_u32(
+        0,
+        width.saturating_sub(32),
+        content_phase,
+        full_modal_step_count,
+    ) as i32;
 
     fill_rect(frame, x, y, width as i32, height as i32, BinaryColor::On);
     stroke_rect(frame, x, y, width as i32, height as i32, BinaryColor::Off);
@@ -1395,18 +1452,26 @@ fn draw_pause_modal_transition(
             Point::new(x + 18, y + 60 + content_offset),
             clip,
         );
+        draw_pause_modal_row(
+            frame,
+            &modal.rows[1],
+            Point::new(x + 18, y + 86 + content_offset),
+            clip,
+        );
     }
     if content_phase >= 2 {
         draw_pause_modal_row(
             frame,
-            &modal.rows[1],
-            Point::new(x + 18, y + 88 + content_offset),
+            &modal.rows[2],
+            Point::new(x + 18, y + 112 + content_offset),
             clip,
         );
+    }
+    if content_phase >= 3 {
         draw_pause_modal_row(
             frame,
-            &modal.rows[2],
-            Point::new(x + 18, y + 116 + content_offset),
+            &modal.rows[3],
+            Point::new(x + 18, y + 138 + content_offset),
             clip,
         );
     }
@@ -1418,6 +1483,63 @@ fn draw_pause_modal_row(
     position: Point,
     clip: ClipRect,
 ) {
+    let row_width = 258;
+    let row_height = 18;
+    let row_y = position.y - 4;
+
+    if row.selected {
+        let frame_color = BinaryColor::On;
+        let fill_color = BinaryColor::Off;
+        let text_color = BinaryColor::On;
+
+        fill_rect_clipped(
+            frame,
+            position.x - 12,
+            row_y,
+            row_width,
+            row_height,
+            fill_color,
+            Some(clip),
+        );
+        stroke_rect_clipped(
+            frame,
+            position.x - 12,
+            row_y,
+            row_width,
+            row_height,
+            frame_color,
+            Some(clip),
+        );
+        draw_text_ellipsized_clipped(
+            frame,
+            row.label,
+            ui_font_small(),
+            ClippedTextSpec {
+                position,
+                color: text_color,
+                alignment: Alignment::Left,
+                max_width_px: if row.action.is_empty() { 230 } else { 126 },
+            },
+            clip,
+        );
+        if !row.action.is_empty() {
+            draw_text_ellipsized_clipped(
+                frame,
+                row.action,
+                ui_font_small(),
+                ClippedTextSpec {
+                    position: Point::new(position.x + 138, position.y),
+                    color: text_color,
+                    alignment: Alignment::Left,
+                    max_width_px: 92,
+                },
+                clip,
+            );
+        }
+
+        return;
+    }
+
     draw_text_ellipsized_clipped(
         frame,
         row.label,
@@ -1426,22 +1548,24 @@ fn draw_pause_modal_row(
             position,
             color: BinaryColor::Off,
             alignment: Alignment::Left,
-            max_width_px: 140,
+            max_width_px: if row.action.is_empty() { 230 } else { 126 },
         },
         clip,
     );
-    draw_text_ellipsized_clipped(
-        frame,
-        row.action,
-        ui_font_small(),
-        ClippedTextSpec {
-            position: Point::new(position.x + 148, position.y),
-            color: BinaryColor::Off,
-            alignment: Alignment::Left,
-            max_width_px: 110,
-        },
-        clip,
-    );
+    if !row.action.is_empty() {
+        draw_text_ellipsized_clipped(
+            frame,
+            row.action,
+            ui_font_small(),
+            ClippedTextSpec {
+                position: Point::new(position.x + 138, position.y),
+                color: BinaryColor::Off,
+                alignment: Alignment::Left,
+                max_width_px: 92,
+            },
+            clip,
+        );
+    }
 }
 
 fn draw_loading_modal_transition(
@@ -2321,6 +2445,301 @@ fn draw_value_pulse(frame: &mut FrameBuffer, step: u8, total_steps: u8) {
     fill_rect(frame, 238, 48, width, 16, BinaryColor::On);
 }
 
+fn draw_startup_wordmark(frame: &mut FrameBuffer) {
+    let top = STARTUP_WORDMARK_Y;
+    let bottom = STARTUP_WORDMARK_Y + STARTUP_WORDMARK_HEIGHT;
+    let mut cursor_x = STARTUP_WORDMARK_X;
+
+    cursor_x = draw_startup_letter_m(frame, cursor_x, top, bottom) + STARTUP_WORDMARK_GAP_X;
+    cursor_x = draw_startup_letter_o(frame, cursor_x, top, bottom) + STARTUP_WORDMARK_GAP_X;
+    cursor_x = draw_startup_letter_t(frame, cursor_x, top, bottom) + STARTUP_WORDMARK_GAP_X;
+    cursor_x = draw_startup_letter_i(frame, cursor_x, top, bottom) + STARTUP_WORDMARK_GAP_X;
+    let right_edge = draw_startup_letter_f(frame, cursor_x, top, bottom);
+
+    apply_startup_wordmark_dither(
+        frame,
+        STARTUP_WORDMARK_X - 4,
+        top - 4,
+        right_edge + 4,
+        bottom + 4,
+    );
+}
+
+fn draw_startup_letter_m(frame: &mut FrameBuffer, left: i32, top: i32, bottom: i32) -> i32 {
+    let radius = STARTUP_WORDMARK_STROKE_RADIUS;
+
+    draw_blob_line(
+        frame,
+        left + 12,
+        top + 18,
+        left + 8,
+        bottom - 10,
+        radius,
+        BinaryColor::On,
+    );
+    draw_blob_line(
+        frame,
+        left + 78,
+        top + 18,
+        left + 82,
+        bottom - 10,
+        radius,
+        BinaryColor::On,
+    );
+    draw_blob_line(
+        frame,
+        left + 22,
+        top + 16,
+        left + 42,
+        bottom - 22,
+        radius - 1,
+        BinaryColor::On,
+    );
+    draw_blob_line(
+        frame,
+        left + 68,
+        top + 16,
+        left + 48,
+        bottom - 20,
+        radius - 1,
+        BinaryColor::On,
+    );
+
+    fill_circle(frame, left + 14, top + 14, radius + 2, BinaryColor::On);
+    fill_circle(frame, left + 76, top + 14, radius + 2, BinaryColor::On);
+    fill_circle(frame, left + 14, bottom - 8, radius + 1, BinaryColor::On);
+    fill_circle(frame, left + 78, bottom - 8, radius + 1, BinaryColor::On);
+
+    left + 92
+}
+
+fn draw_startup_letter_o(frame: &mut FrameBuffer, left: i32, top: i32, bottom: i32) -> i32 {
+    let center_y = (top + bottom) / 2 + 4;
+
+    fill_ellipse(frame, left + 29, center_y, 28, 32, BinaryColor::On);
+    fill_circle(frame, left + 16, center_y - 8, 10, BinaryColor::On);
+    fill_circle(frame, left + 38, center_y + 10, 9, BinaryColor::On);
+    fill_ellipse(frame, left + 29, center_y, 13, 16, BinaryColor::Off);
+
+    left + 58
+}
+
+fn draw_startup_letter_t(frame: &mut FrameBuffer, left: i32, top: i32, bottom: i32) -> i32 {
+    let radius = STARTUP_WORDMARK_STROKE_RADIUS - 1;
+
+    draw_blob_line(
+        frame,
+        left + 6,
+        top + 18,
+        left + 44,
+        top + 18,
+        radius,
+        BinaryColor::On,
+    );
+    draw_blob_line(
+        frame,
+        left + 28,
+        top + 12,
+        left + 28,
+        bottom - 8,
+        radius,
+        BinaryColor::On,
+    );
+    fill_circle(frame, left + 24, bottom - 8, radius, BinaryColor::On);
+
+    left + 52
+}
+
+fn draw_startup_letter_i(frame: &mut FrameBuffer, left: i32, top: i32, bottom: i32) -> i32 {
+    let radius = STARTUP_WORDMARK_STROKE_RADIUS - 2;
+
+    fill_circle(frame, left + 14, top + 6, radius, BinaryColor::On);
+    draw_blob_line(
+        frame,
+        left + 14,
+        top + 34,
+        left + 14,
+        bottom - 8,
+        radius + 1,
+        BinaryColor::On,
+    );
+
+    left + 30
+}
+
+fn draw_startup_letter_f(frame: &mut FrameBuffer, left: i32, top: i32, bottom: i32) -> i32 {
+    let radius = STARTUP_WORDMARK_STROKE_RADIUS - 1;
+
+    fill_circle(frame, left + 22, top + 12, radius + 2, BinaryColor::On);
+    draw_blob_line(
+        frame,
+        left + 18,
+        top + 16,
+        left + 50,
+        top + 16,
+        radius,
+        BinaryColor::On,
+    );
+    draw_blob_line(
+        frame,
+        left + 22,
+        top + 18,
+        left + 20,
+        bottom - 8,
+        radius,
+        BinaryColor::On,
+    );
+    draw_blob_line(
+        frame,
+        left + 18,
+        top + 46,
+        left + 42,
+        top + 46,
+        radius - 3,
+        BinaryColor::On,
+    );
+
+    left + 58
+}
+
+fn draw_blob_line(
+    frame: &mut FrameBuffer,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    radius: i32,
+    color: BinaryColor,
+) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let steps = dx.abs().max(dy.abs()).max(1);
+    let mut step = 0;
+    while step <= steps {
+        let x = x0 + (dx * step) / steps;
+        let y = y0 + (dy * step) / steps;
+        fill_circle(frame, x, y, radius, color);
+        step += 1;
+    }
+}
+
+fn fill_circle(
+    frame: &mut FrameBuffer,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+    color: BinaryColor,
+) {
+    let mut y = center_y - radius;
+    while y <= center_y + radius {
+        let mut run_start = None;
+        let mut x = center_x - radius;
+        while x <= center_x + radius {
+            let filled = in_circle(x, y, center_x, center_y, radius);
+            if filled && run_start.is_none() {
+                run_start = Some(x);
+            } else if !filled && let Some(start) = run_start.take() {
+                fill_rect(frame, start, y, x - start, 1, color);
+            }
+            x += 1;
+        }
+        if let Some(start) = run_start {
+            fill_rect(frame, start, y, center_x + radius + 1 - start, 1, color);
+        }
+        y += 1;
+    }
+}
+
+fn fill_ellipse(
+    frame: &mut FrameBuffer,
+    center_x: i32,
+    center_y: i32,
+    radius_x: i32,
+    radius_y: i32,
+    color: BinaryColor,
+) {
+    let rx2 = (radius_x as i64) * (radius_x as i64);
+    let ry2 = (radius_y as i64) * (radius_y as i64);
+    let limit = rx2 * ry2;
+    let mut y = center_y - radius_y;
+    while y <= center_y + radius_y {
+        let mut run_start = None;
+        let mut x = center_x - radius_x;
+        while x <= center_x + radius_x {
+            let dx = (x - center_x) as i64;
+            let dy = (y - center_y) as i64;
+            let filled = dx * dx * ry2 + dy * dy * rx2 <= limit;
+            if filled && run_start.is_none() {
+                run_start = Some(x);
+            } else if !filled && let Some(start) = run_start.take() {
+                fill_rect(frame, start, y, x - start, 1, color);
+            }
+            x += 1;
+        }
+        if let Some(start) = run_start {
+            fill_rect(frame, start, y, center_x + radius_x + 1 - start, 1, color);
+        }
+        y += 1;
+    }
+}
+
+fn apply_startup_wordmark_dither(
+    frame: &mut FrameBuffer,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) {
+    let mut y = top + 4;
+    while y < bottom - 4 {
+        let mut x = left + 4;
+        while x < right - 4 {
+            if frame.pixel(x as usize, y as usize) == Some(true)
+                && frame.pixel((x - 2) as usize, y as usize) == Some(true)
+                && frame.pixel((x + 2) as usize, y as usize) == Some(true)
+                && frame.pixel(x as usize, (y - 2) as usize) == Some(true)
+                && frame.pixel(x as usize, (y + 2) as usize) == Some(true)
+                && startup_wordmark_dither_pixel(x, y)
+            {
+                fill_rect(frame, x, y, 2, 2, BinaryColor::Off);
+            }
+            x += 4;
+        }
+        y += 4;
+    }
+}
+
+const fn startup_wordmark_dither_pixel(x: i32, y: i32) -> bool {
+    startup_wordmark_bayer_rank(x, y) < 6 || ((x * 5 + y * 3) % 29) == 0
+}
+
+const fn startup_wordmark_bayer_rank(x: i32, y: i32) -> i32 {
+    match (y & 3, x & 3) {
+        (0, 0) => 0,
+        (0, 1) => 8,
+        (0, 2) => 2,
+        (0, 3) => 10,
+        (1, 0) => 12,
+        (1, 1) => 4,
+        (1, 2) => 14,
+        (1, 3) => 6,
+        (2, 0) => 3,
+        (2, 1) => 11,
+        (2, 2) => 1,
+        (2, 3) => 9,
+        (3, 0) => 15,
+        (3, 1) => 7,
+        (3, 2) => 13,
+        _ => 5,
+    }
+}
+
+const fn in_circle(x: i32, y: i32, center_x: i32, center_y: i32, radius: i32) -> bool {
+    let dx = x - center_x;
+    let dy = y - center_y;
+    dx * dx + dy * dy <= radius * radius
+}
+
 fn draw_row_flash(frame: &mut FrameBuffer, y: i32, height: i32, step: u8, total_steps: u8) {
     if step == total_steps / 2 {
         fill_rect(
@@ -2979,6 +3398,15 @@ mod tests {
         make_reader_shell_with_modal(progress_width, None)
     }
 
+    fn make_startup_splash_shell() -> StartupSplashShell {
+        StartupSplashShell {
+            appearance: AppearanceMode::Light,
+            progress_width: 120,
+            stripe_phase: 3,
+            skip_hint: "long press to skip sync",
+        }
+    }
+
     fn make_reader_shell_with_modal(
         progress_width: u16,
         pause_modal: Option<PauseModal>,
@@ -3010,19 +3438,41 @@ mod tests {
             title: "PAUSED",
             rows: [
                 PauseModalRow {
-                    label: "RESUME",
-                    action: "CLICK",
+                    label: "RESUME RSVP",
+                    action: "",
+                    selected: true,
+                    enabled: true,
                 },
                 PauseModalRow {
-                    label: "PARAGRAPH",
-                    action: "PRESS",
+                    label: "PARAGRAPH VIEW",
+                    action: "",
+                    selected: false,
+                    enabled: true,
                 },
                 PauseModalRow {
-                    label: "SPEED",
-                    action: "TURN",
+                    label: "ARTICLE",
+                    action: "SAVE",
+                    selected: false,
+                    enabled: true,
+                },
+                PauseModalRow {
+                    label: "SOURCE",
+                    action: "SUBSCRIBE",
+                    selected: false,
+                    enabled: true,
                 },
             ],
         }
+    }
+
+    fn make_pause_modal_with_selected_row(selected_index: usize) -> PauseModal {
+        let mut modal = make_pause_modal();
+        let mut index = 0usize;
+        while index < modal.rows.len() {
+            modal.rows[index].selected = index == selected_index;
+            index += 1;
+        }
+        modal
     }
 
     fn make_paragraph_shell(
@@ -3155,6 +3605,20 @@ mod tests {
     }
 
     #[test]
+    fn startup_splash_draws_center_wordmark() {
+        let mut frame = FrameBuffer::new();
+
+        draw_prepared_screen(
+            &mut frame,
+            &PreparedScreen::StartupSplash(make_startup_splash_shell()),
+        );
+
+        assert_eq!(frame.pixel(56, 92), Some(true));
+        assert_eq!(frame.pixel(82, 168), Some(true));
+        assert_eq!(frame.pixel(20, 20), Some(false));
+    }
+
+    #[test]
     fn reader_exit_transition_matches_dark_collection_theme() {
         let reader = make_dark_reader_shell(64);
         let mut collection =
@@ -3223,9 +3687,9 @@ mod tests {
             diff_dirty_rows(&frame_1, &frame_2),
             diff_dirty_rows(&frame_2, &frame_3),
         ] {
-            assert!(dirty.count() <= 166, "dirty rows={}", dirty.count());
+            assert!(dirty.count() <= 188, "dirty rows={}", dirty.count());
             for row in dirty.iter() {
-                assert!((35..202).contains(&row), "unexpected dirty row {row}");
+                assert!((35..224).contains(&row), "unexpected dirty row {row}");
             }
         }
     }
@@ -3259,11 +3723,22 @@ mod tests {
             diff_dirty_rows(&frame_1, &frame_2),
             diff_dirty_rows(&frame_2, &frame_3),
         ] {
-            assert!(dirty.count() <= 166, "dirty rows={}", dirty.count());
+            assert!(dirty.count() <= 188, "dirty rows={}", dirty.count());
             for row in dirty.iter() {
-                assert!((35..202).contains(&row), "unexpected dirty row {row}");
+                assert!((35..224).contains(&row), "unexpected dirty row {row}");
             }
         }
+    }
+
+    #[test]
+    fn committed_pause_modal_renders_lower_selected_rows() {
+        let shell = make_reader_shell_with_modal(32, Some(make_pause_modal_with_selected_row(3)));
+        let mut frame = FrameBuffer::new();
+
+        draw_prepared_screen(&mut frame, &PreparedScreen::Reader(shell));
+
+        assert_eq!(frame.pixel(66, 155), Some(true));
+        assert_eq!(frame.pixel(66, 181), Some(false));
     }
 
     #[test]

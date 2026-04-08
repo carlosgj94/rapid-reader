@@ -7,7 +7,7 @@ use crate::{
     },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, MAX_STAGE_SEGMENT_BYTES, StageFont},
     network::NetworkStatus,
-    reader::ReaderMode,
+    reader::{PauseMenuRow, ReaderMode, ReaderPauseMetadataStatus, ReaderPausePendingAction},
     settings::{
         AppearanceMode, TOPIC_CATEGORY_COUNT, TOPIC_CHIP_COUNT, topic_category_label,
         topic_chip_label,
@@ -21,6 +21,8 @@ pub const VISIBLE_LIST_ROWS: usize = 3;
 pub const SETTINGS_ROW_COUNT: usize = 6;
 pub const RECOMMENDATION_VISIBLE_TABS: usize = 4;
 pub const RECOMMENDATION_TAB_LABEL_MAX_BYTES: usize = RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES + 1;
+const STARTUP_SPLASH_BAR_WIDTH_PX: u16 = 236;
+const STARTUP_SPLASH_SKIP_HINT: &str = "long press to skip sync";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct StatusClusterModel {
@@ -43,6 +45,14 @@ pub struct DashboardScreenModel {
     pub rail_label: &'static str,
     pub items: [DashboardItemModel; VISIBLE_LIST_ROWS],
     pub focused: DashboardFocus,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StartupSplashScreenModel {
+    pub appearance: AppearanceMode,
+    pub progress_width: u16,
+    pub stripe_phase: u8,
+    pub skip_hint: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -91,6 +101,8 @@ pub struct RecommendationBarModel {
 pub struct PauseActionModel {
     pub label: &'static str,
     pub action: &'static str,
+    pub selected: bool,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -101,7 +113,7 @@ pub struct ReaderLoadingModel {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ReaderModalModel {
-    Pause([PauseActionModel; 3]),
+    Pause([PauseActionModel; 4]),
     Loading(ReaderLoadingModel),
 }
 
@@ -175,6 +187,7 @@ pub struct SettingsScreenModel {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ActiveScreenModel {
+    StartupSplash(StartupSplashScreenModel),
     Dashboard(DashboardScreenModel),
     Collection(ContentListScreenModel),
     Reader(ReaderScreenModel),
@@ -183,6 +196,18 @@ pub enum ActiveScreenModel {
 }
 
 pub fn select_active_screen(store: &Store) -> ActiveScreenModel {
+    if store.startup_splash_visible {
+        let progress_width = ((STARTUP_SPLASH_BAR_WIDTH_PX as u32
+            * store.startup_splash_display_progress_permille as u32)
+            / 1000) as u16;
+        return ActiveScreenModel::StartupSplash(StartupSplashScreenModel {
+            appearance: store.settings.appearance,
+            progress_width,
+            stripe_phase: ((store.startup_splash_tick_ms / 160) % 8) as u8,
+            skip_hint: STARTUP_SPLASH_SKIP_HINT,
+        });
+    }
+
     match store.ui.route {
         UiRoute::Dashboard => ActiveScreenModel::Dashboard(select_dashboard(store)),
         UiRoute::Collection(kind) => ActiveScreenModel::Collection(select_collection(store, kind)),
@@ -282,16 +307,28 @@ fn reader_modal_model(store: &Store) -> Option<ReaderModalModel> {
     match store.reader.mode {
         ReaderMode::Paused => Some(ReaderModalModel::Pause([
             PauseActionModel {
-                label: "LONG PRESS ->",
-                action: "PARAGRAPH VIEW",
+                label: "RESUME RSVP",
+                action: "",
+                selected: matches!(store.reader.pause.selected_row, PauseMenuRow::ResumeRsvp),
+                enabled: true,
             },
             PauseActionModel {
-                label: "SHORT PRESS ->",
-                action: "RESUME RSVP",
+                label: "PARAGRAPH VIEW",
+                action: "",
+                selected: matches!(store.reader.pause.selected_row, PauseMenuRow::ParagraphView),
+                enabled: true,
             },
             PauseActionModel {
-                label: "ROTATE ->",
-                action: "ADJUST RSVP SPEED",
+                label: "ARTICLE",
+                action: pause_save_action_label(store),
+                selected: matches!(store.reader.pause.selected_row, PauseMenuRow::SaveArticle),
+                enabled: pause_save_action_enabled(store),
+            },
+            PauseActionModel {
+                label: "SOURCE",
+                action: pause_subscription_action_label(store),
+                selected: matches!(store.reader.pause.selected_row, PauseMenuRow::Subscription),
+                enabled: pause_subscription_action_enabled(store),
             },
         ])),
         ReaderMode::LoadingContent => Some(ReaderModalModel::Loading(loading_modal_model(store))),
@@ -303,6 +340,80 @@ fn loading_modal_model(store: &Store) -> ReaderLoadingModel {
     ReaderLoadingModel {
         progress_width: store.reader.prepare_display_progress_width_px(214),
         stripe_phase: store.reader.prepare_stripe_phase(),
+    }
+}
+
+fn pause_backend_actions_available(store: &Store) -> bool {
+    store.network.status == NetworkStatus::Online
+        && !matches!(
+            store.backend_sync.status,
+            crate::sync::SyncStatus::Disabled | crate::sync::SyncStatus::AuthFailed
+        )
+}
+
+fn pause_save_action_enabled(store: &Store) -> bool {
+    pause_backend_actions_available(store)
+        && matches!(
+            store.reader.pause.pending_action,
+            ReaderPausePendingAction::None
+        )
+}
+
+fn pause_subscription_action_enabled(store: &Store) -> bool {
+    if !pause_backend_actions_available(store)
+        || !matches!(
+            store.reader.pause.pending_action,
+            ReaderPausePendingAction::None
+        )
+    {
+        return false;
+    }
+
+    if matches!(
+        store.reader.pause.metadata_status,
+        ReaderPauseMetadataStatus::Loading
+    ) {
+        return false;
+    }
+
+    !store.reader.pause.source_id.is_empty()
+        || matches!(
+            store.reader.pause.metadata_status,
+            ReaderPauseMetadataStatus::Uninitialized | ReaderPauseMetadataStatus::Failed
+        )
+}
+
+fn pause_save_action_label(store: &Store) -> &'static str {
+    if matches!(
+        store.reader.pause.pending_action,
+        ReaderPausePendingAction::Save
+    ) {
+        return "LOADING";
+    }
+    if store.reader.pause.is_saved {
+        "UNSAVE"
+    } else {
+        "SAVE"
+    }
+}
+
+fn pause_subscription_action_label(store: &Store) -> &'static str {
+    if matches!(
+        store.reader.pause.pending_action,
+        ReaderPausePendingAction::Subscription
+    ) {
+        return "LOADING";
+    }
+    if matches!(
+        store.reader.pause.metadata_status,
+        ReaderPauseMetadataStatus::Loading
+    ) {
+        return "LOADING";
+    }
+    if store.reader.pause.is_subscribed_source {
+        "UNSUBSCRIBE"
+    } else {
+        "SUBSCRIBE"
     }
 }
 
@@ -1222,6 +1333,49 @@ mod tests {
         assert!(model.rows[0].title.is_empty());
         assert_eq!(model.rows[1].title.as_str(), "First saved title");
         assert_eq!(model.rows[2].title.as_str(), "Second saved title");
+    }
+
+    #[test]
+    fn startup_splash_overrides_dashboard_screen_selection() {
+        let store = Store::from_bootstrap(crate::runtime::BootstrapSnapshot::new(
+            crate::device::DeviceState::with_boot(crate::device::BootState::ColdBoot),
+            0,
+            None,
+            None,
+            None,
+            None,
+            crate::storage::StorageHealth::new(),
+            crate::network::NetworkState::disabled(),
+        ));
+
+        let model = select_active_screen(&store);
+
+        assert!(matches!(model, ActiveScreenModel::StartupSplash(_)));
+    }
+
+    #[test]
+    fn startup_splash_selector_exposes_bar_animation_and_hint() {
+        let mut store = Store::from_bootstrap(crate::runtime::BootstrapSnapshot::new(
+            crate::device::DeviceState::with_boot(crate::device::BootState::ColdBoot),
+            0,
+            None,
+            None,
+            None,
+            None,
+            crate::storage::StorageHealth::new(),
+            crate::network::NetworkState::disabled(),
+        ));
+        store.startup_splash_tick_ms = 800;
+        store.startup_splash_display_progress_permille = 500;
+
+        let model = select_active_screen(&store);
+
+        let ActiveScreenModel::StartupSplash(model) = model else {
+            panic!("expected startup splash");
+        };
+        assert_eq!(model.progress_width, 118);
+        assert_eq!(model.stripe_phase, 5);
+        assert_eq!(model.skip_hint, "long press to skip sync");
     }
 
     #[test]

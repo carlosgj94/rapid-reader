@@ -244,7 +244,7 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                     let total_units = opened.total_units;
                     let paragraph_count = opened.paragraphs.len();
                     let window_units = opened.window.unit_count;
-                    store.open_cached_content(
+                    let resume_request = store.open_cached_content(
                         request.collection,
                         request.content_id,
                         request.remote_revision,
@@ -253,6 +253,9 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                         opened.paragraphs,
                         opened.window,
                     );
+                    if let Some(request) = resume_request {
+                        load_reader_window_for_request(store, request).await;
+                    }
                     info!(
                         "content storage opened cached package collection={:?} content_id={} total_units={} paragraph_count={} window_units={}",
                         request.collection,
@@ -321,31 +324,7 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
             }
         }
         Effect::LoadReaderWindow(request) => {
-            match content_storage::load_reader_window(
-                request.content_id,
-                request.window_start_unit_index,
-            )
-            .await
-            {
-                Ok(window) => {
-                    info!(
-                        "content storage loaded reader window content_id={} start_unit={} unit_count={}",
-                        request.content_id.as_str(),
-                        window.start_unit_index,
-                        window.unit_count,
-                    );
-                    store.load_reader_window(window);
-                }
-                Err(err) => {
-                    info!(
-                        "content storage reader window load failed content_id={} start_unit={} err={:?}",
-                        request.content_id.as_str(),
-                        request.window_start_unit_index,
-                        err,
-                    );
-                    store.reader.clear_pending_window_request();
-                }
-            }
+            load_reader_window_for_request(store, request).await;
         }
         Effect::PrepareContent(request) => {
             info!(
@@ -355,6 +334,15 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
                 request.remote_item_id.as_str(),
             );
             backend::request_prepare_content(request).await;
+        }
+        Effect::LoadReaderPauseDetail(request) => {
+            backend::request_reader_pause_detail(request).await;
+        }
+        Effect::ToggleReaderSaved(request) => {
+            backend::request_reader_saved_toggle(request).await;
+        }
+        Effect::ToggleReaderSubscription(request) => {
+            backend::request_reader_subscription_toggle(request).await;
         }
         Effect::LoadRecommendationSubtopics => {
             info!("recommendations load subtopics");
@@ -367,12 +355,43 @@ async fn apply_effect(store: &mut Store, effect: Effect, at_ms: u64) {
             );
             backend::request_recommendation_topic(request).await;
         }
+        Effect::RefreshCollection(collection) => {
+            backend::request_collection_refresh(collection).await;
+        }
         Effect::PersistSettings(settings) => {
             PLATFORM_CMD_CH
                 .send(PlatformCommand::PersistSettings(settings))
                 .await;
         }
         Effect::Noop => {}
+    }
+}
+
+async fn load_reader_window_for_request(
+    store: &mut Store,
+    request: domain::reader::ReaderWindowLoadRequest,
+) {
+    match content_storage::load_reader_window(request.content_id, request.window_start_unit_index)
+        .await
+    {
+        Ok(window) => {
+            info!(
+                "content storage loaded reader window content_id={} start_unit={} unit_count={}",
+                request.content_id.as_str(),
+                window.start_unit_index,
+                window.unit_count,
+            );
+            store.load_reader_window(window);
+        }
+        Err(err) => {
+            info!(
+                "content storage reader window load failed content_id={} start_unit={} err={:?}",
+                request.content_id.as_str(),
+                request.window_start_unit_index,
+                err,
+            );
+            store.reader.clear_pending_window_request();
+        }
     }
 }
 
@@ -880,10 +899,15 @@ fn current_prepared_screen(
 }
 
 fn prepared_screen_suppresses_sleep(screen: &PreparedScreen) -> bool {
-    prepared_screen_drives_reader_ticks(screen)
+    prepared_screen_shows_startup_splash(screen)
+        || prepared_screen_drives_reader_ticks(screen)
         || prepared_screen_shows_reader_loading(screen)
         || prepared_screen_shows_collection_fetch(screen)
         || prepared_screen_shows_dashboard_sync(screen)
+}
+
+fn prepared_screen_shows_startup_splash(screen: &PreparedScreen) -> bool {
+    matches!(screen, PreparedScreen::StartupSplash(_))
 }
 
 fn prepared_screen_drives_reader_ticks(screen: &PreparedScreen) -> bool {
@@ -922,6 +946,7 @@ fn prepared_screen_shows_dashboard_sync(screen: &PreparedScreen) -> bool {
 
 fn prepared_screen_drives_ui_ticks(screen: &PreparedScreen) -> bool {
     match screen {
+        PreparedScreen::StartupSplash(_) => true,
         PreparedScreen::Dashboard(_) => true,
         PreparedScreen::Reader(shell) => matches!(
             shell.modal,
@@ -1245,6 +1270,15 @@ mod tests {
         }
     }
 
+    fn startup_splash_shell() -> app_runtime::components::StartupSplashShell {
+        app_runtime::components::StartupSplashShell {
+            appearance: domain::settings::AppearanceMode::Light,
+            progress_width: 120,
+            stripe_phase: 3,
+            skip_hint: "long press to skip sync",
+        }
+    }
+
     #[test]
     fn requested_sleep_uses_immediate_deadline() {
         let mut model = SleepModel::new(SleepConfig::new(30_000));
@@ -1321,6 +1355,20 @@ mod tests {
     }
 
     #[test]
+    fn startup_splash_suppresses_sleep() {
+        let screen = PreparedScreen::StartupSplash(startup_splash_shell());
+
+        assert!(prepared_screen_suppresses_sleep(&screen));
+    }
+
+    #[test]
+    fn startup_splash_drives_ui_ticks() {
+        let screen = PreparedScreen::StartupSplash(startup_splash_shell());
+
+        assert!(prepared_screen_drives_ui_ticks(&screen));
+    }
+
+    #[test]
     fn paused_reader_does_not_suppress_sleep() {
         let screen =
             PreparedScreen::Reader(reader_shell(Some(app_runtime::components::PauseModal {
@@ -1329,14 +1377,26 @@ mod tests {
                     app_runtime::components::PauseModalRow {
                         label: "A",
                         action: "A",
+                        selected: true,
+                        enabled: true,
                     },
                     app_runtime::components::PauseModalRow {
                         label: "B",
                         action: "B",
+                        selected: false,
+                        enabled: true,
                     },
                     app_runtime::components::PauseModalRow {
                         label: "C",
                         action: "C",
+                        selected: false,
+                        enabled: true,
+                    },
+                    app_runtime::components::PauseModalRow {
+                        label: "D",
+                        action: "D",
+                        selected: false,
+                        enabled: true,
                     },
                 ],
             })));
@@ -1420,14 +1480,26 @@ mod tests {
                 app_runtime::components::PauseModalRow {
                     label: "A",
                     action: "A",
+                    selected: true,
+                    enabled: true,
                 },
                 app_runtime::components::PauseModalRow {
                     label: "B",
                     action: "B",
+                    selected: false,
+                    enabled: true,
                 },
                 app_runtime::components::PauseModalRow {
                     label: "C",
                     action: "C",
+                    selected: false,
+                    enabled: true,
+                },
+                app_runtime::components::PauseModalRow {
+                    label: "D",
+                    action: "D",
+                    selected: false,
+                    enabled: true,
                 },
             ],
         }));

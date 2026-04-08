@@ -3,6 +3,7 @@ use alloc::boxed::Box;
 use crate::{
     content::{
         CollectionKind, CollectionManifestState, ContentState, PackageState, PrepareContentRequest,
+        ReaderPauseDetailRequest, ReaderSavedToggleRequest, ReaderSubscriptionToggleRequest,
         ReadingProgressEntry, ReadingProgressState, RecommendationState,
         RecommendationTopicRequest,
     },
@@ -10,19 +11,24 @@ use crate::{
     input::InputState,
     network::{NetworkState, NetworkStatus},
     power::PowerStatus,
-    reader::ReaderSession,
+    reader::{PauseMenuRow, ReaderMode, ReaderSession},
     runtime::{
         BootstrapSnapshot, CollectionConfirmIgnoredReason, Command, Effect, Event, UiCommand,
     },
     settings::{REFRESH_LOADING_DURATION_MS, RefreshState, SettingsState},
     sleep::{SleepModel, WakeReason},
     storage::StorageHealth,
-    sync::{SyncState, SyncStatus},
+    sync::{StartupSyncProgress, SyncState, SyncStatus},
     ui::{RecommendationsRegion, SettingsMode, SettingsRow, TopicRegion, UiRoute, UiState},
 };
 
 static EMPTY_CONTENT_STATE: ContentState = ContentState::empty();
 const RECOMMENDATION_SUBTOPIC_FOCUS_FLASH_TICKS: u8 = 8;
+const STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE: u16 = 60;
+const STARTUP_SPLASH_REFRESH_PROGRESS_PERMILLE: u16 = 160;
+const STARTUP_SPLASH_PROGRESS_BASE_PERMILLE: u16 = 160;
+const STARTUP_SPLASH_PROGRESS_RANGE_PERMILLE: u16 = 840;
+const STARTUP_SPLASH_PROGRESS_SMOOTH_STEP_PERMILLE: u16 = 90;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum DispatchError {
@@ -43,6 +49,12 @@ struct PendingPrepare {
 #[derive(Debug)]
 pub struct Store {
     pub device: DeviceState,
+    pub startup_splash_visible: bool,
+    pub startup_splash_started_at_ms: u64,
+    pub startup_splash_tick_ms: u64,
+    pub startup_splash_progress: StartupSyncProgress,
+    pub startup_splash_target_progress_permille: u16,
+    pub startup_splash_display_progress_permille: u16,
     content: Option<Box<ContentState>>,
     pub reading_progress: ReadingProgressState,
     pub recommendations: RecommendationState,
@@ -63,6 +75,12 @@ impl Store {
     pub fn new() -> Self {
         Self {
             device: DeviceState::new(),
+            startup_splash_visible: false,
+            startup_splash_started_at_ms: 0,
+            startup_splash_tick_ms: 0,
+            startup_splash_progress: StartupSyncProgress::new(0, 4),
+            startup_splash_target_progress_permille: STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE,
+            startup_splash_display_progress_permille: STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE,
             content: None,
             reading_progress: ReadingProgressState::empty(),
             recommendations: RecommendationState::new(),
@@ -92,6 +110,10 @@ impl Store {
     }
 
     pub fn hydrate_from_bootstrap(&mut self, snapshot: BootstrapSnapshot) {
+        let show_startup_splash = matches!(
+            snapshot.device.boot,
+            BootState::ColdBoot | BootState::DeepSleepWake
+        );
         let settings = match snapshot.settings {
             Some(settings) => SettingsState::from_persisted(settings),
             None => SettingsState::new(crate::sleep::DEFAULT_INACTIVITY_TIMEOUT_MS),
@@ -101,6 +123,12 @@ impl Store {
             BootState::ColdBoot => WakeReason::ColdBoot,
         };
         self.device = snapshot.device;
+        self.startup_splash_visible = show_startup_splash;
+        self.startup_splash_started_at_ms = snapshot.boot_at_ms;
+        self.startup_splash_tick_ms = snapshot.boot_at_ms;
+        self.startup_splash_progress = StartupSyncProgress::new(0, 4);
+        self.startup_splash_target_progress_permille = STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE;
+        self.startup_splash_display_progress_permille = STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE;
         self.content = snapshot.content;
         self.reading_progress = snapshot
             .reading_progress
@@ -150,14 +178,37 @@ impl Store {
                 if let Some(request) = self.dispatchable_pending_prepare_request() {
                     return Ok(Effect::PrepareContent(request));
                 }
+                if let Some(effect) = self.reader_pause_detail_effect() {
+                    return Ok(effect);
+                }
             }
             Event::BackendSyncStatusChanged(status) => {
                 self.backend_sync.set_status(status);
+                self.update_startup_splash_target_for_status(status);
+                if matches!(
+                    status,
+                    SyncStatus::Ready
+                        | SyncStatus::TransportFailed
+                        | SyncStatus::AuthFailed
+                        | SyncStatus::Disabled
+                ) {
+                    self.startup_splash_visible = false;
+                    self.startup_splash_display_progress_permille =
+                        self.startup_splash_target_progress_permille;
+                }
                 if matches!(status, SyncStatus::AuthFailed | SyncStatus::Disabled) {
                     self.restore_pending_prepare();
                 } else if let Some(request) = self.dispatchable_pending_prepare_request() {
                     return Ok(Effect::PrepareContent(request));
                 }
+                if let Some(effect) = self.reader_pause_detail_effect() {
+                    return Ok(effect);
+                }
+            }
+            Event::StartupSyncProgressChanged(progress) => {
+                self.startup_splash_progress = progress;
+                self.startup_splash_target_progress_permille =
+                    startup_splash_progress_permille(progress);
             }
             Event::CollectionContentUpdated(kind, mut collection) => {
                 if let Some(pending) = self.pending_prepare
@@ -268,7 +319,7 @@ impl Store {
                         })
                         .map(|pending| pending.request.remote_revision)
                         .unwrap_or(0);
-                    self.open_cached_content(
+                    if let Some(request) = self.open_cached_content(
                         collection,
                         content_id,
                         remote_revision,
@@ -276,7 +327,9 @@ impl Store {
                         total_units,
                         paragraphs,
                         window,
-                    );
+                    ) {
+                        return Ok(Effect::LoadReaderWindow(request));
+                    }
                 } else if self.pending_prepare.as_ref().is_some_and(|pending| {
                     pending.request.collection == collection
                         && pending.request.content_id == content_id
@@ -321,7 +374,28 @@ impl Store {
                     self.reader.update_prepare_progress(progress);
                 }
             }
+            Event::ReaderPauseDetailLoaded(detail) => {
+                self.reader.apply_pause_detail(detail);
+            }
+            Event::ReaderPauseDetailFailed { content_id } => {
+                self.reader.mark_pause_detail_failed(content_id);
+            }
+            Event::ReaderPauseActionApplied {
+                content_id,
+                action,
+                enabled,
+            } => {
+                self.reader.apply_pause_action(content_id, action, enabled);
+            }
+            Event::ReaderPauseActionFailed { content_id, action } => {
+                self.reader.fail_pause_action(content_id, action);
+            }
             Event::UiTick(tick_ms) => {
+                if self.startup_splash_visible {
+                    self.startup_splash_tick_ms = tick_ms;
+                    self.sleep.note_activity(tick_ms);
+                    self.advance_startup_splash_progress();
+                }
                 if matches!(self.ui.route, UiRoute::Dashboard | UiRoute::Collection(_)) {
                     self.backend_sync.advance_spinner();
                 }
@@ -379,13 +453,18 @@ impl Store {
         total_units: u32,
         paragraphs: Box<[crate::reader::ReaderParagraphInfo]>,
         window: Box<crate::reader::ReaderWindow>,
-    ) {
+    ) -> Option<crate::reader::ReaderWindowLoadRequest> {
         if self.pending_prepare.is_some_and(|pending| {
             pending.request.collection == collection && pending.request.content_id == content_id
         }) {
             self.pending_prepare = None;
         }
-        self.reader.open_cached_reader_content(
+        let resume_paragraph_index = self
+            .reading_progress
+            .find_by_content_id(&content_id)
+            .filter(|entry| entry.remote_revision == remote_revision)
+            .map(|entry| entry.paragraph_index.max(1));
+        let request = self.reader.open_cached_reader_content(
             collection,
             crate::content::ArticleId(0),
             content_id,
@@ -396,12 +475,14 @@ impl Store {
             window,
             false,
             self.settings.reading_speed_wpm,
+            resume_paragraph_index,
         );
         if matches!(collection, CollectionKind::Recommendations) {
             self.show_recommendation_articles();
         }
         self.ui.route = UiRoute::Reader;
         self.track_reader_progress();
+        request
     }
 
     pub fn load_reader_window(&mut self, window: Box<crate::reader::ReaderWindow>) {
@@ -437,7 +518,40 @@ impl Store {
         self.ui.recommendations_focus_flash_ticks = 0;
     }
 
+    fn update_startup_splash_target_for_status(&mut self, status: SyncStatus) {
+        self.startup_splash_target_progress_permille = match status {
+            SyncStatus::Uninitialized | SyncStatus::WaitingForNetwork => {
+                STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE
+            }
+            SyncStatus::RefreshingSession => STARTUP_SPLASH_REFRESH_PROGRESS_PERMILLE,
+            SyncStatus::VerifyingIdentity | SyncStatus::SyncingContent | SyncStatus::Ready => {
+                startup_splash_progress_permille(self.startup_splash_progress)
+            }
+            SyncStatus::TransportFailed | SyncStatus::AuthFailed | SyncStatus::Disabled => 1000,
+        };
+    }
+
+    fn advance_startup_splash_progress(&mut self) {
+        let current = self.startup_splash_display_progress_permille;
+        let target = self.startup_splash_target_progress_permille;
+        if current >= target {
+            self.startup_splash_display_progress_permille = target;
+            return;
+        }
+
+        let delta = target - current;
+        let step = (delta / 4).max(STARTUP_SPLASH_PROGRESS_SMOOTH_STEP_PERMILLE.min(delta));
+        self.startup_splash_display_progress_permille = current.saturating_add(step).min(target);
+    }
+
     fn dispatch_ui(&mut self, command: UiCommand) -> Effect {
+        if self.startup_splash_visible {
+            if matches!(command, UiCommand::Back) {
+                self.startup_splash_visible = false;
+            }
+            return Effect::Noop;
+        }
+
         match self.ui.route {
             UiRoute::Dashboard => self.dispatch_dashboard(command),
             UiRoute::Collection(kind) => self.dispatch_collection(command, kind),
@@ -743,6 +857,69 @@ impl Store {
             && self.network.status == NetworkStatus::Online
     }
 
+    fn backend_actions_available(&self) -> bool {
+        self.network.status == NetworkStatus::Online
+            && !matches!(
+                self.backend_sync.status,
+                SyncStatus::Disabled | SyncStatus::AuthFailed
+            )
+    }
+
+    fn reader_pause_detail_effect(&mut self) -> Option<Effect> {
+        if !self.backend_actions_available() || !self.reader.pause_needs_detail_load() {
+            return None;
+        }
+
+        self.reader.begin_pause_detail_load();
+        Some(Effect::LoadReaderPauseDetail(
+            ReaderPauseDetailRequest::new(self.reader.active_content_id),
+        ))
+    }
+
+    fn dispatch_pause_save_toggle(&mut self) -> Effect {
+        if !self.backend_actions_available()
+            || !matches!(
+                self.reader.pause.pending_action,
+                crate::reader::ReaderPausePendingAction::None
+            )
+        {
+            return Effect::Noop;
+        }
+
+        let next_save = !self.reader.pause.is_saved;
+        self.reader.begin_pause_save_toggle();
+        Effect::ToggleReaderSaved(ReaderSavedToggleRequest::new(
+            self.reader.active_content_id,
+            next_save,
+        ))
+    }
+
+    fn dispatch_pause_subscription_toggle(&mut self) -> Effect {
+        if !self.backend_actions_available()
+            || !matches!(
+                self.reader.pause.pending_action,
+                crate::reader::ReaderPausePendingAction::None
+            )
+        {
+            return Effect::Noop;
+        }
+
+        if self.reader.pause.source_id.is_empty() {
+            if let Some(effect) = self.reader_pause_detail_effect() {
+                return effect;
+            }
+            return Effect::Noop;
+        }
+
+        let subscribe = !self.reader.pause.is_subscribed_source;
+        self.reader.begin_pause_subscription_toggle();
+        Effect::ToggleReaderSubscription(ReaderSubscriptionToggleRequest::new(
+            self.reader.active_content_id,
+            self.reader.pause.source_id,
+            subscribe,
+        ))
+    }
+
     fn dispatchable_pending_prepare_request(&mut self) -> Option<PrepareContentRequest> {
         if !self.can_dispatch_prepare_now() {
             return None;
@@ -830,7 +1007,7 @@ impl Store {
 
     fn dispatch_reader(&mut self, command: UiCommand) -> Effect {
         match self.reader.mode {
-            crate::reader::ReaderMode::Normal | crate::reader::ReaderMode::Chat => match command {
+            ReaderMode::Normal | ReaderMode::Chat => match command {
                 UiCommand::FocusPrevious => {
                     let request = self
                         .reader
@@ -849,34 +1026,35 @@ impl Store {
                         return Effect::LoadReaderWindow(request);
                     }
                 }
-                UiCommand::Confirm => self.reader.pause(),
+                UiCommand::Confirm => {
+                    let is_saved = self.content().collection_contains_content_id(
+                        CollectionKind::Saved,
+                        &self.reader.active_content_id,
+                    );
+                    self.reader.pause(is_saved);
+                    if let Some(effect) = self.reader_pause_detail_effect() {
+                        return effect;
+                    }
+                }
                 UiCommand::Back => {
                     self.ui.route = UiRoute::Collection(self.reader.active_collection);
                     self.reader.unload_document();
-                    self.reader.mode = crate::reader::ReaderMode::Normal;
-                    self.reader.resume_mode = crate::reader::ReaderMode::Normal;
+                    self.reader.mode = ReaderMode::Normal;
+                    self.reader.resume_mode = ReaderMode::Normal;
                     self.reader.next_due_at_ms = None;
                 }
                 UiCommand::Noop => {}
             },
-            crate::reader::ReaderMode::Paused => match command {
-                UiCommand::FocusPrevious => {
-                    self.settings.adjust_reading_speed(true);
-                    return self.persist_settings_effect();
-                }
-                UiCommand::FocusNext => {
-                    self.settings.adjust_reading_speed(false);
-                    return self.persist_settings_effect();
-                }
-                UiCommand::Confirm => {
-                    self.reader.resume(self.settings.reading_speed_wpm);
-                }
+            ReaderMode::Paused => match command {
+                UiCommand::FocusPrevious => self.reader.move_pause_selection(true),
+                UiCommand::FocusNext => self.reader.move_pause_selection(false),
+                UiCommand::Confirm => return self.dispatch_pause_action(),
                 UiCommand::Back => {
-                    self.reader.open_paragraph_navigation();
+                    self.reader.resume(self.settings.reading_speed_wpm);
                 }
                 UiCommand::Noop => {}
             },
-            crate::reader::ReaderMode::ParagraphNavigation => match command {
+            ReaderMode::ParagraphNavigation => match command {
                 UiCommand::FocusPrevious => self.reader.move_paragraph(true),
                 UiCommand::FocusNext => self.reader.move_paragraph(false),
                 UiCommand::Confirm => {
@@ -891,7 +1069,7 @@ impl Store {
                 UiCommand::Back => self.reader.close_paragraph_navigation(),
                 UiCommand::Noop => {}
             },
-            crate::reader::ReaderMode::LoadingContent => match command {
+            ReaderMode::LoadingContent => match command {
                 UiCommand::Back => {
                     if let Some(pending) = self.pending_prepare.as_mut() {
                         pending.auto_open_reader = false;
@@ -907,6 +1085,21 @@ impl Store {
         }
 
         Effect::Noop
+    }
+
+    fn dispatch_pause_action(&mut self) -> Effect {
+        match self.reader.selected_pause_row() {
+            PauseMenuRow::ResumeRsvp => {
+                self.reader.resume(self.settings.reading_speed_wpm);
+                Effect::Noop
+            }
+            PauseMenuRow::ParagraphView => {
+                self.reader.open_paragraph_navigation();
+                Effect::Noop
+            }
+            PauseMenuRow::SaveArticle => self.dispatch_pause_save_toggle(),
+            PauseMenuRow::Subscription => self.dispatch_pause_subscription_toggle(),
+        }
     }
 
     fn dispatch_settings(&mut self, command: UiCommand) -> Effect {
@@ -1042,6 +1235,17 @@ const fn ignored_reason_for_manifest_item(
     }
 }
 
+const fn startup_splash_progress_permille(progress: StartupSyncProgress) -> u16 {
+    if progress.total_queries == 0 {
+        return STARTUP_SPLASH_IDLE_PROGRESS_PERMILLE;
+    }
+
+    let completed = progress.clamped_completed() as u16;
+    let total = progress.total_queries as u16;
+    STARTUP_SPLASH_PROGRESS_BASE_PERMILLE
+        + ((STARTUP_SPLASH_PROGRESS_RANGE_PERMILLE * completed) / total)
+}
+
 fn collection_package_state_for_remote_item(
     collection: &crate::content::CollectionManifestState,
     remote_item_id: &crate::text::InlineText<{ crate::content::REMOTE_ITEM_ID_MAX_BYTES }>,
@@ -1175,6 +1379,14 @@ mod tests {
         let store = Store::from_bootstrap(snapshot);
 
         assert_eq!(store.device.boot, BootState::DeepSleepWake);
+        assert!(store.startup_splash_visible);
+        assert_eq!(store.startup_splash_started_at_ms, 42);
+        assert_eq!(store.startup_splash_tick_ms, 42);
+        assert_eq!(
+            store.startup_splash_progress,
+            StartupSyncProgress::new(0, 4)
+        );
+        assert_eq!(store.startup_splash_display_progress_permille, 60);
         assert_eq!(store.settings.inactivity_timeout_ms, 45_000);
         assert_eq!(store.settings.reading_speed_wpm, 320);
         assert_eq!(store.settings.appearance, AppearanceMode::Dark);
@@ -1200,6 +1412,7 @@ mod tests {
 
         let store = Store::from_bootstrap(snapshot);
 
+        assert!(store.startup_splash_visible);
         assert_eq!(
             store.settings.inactivity_timeout_ms,
             crate::sleep::DEFAULT_INACTIVITY_TIMEOUT_MS
@@ -1210,6 +1423,104 @@ mod tests {
         );
         assert_eq!(store.sleep.last_wake_reason, WakeReason::ColdBoot);
         assert_eq!(store.ui.route, UiRoute::Dashboard);
+    }
+
+    #[test]
+    fn startup_splash_hides_when_backend_sync_is_ready() {
+        let snapshot = BootstrapSnapshot::new(
+            DeviceState::with_boot(BootState::ColdBoot),
+            100,
+            None,
+            None,
+            None,
+            None,
+            StorageHealth::new(),
+            NetworkState::disabled(),
+        );
+        let mut store = Store::from_bootstrap(snapshot);
+
+        store
+            .handle_event(
+                Event::BackendSyncStatusChanged(SyncStatus::RefreshingSession),
+                0,
+            )
+            .unwrap();
+        assert!(store.startup_splash_visible);
+
+        store
+            .handle_event(Event::BackendSyncStatusChanged(SyncStatus::Ready), 0)
+            .unwrap();
+
+        assert!(!store.startup_splash_visible);
+        assert_eq!(store.startup_splash_display_progress_permille, 1000);
+    }
+
+    #[test]
+    fn startup_splash_can_be_skipped_with_back() {
+        let snapshot = BootstrapSnapshot::new(
+            DeviceState::with_boot(BootState::ColdBoot),
+            100,
+            None,
+            None,
+            None,
+            None,
+            StorageHealth::new(),
+            NetworkState::disabled(),
+        );
+        let mut store = Store::from_bootstrap(snapshot);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert!(!store.startup_splash_visible);
+    }
+
+    #[test]
+    fn startup_splash_progress_event_updates_target_and_tick_smooths_display() {
+        let snapshot = BootstrapSnapshot::new(
+            DeviceState::with_boot(BootState::ColdBoot),
+            100,
+            None,
+            None,
+            None,
+            None,
+            StorageHealth::new(),
+            NetworkState::disabled(),
+        );
+        let mut store = Store::from_bootstrap(snapshot);
+
+        store
+            .handle_event(
+                Event::StartupSyncProgressChanged(StartupSyncProgress::new(2, 4)),
+                0,
+            )
+            .unwrap();
+        store.handle_event(Event::UiTick(260), 0).unwrap();
+
+        assert_eq!(store.startup_splash_target_progress_permille, 580);
+        assert_eq!(store.startup_splash_display_progress_permille, 190);
+        assert_eq!(store.startup_splash_tick_ms, 260);
+    }
+
+    #[test]
+    fn startup_splash_ui_tick_refreshes_sleep_activity() {
+        let snapshot = BootstrapSnapshot::new(
+            DeviceState::with_boot(BootState::ColdBoot),
+            100,
+            None,
+            None,
+            None,
+            None,
+            StorageHealth::new(),
+            NetworkState::disabled(),
+        );
+        let mut store = Store::from_bootstrap(snapshot);
+        store.sleep.last_activity_ms = 40;
+
+        store.handle_event(Event::UiTick(260), 0).unwrap();
+
+        assert_eq!(store.sleep.last_activity_ms, 260);
+        assert_eq!(store.sleep.state, crate::sleep::SleepState::Awake);
     }
 
     #[test]
@@ -1635,11 +1946,53 @@ mod tests {
     }
 
     #[test]
+    fn reader_confirm_opens_pause_and_requests_detail() {
+        let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
+        store.network.status = NetworkStatus::Online;
+        store.backend_sync.status = SyncStatus::Ready;
+        let request = store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            7,
+            crate::text::InlineText::from_slice("Example inbox title"),
+            120,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 64),
+        );
+        assert_eq!(request, None);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::LoadReaderPauseDetail(ReaderPauseDetailRequest::new(
+                crate::text::InlineText::from_slice("content-1")
+            ))
+        );
+        assert!(matches!(
+            store.reader.mode,
+            crate::reader::ReaderMode::Paused
+        ));
+        assert_eq!(store.reader.selected_pause_row(), PauseMenuRow::ResumeRsvp);
+    }
+
+    #[test]
     fn paused_reader_confirm_resumes_live_session() {
         let mut store = Store::new();
         store.settings.reading_speed_wpm = 300;
         store.ui.route = UiRoute::Reader;
-        store.reader.pause();
+        store.reader.pause(false);
 
         store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
@@ -1654,13 +2007,37 @@ mod tests {
     }
 
     #[test]
-    fn paused_reader_back_opens_paragraph_navigation() {
+    fn paused_reader_back_resumes_live_session() {
         let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
         store.ui.route = UiRoute::Reader;
-        store.reader.pause();
+        store.reader.pause(false);
 
         store.dispatch(Command::Ui(UiCommand::Back)).unwrap();
 
+        assert!(matches!(
+            store.reader.mode,
+            crate::reader::ReaderMode::Normal
+        ));
+    }
+
+    #[test]
+    fn paused_reader_focus_moves_to_paragraph_view_and_confirms() {
+        let mut store = Store::new();
+        store.ui.route = UiRoute::Reader;
+        store.reader.pause(false);
+
+        let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
+        assert_eq!(
+            store.reader.selected_pause_row(),
+            PauseMenuRow::ParagraphView
+        );
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(effect, Effect::Noop);
         assert!(matches!(
             store.reader.mode,
             crate::reader::ReaderMode::ParagraphNavigation
@@ -1778,7 +2155,7 @@ mod tests {
             store.settings.reading_speed_wpm,
         );
         store.ui.route = UiRoute::Reader;
-        store.reader.pause();
+        store.reader.pause(false);
         store.sleep.last_activity_ms = 10;
 
         store.handle_event(Event::ReaderTick(250), 0).unwrap();
@@ -1791,7 +2168,7 @@ mod tests {
         let mut store = Store::new();
         store.settings.reading_speed_wpm = 300;
 
-        store.open_cached_content(
+        let request = store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
             7,
@@ -1811,6 +2188,7 @@ mod tests {
             make_reader_window(0, 64),
         );
 
+        assert_eq!(request, None);
         assert_eq!(
             store.take_pending_reading_progress_write(),
             Some(ReadingProgressEntry {
@@ -1827,7 +2205,7 @@ mod tests {
         let mut store = Store::new();
         store.settings.reading_speed_wpm = 300;
 
-        store.open_cached_content(
+        let request = store.open_cached_content(
             CollectionKind::Recommendations,
             crate::text::InlineText::from_slice("content-1"),
             7,
@@ -1847,6 +2225,7 @@ mod tests {
             make_reader_window(0, 64),
         );
 
+        assert_eq!(request, None);
         assert_eq!(
             store.take_pending_reading_progress_write(),
             Some(ReadingProgressEntry {
@@ -1862,7 +2241,7 @@ mod tests {
     fn live_reader_scroll_back_jumps_to_current_paragraph_start() {
         let mut store = Store::new();
         store.settings.reading_speed_wpm = 300;
-        store.open_cached_content(
+        let request = store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
             7,
@@ -1885,6 +2264,7 @@ mod tests {
             .into_boxed_slice(),
             make_reader_window(0, 64),
         );
+        assert_eq!(request, None);
         store.reader.progress.unit_index = 14;
         store.reader.progress.paragraph_index = 2;
         store.reader.progress.total_paragraphs = 3;
@@ -1908,7 +2288,7 @@ mod tests {
     fn live_reader_scroll_forward_requests_reader_window_for_next_paragraph() {
         let mut store = Store::new();
         store.settings.reading_speed_wpm = 300;
-        store.open_cached_content(
+        let request = store.open_cached_content(
             CollectionKind::Inbox,
             crate::text::InlineText::from_slice("content-1"),
             7,
@@ -1927,6 +2307,7 @@ mod tests {
             .into_boxed_slice(),
             make_reader_window(0, 32),
         );
+        assert_eq!(request, None);
 
         let effect = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
 
@@ -1942,6 +2323,95 @@ mod tests {
             store.reader.display_wpm(store.settings.reading_speed_wpm)
                 < store.settings.reading_speed_wpm
         );
+    }
+
+    #[test]
+    fn opening_cached_content_resumes_to_saved_paragraph_in_loaded_window() {
+        let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                remote_revision: 7,
+                paragraph_index: 2,
+                total_paragraphs: 3,
+            });
+
+        let request = store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            7,
+            crate::text::InlineText::from_slice("Example"),
+            200,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 128,
+                    preview: crate::text::InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 128),
+        );
+
+        assert_eq!(request, None);
+        assert_eq!(store.reader.progress.unit_index, 64);
+        assert_eq!(store.reader.progress.paragraph_index, 2);
+        assert_eq!(store.take_pending_reading_progress_write(), None);
+    }
+
+    #[test]
+    fn opening_cached_content_requests_resume_window_when_progress_is_outside_initial_window() {
+        let mut store = Store::new();
+        store.settings.reading_speed_wpm = 300;
+        let _ = store
+            .reading_progress
+            .record_progress(ReadingProgressEntry {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                remote_revision: 7,
+                paragraph_index: 2,
+                total_paragraphs: 3,
+            });
+
+        let request = store
+            .open_cached_content(
+                CollectionKind::Inbox,
+                crate::text::InlineText::from_slice("content-1"),
+                7,
+                crate::text::InlineText::from_slice("Example"),
+                200,
+                alloc::vec![
+                    ReaderParagraphInfo {
+                        start_unit_index: 0,
+                        preview: crate::text::InlineText::new(),
+                    },
+                    ReaderParagraphInfo {
+                        start_unit_index: 64,
+                        preview: crate::text::InlineText::new(),
+                    },
+                    ReaderParagraphInfo {
+                        start_unit_index: 128,
+                        preview: crate::text::InlineText::new(),
+                    },
+                ]
+                .into_boxed_slice(),
+                make_reader_window(0, 32),
+            )
+            .unwrap();
+
+        assert_eq!(request.content_id.as_str(), "content-1");
+        assert_eq!(request.window_start_unit_index, 32);
+        assert_eq!(store.reader.progress.unit_index, 0);
+        assert_eq!(store.reader.progress.paragraph_index, 1);
+        assert_eq!(store.take_pending_reading_progress_write(), None);
     }
 
     #[test]
@@ -1975,18 +2445,102 @@ mod tests {
     }
 
     #[test]
-    fn paused_reader_speed_adjust_persists_settings() {
+    fn paused_reader_save_row_dispatches_save_toggle_effect() {
         let mut store = Store::new();
-        store.ui.route = UiRoute::Reader;
-        store.reader.pause();
+        store.network.status = NetworkStatus::Online;
+        store.backend_sync.status = SyncStatus::Ready;
+        let request = store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            7,
+            crate::text::InlineText::from_slice("Example inbox title"),
+            120,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 64),
+        );
+        assert_eq!(request, None);
+        store.reader.pause(false);
+        store
+            .reader
+            .apply_pause_detail(crate::content::ReaderPauseDetail {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                saved_content_id: crate::text::InlineText::new(),
+                source_id: crate::text::InlineText::from_slice("source-1"),
+                is_saved: false,
+                is_subscribed_source: false,
+            });
+        let _ = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+        let _ = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
 
-        let effect = store
-            .dispatch(Command::Ui(UiCommand::FocusPrevious))
-            .unwrap();
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
 
         assert_eq!(
             effect,
-            Effect::PersistSettings(store.settings.to_persisted())
+            Effect::ToggleReaderSaved(ReaderSavedToggleRequest::new(
+                crate::text::InlineText::from_slice("content-1"),
+                true,
+            ))
+        );
+    }
+
+    #[test]
+    fn paused_reader_subscription_row_dispatches_subscription_toggle_effect() {
+        let mut store = Store::new();
+        store.network.status = NetworkStatus::Online;
+        store.backend_sync.status = SyncStatus::Ready;
+        let request = store.open_cached_content(
+            CollectionKind::Inbox,
+            crate::text::InlineText::from_slice("content-1"),
+            7,
+            crate::text::InlineText::from_slice("Example inbox title"),
+            120,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: crate::text::InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: crate::text::InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            make_reader_window(0, 64),
+        );
+        assert_eq!(request, None);
+        store.reader.pause(false);
+        store
+            .reader
+            .apply_pause_detail(crate::content::ReaderPauseDetail {
+                content_id: crate::text::InlineText::from_slice("content-1"),
+                saved_content_id: crate::text::InlineText::new(),
+                source_id: crate::text::InlineText::from_slice("source-1"),
+                is_saved: false,
+                is_subscribed_source: false,
+            });
+        let _ = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+        let _ = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+        let _ = store.dispatch(Command::Ui(UiCommand::FocusNext)).unwrap();
+
+        let effect = store.dispatch(Command::Ui(UiCommand::Confirm)).unwrap();
+
+        assert_eq!(
+            effect,
+            Effect::ToggleReaderSubscription(ReaderSubscriptionToggleRequest::new(
+                crate::text::InlineText::from_slice("content-1"),
+                crate::text::InlineText::from_slice("source-1"),
+                true,
+            ))
         );
     }
 

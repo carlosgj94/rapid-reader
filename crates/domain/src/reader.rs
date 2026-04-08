@@ -5,7 +5,8 @@ use alloc::boxed::Box;
 use crate::{
     content::{
         ArticleId, CONTENT_ID_MAX_BYTES, CONTENT_TITLE_MAX_BYTES, CollectionKind,
-        PrepareContentProgress, ReadingProgressEntry,
+        PrepareContentProgress, REMOTE_ITEM_ID_MAX_BYTES, ReaderPauseDetail, ReadingProgressEntry,
+        SOURCE_ID_MAX_BYTES,
     },
     formatter::{MAX_PARAGRAPH_PREVIEW_BYTES, ReadingDocument, ReadingUnit},
     settings::{DEFAULT_READING_SPEED_WPM, MIN_READING_SPEED_WPM, READING_SPEED_STEP_WPM},
@@ -34,6 +35,103 @@ pub enum ReaderMode {
     Paused,
     ParagraphNavigation,
     LoadingContent,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum PauseMenuRow {
+    #[default]
+    ResumeRsvp,
+    ParagraphView,
+    SaveArticle,
+    Subscription,
+}
+
+impl PauseMenuRow {
+    pub fn previous(self) -> Self {
+        match self {
+            Self::ResumeRsvp => Self::ResumeRsvp,
+            Self::ParagraphView => Self::ResumeRsvp,
+            Self::SaveArticle => Self::ParagraphView,
+            Self::Subscription => Self::SaveArticle,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::ResumeRsvp => Self::ParagraphView,
+            Self::ParagraphView => Self::SaveArticle,
+            Self::SaveArticle => Self::Subscription,
+            Self::Subscription => Self::Subscription,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum ReaderPauseMetadataStatus {
+    #[default]
+    Uninitialized,
+    Loading,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum ReaderPausePendingAction {
+    #[default]
+    None,
+    Save,
+    Subscription,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum ReaderPauseActionError {
+    #[default]
+    None,
+    Save,
+    Subscription,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReaderPauseActionKind {
+    Save,
+    Subscription,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReaderPauseState {
+    pub selected_row: PauseMenuRow,
+    pub metadata_status: ReaderPauseMetadataStatus,
+    pub pending_action: ReaderPausePendingAction,
+    pub action_error: ReaderPauseActionError,
+    pub is_saved: bool,
+    pub is_subscribed_source: bool,
+    pub saved_content_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    pub source_id: InlineText<SOURCE_ID_MAX_BYTES>,
+}
+
+impl ReaderPauseState {
+    pub const fn new() -> Self {
+        Self {
+            selected_row: PauseMenuRow::ResumeRsvp,
+            metadata_status: ReaderPauseMetadataStatus::Uninitialized,
+            pending_action: ReaderPausePendingAction::None,
+            action_error: ReaderPauseActionError::None,
+            is_saved: false,
+            is_subscribed_source: false,
+            saved_content_id: InlineText::new(),
+            source_id: InlineText::new(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+}
+
+impl Default for ReaderPauseState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -88,6 +186,7 @@ pub struct ReaderSession {
     pub chat_available: bool,
     pub next_due_at_ms: Option<u64>,
     pub effective_wpm: u16,
+    pub pause: ReaderPauseState,
     speed_ramp_start_wpm: u16,
     speed_ramp_started_at_ms: u64,
     prepare_progress: PrepareContentProgress,
@@ -151,6 +250,7 @@ impl ReaderSession {
             chat_available: true,
             next_due_at_ms: None,
             effective_wpm: DEFAULT_READING_SPEED_WPM,
+            pause: ReaderPauseState::new(),
             speed_ramp_start_wpm: 0,
             speed_ramp_started_at_ms: SPEED_RAMP_IDLE_AT_MS,
             prepare_progress: PrepareContentProgress::connecting(),
@@ -188,6 +288,7 @@ impl ReaderSession {
         self.prepare_progress = PrepareContentProgress::connecting();
         self.prepare_display_progress_permille = 0;
         self.prepare_stripe_phase = 0;
+        self.pause.clear();
         self.clear_speed_ramp();
         self.effective_wpm = DEFAULT_READING_SPEED_WPM;
     }
@@ -221,7 +322,7 @@ impl ReaderSession {
         }
         window.unit_count = unit_count;
 
-        self.open_cached_reader_content(
+        let _ = self.open_cached_reader_content(
             collection,
             article,
             InlineText::new(),
@@ -232,6 +333,7 @@ impl ReaderSession {
             window,
             chat_available,
             target_wpm,
+            None,
         );
     }
 
@@ -248,7 +350,8 @@ impl ReaderSession {
         window: Box<ReaderWindow>,
         chat_available: bool,
         target_wpm: u16,
-    ) {
+        resume_paragraph_index: Option<u16>,
+    ) -> Option<ReaderWindowLoadRequest> {
         self.active_collection = collection;
         self.active_article = article;
         self.active_content_id = content_id;
@@ -269,7 +372,14 @@ impl ReaderSession {
         self.prepare_progress = PrepareContentProgress::connecting();
         self.prepare_display_progress_permille = 0;
         self.prepare_stripe_phase = 0;
-        self.arm_speed_ramp(target_wpm);
+        self.pause.clear();
+        let request = resume_paragraph_index.and_then(|paragraph_index| {
+            self.seek_to_unit(self.paragraph_start(paragraph_index.max(1)), target_wpm)
+        });
+        if self.pending_seek_unit_index.is_none() && self.progress.unit_index == 0 {
+            self.arm_speed_ramp(target_wpm);
+        }
+        request
     }
 
     pub fn apply_loaded_window(&mut self, window: Box<ReaderWindow>) {
@@ -323,6 +433,7 @@ impl ReaderSession {
         self.prepare_progress = PrepareContentProgress::connecting();
         self.prepare_display_progress_permille = 0;
         self.prepare_stripe_phase = 0;
+        self.pause.clear();
     }
 
     pub fn clear_pending_window_request(&mut self) {
@@ -350,12 +461,18 @@ impl ReaderSession {
         }
     }
 
-    pub fn pause(&mut self) {
+    pub fn pause(&mut self, seeded_is_saved: bool) {
         if matches!(self.mode, ReaderMode::Normal | ReaderMode::Chat) {
             self.resume_mode = self.mode;
             self.mode = ReaderMode::Paused;
             self.next_due_at_ms = None;
             self.clear_speed_ramp();
+            self.pause.selected_row = PauseMenuRow::ResumeRsvp;
+            if !matches!(self.pause.metadata_status, ReaderPauseMetadataStatus::Ready)
+                && !matches!(self.pause.pending_action, ReaderPausePendingAction::Save)
+            {
+                self.pause.is_saved = seeded_is_saved;
+            }
         }
     }
 
@@ -377,6 +494,129 @@ impl ReaderSession {
     pub fn close_paragraph_navigation(&mut self) {
         if matches!(self.mode, ReaderMode::ParagraphNavigation) {
             self.mode = ReaderMode::Paused;
+        }
+    }
+
+    pub fn move_pause_selection(&mut self, previous: bool) {
+        if !matches!(self.mode, ReaderMode::Paused) {
+            return;
+        }
+
+        self.pause.selected_row = if previous {
+            self.pause.selected_row.previous()
+        } else {
+            self.pause.selected_row.next()
+        };
+    }
+
+    pub const fn selected_pause_row(&self) -> PauseMenuRow {
+        self.pause.selected_row
+    }
+
+    pub const fn pause_needs_detail_load(&self) -> bool {
+        matches!(self.mode, ReaderMode::Paused)
+            && !self.active_content_id.is_empty()
+            && matches!(
+                self.pause.metadata_status,
+                ReaderPauseMetadataStatus::Uninitialized | ReaderPauseMetadataStatus::Failed
+            )
+            && matches!(self.pause.pending_action, ReaderPausePendingAction::None)
+    }
+
+    pub fn begin_pause_detail_load(&mut self) {
+        if self.active_content_id.is_empty() {
+            return;
+        }
+
+        self.pause.metadata_status = ReaderPauseMetadataStatus::Loading;
+        self.pause.action_error = ReaderPauseActionError::None;
+    }
+
+    pub fn apply_pause_detail(&mut self, detail: ReaderPauseDetail) {
+        if self.active_content_id != detail.content_id {
+            return;
+        }
+
+        self.pause.metadata_status = ReaderPauseMetadataStatus::Ready;
+        self.pause.pending_action = ReaderPausePendingAction::None;
+        self.pause.action_error = ReaderPauseActionError::None;
+        self.pause.is_saved = detail.is_saved;
+        self.pause.is_subscribed_source = detail.is_subscribed_source;
+        self.pause.saved_content_id = detail.saved_content_id;
+        self.pause.source_id = detail.source_id;
+    }
+
+    pub fn mark_pause_detail_failed(&mut self, content_id: InlineText<CONTENT_ID_MAX_BYTES>) {
+        if self.active_content_id != content_id {
+            return;
+        }
+
+        if !matches!(self.pause.pending_action, ReaderPausePendingAction::None) {
+            return;
+        }
+
+        self.pause.metadata_status = ReaderPauseMetadataStatus::Failed;
+    }
+
+    pub fn begin_pause_save_toggle(&mut self) {
+        self.pause.pending_action = ReaderPausePendingAction::Save;
+        if matches!(self.pause.action_error, ReaderPauseActionError::Save) {
+            self.pause.action_error = ReaderPauseActionError::None;
+        }
+    }
+
+    pub fn begin_pause_subscription_toggle(&mut self) {
+        self.pause.pending_action = ReaderPausePendingAction::Subscription;
+        if matches!(
+            self.pause.action_error,
+            ReaderPauseActionError::Subscription
+        ) {
+            self.pause.action_error = ReaderPauseActionError::None;
+        }
+    }
+
+    pub fn apply_pause_action(
+        &mut self,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        action: ReaderPauseActionKind,
+        enabled: bool,
+    ) {
+        if self.active_content_id != content_id {
+            return;
+        }
+
+        match action {
+            ReaderPauseActionKind::Save => {
+                self.pause.pending_action = ReaderPausePendingAction::None;
+                self.pause.action_error = ReaderPauseActionError::None;
+                self.pause.is_saved = enabled;
+            }
+            ReaderPauseActionKind::Subscription => {
+                self.pause.pending_action = ReaderPausePendingAction::None;
+                self.pause.action_error = ReaderPauseActionError::None;
+                self.pause.is_subscribed_source = enabled;
+            }
+        }
+    }
+
+    pub fn fail_pause_action(
+        &mut self,
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        action: ReaderPauseActionKind,
+    ) {
+        if self.active_content_id != content_id {
+            return;
+        }
+
+        match action {
+            ReaderPauseActionKind::Save => {
+                self.pause.pending_action = ReaderPausePendingAction::None;
+                self.pause.action_error = ReaderPauseActionError::Save;
+            }
+            ReaderPauseActionKind::Subscription => {
+                self.pause.pending_action = ReaderPausePendingAction::None;
+                self.pause.action_error = ReaderPauseActionError::Subscription;
+            }
         }
     }
 
@@ -1029,6 +1269,87 @@ mod tests {
     }
 
     #[test]
+    fn opening_cached_content_resumes_inside_loaded_window() {
+        let mut session = ReaderSession::new();
+
+        let request = session.open_cached_reader_content(
+            CollectionKind::Saved,
+            ArticleId(1),
+            InlineText::from_slice("content-1"),
+            7,
+            InlineText::from_slice("Example"),
+            300,
+            alloc::vec![
+                ReaderParagraphInfo {
+                    start_unit_index: 0,
+                    preview: InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 64,
+                    preview: InlineText::new(),
+                },
+                ReaderParagraphInfo {
+                    start_unit_index: 128,
+                    preview: InlineText::new(),
+                },
+            ]
+            .into_boxed_slice(),
+            Box::new(make_test_window(0, 128)),
+            false,
+            300,
+            Some(2),
+        );
+
+        assert_eq!(request, None);
+        assert_eq!(session.progress.unit_index, 64);
+        assert_eq!(session.progress.paragraph_index, 2);
+        assert_eq!(session.active_window().start_unit_index, 0);
+    }
+
+    #[test]
+    fn opening_cached_content_requests_window_for_resume_outside_loaded_window() {
+        let mut session = ReaderSession::new();
+        let start_wpm = ramp_start_wpm(300);
+
+        let request = session
+            .open_cached_reader_content(
+                CollectionKind::Saved,
+                ArticleId(1),
+                InlineText::from_slice("content-1"),
+                7,
+                InlineText::from_slice("Example"),
+                300,
+                alloc::vec![
+                    ReaderParagraphInfo {
+                        start_unit_index: 0,
+                        preview: InlineText::new(),
+                    },
+                    ReaderParagraphInfo {
+                        start_unit_index: 64,
+                        preview: InlineText::new(),
+                    },
+                    ReaderParagraphInfo {
+                        start_unit_index: 128,
+                        preview: InlineText::new(),
+                    },
+                ]
+                .into_boxed_slice(),
+                Box::new(make_test_window(0, 32)),
+                false,
+                300,
+                Some(2),
+            )
+            .unwrap();
+
+        assert_eq!(request.content_id.as_str(), "content-1");
+        assert_eq!(request.window_start_unit_index, 32);
+        assert_eq!(session.pending_seek_unit_index, Some(64));
+        assert_eq!(session.progress.unit_index, 0);
+        assert_eq!(session.progress.paragraph_index, 1);
+        assert_eq!(session.display_wpm(300), start_wpm);
+    }
+
+    #[test]
     fn first_reader_tick_uses_ramp_start_wpm_for_initial_dwell() {
         let document = format_article_document(&ArticleDocument::new(
             SourceKind::Unknown,
@@ -1101,7 +1422,7 @@ mod tests {
             false,
             300,
         );
-        session.pause();
+        session.pause(false);
 
         assert_eq!(session.display_wpm(300), 300);
 

@@ -52,8 +52,10 @@ use domain::{
         PrepareContentPhase, PrepareContentProgress, PrepareContentRequest,
         RECOMMENDATION_SERVE_ID_MAX_BYTES, RECOMMENDATION_SUBTOPIC_CAPACITY,
         RECOMMENDATION_SUBTOPIC_LABEL_MAX_BYTES, RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES,
-        REMOTE_ITEM_ID_MAX_BYTES, RecommendationSubtopic, RecommendationSubtopicsState,
-        RecommendationTopicRequest, RemoteContentStatus,
+        REMOTE_ITEM_ID_MAX_BYTES, ReaderPauseDetail, ReaderPauseDetailRequest,
+        ReaderSavedToggleRequest, ReaderSubscriptionToggleRequest, RecommendationSubtopic,
+        RecommendationSubtopicsState, RecommendationTopicRequest, RemoteContentStatus,
+        SOURCE_ID_MAX_BYTES,
     },
     runtime::Event,
     text::InlineText,
@@ -70,6 +72,10 @@ const SAVED_CONTENT_PATH: &str = "/device/v1/me/saved-content";
 const RECOMMENDATIONS_PATH: &str = "/device/v1/me/recommendations/content";
 const RECOMMENDATION_SUBTOPICS_PATH: &str = "/device/v1/me/recommendations/subtopics";
 const RECOMMENDATION_TOPIC_PATH_PREFIX: &str = "/device/v1/me/recommendations/content/by-topic/";
+const READER_PAUSE_CONTENT_PATH_PREFIX: &str = "/device/v1/me/content/";
+const READER_SAVE_SUFFIX: &str = "/save";
+const READER_SOURCE_SUBSCRIPTION_PATH_PREFIX: &str = "/device/v1/me/sources/";
+const READER_SOURCE_SUBSCRIPTION_SUFFIX: &str = "/subscription";
 pub(crate) const BACKEND_PORT: u16 = 443;
 const NETWORK_POLL_MS: u64 = 500;
 const RETRY_BACKOFF_MS: u64 = 10_000;
@@ -106,6 +112,7 @@ const COLLECTION_PAGE_LIMIT: usize = 4;
 const COLLECTION_CURSOR_MAX_LEN: usize = 192;
 const COLLECTION_PAGE_PATH_MAX_LEN: usize = 320;
 const COLLECTION_FETCH_MAX_PAGES: usize = 32;
+const STARTUP_SYNC_QUERY_COUNT: u8 = 4;
 const REFRESH_BODY_OVERHEAD_LEN: usize = "{\"refresh_token\":\"\"}".len();
 const REQUEST_BODY_MAX_LEN: usize = REFRESH_BODY_OVERHEAD_LEN + (BACKEND_REFRESH_TOKEN_MAX_LEN * 2);
 const INBOX_LOG_PREVIEW_MAX_LEN: usize = 256;
@@ -487,6 +494,10 @@ struct BackendRequestContext<'a> {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum BackendCommand {
     PrepareContent(PrepareContentRequest),
+    LoadCollection(CollectionEndpoint),
+    LoadReaderPauseDetail(ReaderPauseDetailRequest),
+    ToggleReaderSaved(ReaderSavedToggleRequest),
+    ToggleReaderSubscription(ReaderSubscriptionToggleRequest),
     LoadRecommendationSubtopics,
     LoadRecommendationTopic(RecommendationTopicRequest),
 }
@@ -820,6 +831,35 @@ pub async fn request_prepare_content(request: PrepareContentRequest) {
         .await;
 }
 
+pub async fn request_collection_refresh(collection: CollectionKind) {
+    let endpoint = match collection {
+        CollectionKind::Saved => CollectionEndpoint::Saved,
+        CollectionKind::Inbox => CollectionEndpoint::Inbox,
+        CollectionKind::Recommendations => CollectionEndpoint::Recommendations,
+    };
+    BACKEND_CMD_CH
+        .send(BackendCommand::LoadCollection(endpoint))
+        .await;
+}
+
+pub async fn request_reader_pause_detail(request: ReaderPauseDetailRequest) {
+    BACKEND_CMD_CH
+        .send(BackendCommand::LoadReaderPauseDetail(request))
+        .await;
+}
+
+pub async fn request_reader_saved_toggle(request: ReaderSavedToggleRequest) {
+    BACKEND_CMD_CH
+        .send(BackendCommand::ToggleReaderSaved(request))
+        .await;
+}
+
+pub async fn request_reader_subscription_toggle(request: ReaderSubscriptionToggleRequest) {
+    BACKEND_CMD_CH
+        .send(BackendCommand::ToggleReaderSubscription(request))
+        .await;
+}
+
 pub async fn request_recommendation_subtopics() {
     BACKEND_CMD_CH
         .send(BackendCommand::LoadRecommendationSubtopics)
@@ -890,6 +930,7 @@ async fn backend_task(
             log_status(SyncStatus::RefreshingSession);
             crate::internet::set_probe_suspended(true);
             let startup_sync_id = next_sync_id();
+            log_startup_progress(0, STARTUP_SYNC_QUERY_COUNT);
             crate::memtrace!(
                 "backend_sync",
                 "component" = "backend",
@@ -1090,6 +1131,54 @@ async fn run_backend_command_loop<'a>(
         match command {
             BackendCommand::PrepareContent(request) => {
                 handle_prepare_content_request(
+                    context,
+                    current,
+                    access_session,
+                    &mut reusable_session,
+                    &mut tls_session_cache,
+                    request,
+                )
+                .await;
+                log_status(SyncStatus::Ready);
+            }
+            BackendCommand::LoadCollection(endpoint) => {
+                handle_collection_refresh_request(
+                    context,
+                    current,
+                    access_session,
+                    &mut reusable_session,
+                    &mut tls_session_cache,
+                    endpoint,
+                )
+                .await;
+                log_status(SyncStatus::Ready);
+            }
+            BackendCommand::LoadReaderPauseDetail(request) => {
+                handle_reader_pause_detail_request(
+                    context,
+                    current,
+                    access_session,
+                    &mut reusable_session,
+                    &mut tls_session_cache,
+                    request,
+                )
+                .await;
+                log_status(SyncStatus::Ready);
+            }
+            BackendCommand::ToggleReaderSaved(request) => {
+                handle_reader_saved_toggle_request(
+                    context,
+                    current,
+                    access_session,
+                    &mut reusable_session,
+                    &mut tls_session_cache,
+                    request,
+                )
+                .await;
+                log_status(SyncStatus::Ready);
+            }
+            BackendCommand::ToggleReaderSubscription(request) => {
+                handle_reader_subscription_toggle_request(
                     context,
                     current,
                     access_session,
@@ -1600,6 +1689,7 @@ async fn perform_startup_refresh_and_collection_sync_once<'a>(
     }
 
     let refresh_session = parse_refresh_session(refresh_response.body)?;
+    log_startup_progress(1, STARTUP_SYNC_QUERY_COUNT);
     log_status(SyncStatus::SyncingContent);
     info!("backend startup sync mode=saved+inbox+recommendation_subtopics");
 
@@ -1610,6 +1700,7 @@ async fn perform_startup_refresh_and_collection_sync_once<'a>(
         sync_id,
     )
     .await;
+    log_startup_progress(2, STARTUP_SYNC_QUERY_COUNT);
 
     if let Some(err) = startup_collection_fetch_transport_error(&saved_result) {
         if let Err(close_err) = session.close().await {
@@ -1625,6 +1716,7 @@ async fn perform_startup_refresh_and_collection_sync_once<'a>(
         sync_id,
     )
     .await;
+    log_startup_progress(3, STARTUP_SYNC_QUERY_COUNT);
 
     if let Some(err) = startup_collection_fetch_transport_error(&inbox_result) {
         if let Err(close_err) = session.close().await {
@@ -1675,6 +1767,7 @@ async fn perform_startup_refresh_and_collection_sync_once<'a>(
                 }
             }
         }
+        log_startup_progress(4, STARTUP_SYNC_QUERY_COUNT);
     }
 
     let reusable_session = if saved_result.is_ok()
@@ -1973,6 +2066,440 @@ async fn persist_and_publish_recommendation_subtopics(
     info!("{} ok count={}", label, subtopics.len());
 }
 
+async fn handle_collection_refresh_request<'a>(
+    context: BackendRequestContext<'a>,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    endpoint: CollectionEndpoint,
+) {
+    let operation_sync_id = next_sync_id();
+
+    if let Err(err) = ensure_access_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_state,
+        current,
+        access_session,
+        reusable_session,
+        tls_session_cache,
+        operation_sync_id,
+    )
+    .await
+    {
+        handle_reader_pause_access_error(err, current, access_session, reusable_session).await;
+        return;
+    }
+
+    log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.clone())
+        .unwrap_or_default();
+    let result = perform_collection_fetch_paginated_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        access_token.as_str(),
+        operation_sync_id,
+        endpoint,
+    )
+    .await;
+    sync_one_collection(
+        endpoint.kind(),
+        result,
+        match endpoint {
+            CollectionEndpoint::Inbox => "backend inbox refresh",
+            CollectionEndpoint::Saved => "backend saved refresh",
+            CollectionEndpoint::Recommendations => "backend recommendation refresh",
+        },
+    )
+    .await;
+}
+
+async fn handle_reader_pause_detail_request<'a>(
+    context: BackendRequestContext<'a>,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    request: ReaderPauseDetailRequest,
+) {
+    if request.content_id.is_empty() {
+        return;
+    }
+
+    let operation_sync_id = next_sync_id();
+    if let Err(err) = ensure_access_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_state,
+        current,
+        access_session,
+        reusable_session,
+        tls_session_cache,
+        operation_sync_id,
+    )
+    .await
+    {
+        handle_reader_pause_access_error(err, current, access_session, reusable_session).await;
+        publish_event(
+            Event::ReaderPauseDetailFailed {
+                content_id: request.content_id,
+            },
+            now_ms(),
+        );
+        return;
+    }
+
+    log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.clone())
+        .unwrap_or_default();
+    match perform_reader_pause_detail_fetch_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        request.content_id,
+        access_token.as_ref(),
+        operation_sync_id,
+    )
+    .await
+    {
+        Ok(detail) => {
+            publish_event(Event::ReaderPauseDetailLoaded(detail), now_ms());
+        }
+        Err(CollectionQueryError::Rejected(status)) => {
+            if is_auth_status(status) {
+                invalidate_access_state(access_session, reusable_session).await;
+                log_status(SyncStatus::AuthFailed);
+            }
+            publish_event(
+                Event::ReaderPauseDetailFailed {
+                    content_id: request.content_id,
+                },
+                now_ms(),
+            );
+        }
+        Err(CollectionQueryError::Other(err)) => {
+            if is_transient_transport_error(err) {
+                *access_session = None;
+                log_status(SyncStatus::TransportFailed);
+            }
+            publish_event(
+                Event::ReaderPauseDetailFailed {
+                    content_id: request.content_id,
+                },
+                now_ms(),
+            );
+        }
+    }
+}
+
+async fn handle_reader_saved_toggle_request<'a>(
+    context: BackendRequestContext<'a>,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    request: ReaderSavedToggleRequest,
+) {
+    if request.content_id.is_empty() {
+        return;
+    }
+
+    let operation_sync_id = next_sync_id();
+    if let Err(err) = ensure_access_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_state,
+        current,
+        access_session,
+        reusable_session,
+        tls_session_cache,
+        operation_sync_id,
+    )
+    .await
+    {
+        handle_reader_pause_access_error(err, current, access_session, reusable_session).await;
+        publish_event(
+            Event::ReaderPauseActionFailed {
+                content_id: request.content_id,
+                action: domain::reader::ReaderPauseActionKind::Save,
+            },
+            now_ms(),
+        );
+        return;
+    }
+
+    log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.clone())
+        .unwrap_or_default();
+    let path = match build_reader_save_path(&request.content_id) {
+        Ok(path) => path,
+        Err(_) => {
+            publish_event(
+                Event::ReaderPauseActionFailed {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Save,
+                },
+                now_ms(),
+            );
+            return;
+        }
+    };
+    match perform_reader_pause_mutation_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        if request.save { "PUT" } else { "DELETE" },
+        path.as_str(),
+        access_token.as_ref(),
+        operation_sync_id,
+    )
+    .await
+    {
+        Ok(()) => {
+            publish_event(
+                Event::ReaderPauseActionApplied {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Save,
+                    enabled: request.save,
+                },
+                now_ms(),
+            );
+            let _ = refresh_reader_pause_detail_after_action(
+                context,
+                current,
+                access_session,
+                reusable_session,
+                tls_session_cache,
+                request.content_id,
+                operation_sync_id,
+            )
+            .await;
+            let result = perform_collection_fetch_paginated_reusing_session(
+                context.stack,
+                context.tls,
+                context.ca_chain,
+                context.tcp_client,
+                reusable_session,
+                tls_session_cache,
+                access_token.as_ref(),
+                operation_sync_id,
+                CollectionEndpoint::Saved,
+            )
+            .await;
+            sync_one_collection(CollectionKind::Saved, result, "backend saved refresh").await;
+        }
+        Err(CollectionQueryError::Rejected(status)) => {
+            if is_auth_status(status) {
+                invalidate_access_state(access_session, reusable_session).await;
+                log_status(SyncStatus::AuthFailed);
+            }
+            publish_event(
+                Event::ReaderPauseActionFailed {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Save,
+                },
+                now_ms(),
+            );
+        }
+        Err(CollectionQueryError::Other(err)) => {
+            if is_transient_transport_error(err) {
+                *access_session = None;
+                log_status(SyncStatus::TransportFailed);
+            }
+            publish_event(
+                Event::ReaderPauseActionFailed {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Save,
+                },
+                now_ms(),
+            );
+        }
+    }
+}
+
+async fn handle_reader_subscription_toggle_request<'a>(
+    context: BackendRequestContext<'a>,
+    current: &mut StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    request: ReaderSubscriptionToggleRequest,
+) {
+    if request.content_id.is_empty() || request.source_id.is_empty() {
+        return;
+    }
+
+    let operation_sync_id = next_sync_id();
+    if let Err(err) = ensure_access_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_state,
+        current,
+        access_session,
+        reusable_session,
+        tls_session_cache,
+        operation_sync_id,
+    )
+    .await
+    {
+        handle_reader_pause_access_error(err, current, access_session, reusable_session).await;
+        publish_event(
+            Event::ReaderPauseActionFailed {
+                content_id: request.content_id,
+                action: domain::reader::ReaderPauseActionKind::Subscription,
+            },
+            now_ms(),
+        );
+        return;
+    }
+
+    log_status(SyncStatus::SyncingContent);
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.as_str())
+        .unwrap_or("");
+    let path = match build_reader_source_subscription_path(&request.source_id) {
+        Ok(path) => path,
+        Err(_) => {
+            publish_event(
+                Event::ReaderPauseActionFailed {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Subscription,
+                },
+                now_ms(),
+            );
+            return;
+        }
+    };
+    match perform_reader_pause_mutation_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        if request.subscribe { "PUT" } else { "DELETE" },
+        path.as_str(),
+        access_token,
+        operation_sync_id,
+    )
+    .await
+    {
+        Ok(()) => {
+            publish_event(
+                Event::ReaderPauseActionApplied {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Subscription,
+                    enabled: request.subscribe,
+                },
+                now_ms(),
+            );
+            let _ = refresh_reader_pause_detail_after_action(
+                context,
+                current,
+                access_session,
+                reusable_session,
+                tls_session_cache,
+                request.content_id,
+                operation_sync_id,
+            )
+            .await;
+        }
+        Err(CollectionQueryError::Rejected(status)) => {
+            if is_auth_status(status) {
+                invalidate_access_state(access_session, reusable_session).await;
+                log_status(SyncStatus::AuthFailed);
+            }
+            publish_event(
+                Event::ReaderPauseActionFailed {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Subscription,
+                },
+                now_ms(),
+            );
+        }
+        Err(CollectionQueryError::Other(err)) => {
+            if is_transient_transport_error(err) {
+                *access_session = None;
+                log_status(SyncStatus::TransportFailed);
+            }
+            publish_event(
+                Event::ReaderPauseActionFailed {
+                    content_id: request.content_id,
+                    action: domain::reader::ReaderPauseActionKind::Subscription,
+                },
+                now_ms(),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn refresh_reader_pause_detail_after_action<'a>(
+    context: BackendRequestContext<'a>,
+    current: &StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    content_id: InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>,
+    sync_id: u32,
+) -> Result<(), CollectionQueryError> {
+    let access_token = access_session
+        .as_ref()
+        .map(|session| session.access_token.as_str())
+        .unwrap_or("");
+    match perform_reader_pause_detail_fetch_reusing_session(
+        context.stack,
+        context.tls,
+        context.ca_chain,
+        context.tcp_client,
+        reusable_session,
+        tls_session_cache,
+        content_id,
+        access_token,
+        sync_id,
+    )
+    .await
+    {
+        Ok(detail) => {
+            publish_event(Event::ReaderPauseDetailLoaded(detail), now_ms());
+            Ok(())
+        }
+        Err(err) => {
+            if matches!(err, CollectionQueryError::Rejected(status) if is_auth_status(status)) {
+                warn!(
+                    "backend reader pause detail refresh rejected content_id={} source={}",
+                    content_id.as_str(),
+                    current.source.label(),
+                );
+            }
+            publish_event(Event::ReaderPauseDetailFailed { content_id }, now_ms());
+            Err(err)
+        }
+    }
+}
+
 fn startup_collection_fetch_transport_error(
     result: &Result<CollectionFetchResult, CollectionQueryError>,
 ) -> Option<BackendError> {
@@ -2175,6 +2702,30 @@ async fn handle_recommendation_access_error(
             *access_session = None;
             log_status(SyncStatus::TransportFailed);
             warn!("backend recommendation refresh failed: {:?}", err);
+        }
+    }
+}
+
+async fn handle_reader_pause_access_error(
+    err: RefreshError,
+    current: &StartupCredential,
+    access_session: &mut Option<ActiveAccessSession>,
+    reusable_session: &mut Option<ReusableBackendSession<'_>>,
+) {
+    match err {
+        RefreshError::Rejected(status) => {
+            invalidate_access_state(access_session, reusable_session).await;
+            log_status(SyncStatus::AuthFailed);
+            warn!(
+                "backend reader pause refresh rejected status={} source={}",
+                status,
+                current.source.label(),
+            );
+        }
+        RefreshError::Other(err) => {
+            *access_session = None;
+            log_status(SyncStatus::TransportFailed);
+            warn!("backend reader pause refresh failed: {:?}", err);
         }
     }
 }
@@ -3906,6 +4457,43 @@ fn build_recommendation_topic_page_path(
     Ok(path)
 }
 
+fn build_reader_pause_content_path(
+    content_id: &InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>,
+) -> Result<heapless::String<128>, BackendError> {
+    let mut path = heapless::String::<128>::new();
+    path.push_str(READER_PAUSE_CONTENT_PATH_PREFIX)
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    path.push_str(content_id.as_str())
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    Ok(path)
+}
+
+fn build_reader_save_path(
+    content_id: &InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>,
+) -> Result<heapless::String<144>, BackendError> {
+    let mut path = heapless::String::<144>::new();
+    path.push_str(READER_PAUSE_CONTENT_PATH_PREFIX)
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    path.push_str(content_id.as_str())
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    path.push_str(READER_SAVE_SUFFIX)
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    Ok(path)
+}
+
+fn build_reader_source_subscription_path(
+    source_id: &InlineText<SOURCE_ID_MAX_BYTES>,
+) -> Result<heapless::String<144>, BackendError> {
+    let mut path = heapless::String::<144>::new();
+    path.push_str(READER_SOURCE_SUBSCRIPTION_PATH_PREFIX)
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    path.push_str(source_id.as_str())
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    path.push_str(READER_SOURCE_SUBSCRIPTION_SUFFIX)
+        .map_err(|_| BackendError::ResponseTooLarge)?;
+    Ok(path)
+}
+
 fn parse_collection_page_cursor(
     endpoint: CollectionEndpoint,
     body: &str,
@@ -4294,6 +4882,96 @@ where
     Ok((*accumulator).into_result())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn perform_collection_fetch_paginated_reusing_session<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'a>,
+    ca_chain: &Certificate<'static>,
+    tcp_client: &'a BackendTcpClient<'a>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    access_token: &str,
+    sync_id: u32,
+    endpoint: CollectionEndpoint,
+) -> Result<CollectionFetchResult, CollectionQueryError> {
+    let mut accumulator = crate::memory_policy::external_or_global_box(
+        CollectionFetchAccumulator::new(next_request_trace(sync_id)),
+    );
+    let mut page_index = 0usize;
+    let mut cursor = None::<heapless::String<COLLECTION_CURSOR_MAX_LEN>>;
+
+    loop {
+        if page_index >= COLLECTION_FETCH_MAX_PAGES {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        let path = build_collection_page_path(endpoint, cursor.as_ref())
+            .map_err(CollectionQueryError::Other)?;
+        let request_trace = if page_index == 0 {
+            accumulator.trace
+        } else {
+            next_request_trace(sync_id)
+        };
+        let mut response_buffer = allocate_standard_response_buffer(path.as_str())
+            .map_err(CollectionQueryError::Other)?;
+        let response = send_https_request_reusing_session(
+            stack,
+            tls,
+            ca_chain,
+            tcp_client,
+            reusable_session,
+            tls_session_cache,
+            HttpRequest {
+                trace: request_trace,
+                class: RequestClass::BufferedMetadata,
+                method: "GET",
+                path: path.as_str(),
+                content_type: Some("application/json"),
+                bearer_token: Some(access_token),
+                body: b"",
+                connection_close: false,
+            },
+            response_buffer.as_mut_slice(),
+        )
+        .await
+        .map_err(CollectionQueryError::Other)?;
+
+        if (400..500).contains(&response.status) {
+            return Err(CollectionQueryError::Rejected(response.status));
+        }
+        if response.status != 200 {
+            return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+        }
+
+        parse_collection_page_into_accumulator(
+            endpoint,
+            response.body,
+            path.as_str(),
+            response.body.len(),
+            page_index,
+            &mut accumulator,
+        )
+        .map_err(CollectionQueryError::Other)?;
+        page_index += 1;
+
+        if !accumulator.should_continue() {
+            break;
+        }
+        cursor = accumulator.next_cursor.clone();
+    }
+
+    log_collection_fetch_total_metrics(
+        accumulator.trace,
+        endpoint.kind(),
+        accumulator.page_count,
+        accumulator.body_bytes_total,
+        accumulator.collection.len(),
+        accumulator.next_cursor.is_some() || accumulator.truncated_by_capacity,
+        accumulator.truncated_by_capacity,
+    );
+    Ok((*accumulator).into_result())
+}
+
 async fn perform_inbox_fetch(
     stack: Stack<'static>,
     tls: TlsReference<'_>,
@@ -4397,6 +5075,102 @@ where
     }
 
     parse_recommendation_subtopics(response.body).map_err(CollectionQueryError::Other)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_reader_pause_detail_fetch_reusing_session<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'a>,
+    ca_chain: &Certificate<'static>,
+    tcp_client: &'a BackendTcpClient<'a>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    content_id: InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>,
+    access_token: &str,
+    sync_id: u32,
+) -> Result<ReaderPauseDetail, CollectionQueryError> {
+    let path = build_reader_pause_content_path(&content_id).map_err(CollectionQueryError::Other)?;
+    let trace = next_request_trace(sync_id);
+    let mut response_buffer =
+        allocate_standard_response_buffer(path.as_str()).map_err(CollectionQueryError::Other)?;
+    let response = send_https_request_reusing_session(
+        stack,
+        tls,
+        ca_chain,
+        tcp_client,
+        reusable_session,
+        tls_session_cache,
+        HttpRequest {
+            trace,
+            class: RequestClass::BufferedMetadata,
+            method: "GET",
+            path: path.as_str(),
+            content_type: Some("application/json"),
+            bearer_token: Some(access_token),
+            body: b"",
+            connection_close: false,
+        },
+        response_buffer.as_mut_slice(),
+    )
+    .await
+    .map_err(CollectionQueryError::Other)?;
+
+    if (400..500).contains(&response.status) {
+        return Err(CollectionQueryError::Rejected(response.status));
+    }
+    if response.status != 200 {
+        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+    }
+
+    parse_reader_pause_detail(content_id, response.body).map_err(CollectionQueryError::Other)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_reader_pause_mutation_reusing_session<'a>(
+    stack: Stack<'static>,
+    tls: TlsReference<'a>,
+    ca_chain: &Certificate<'static>,
+    tcp_client: &'a BackendTcpClient<'a>,
+    reusable_session: &mut Option<ReusableBackendSession<'a>>,
+    tls_session_cache: &mut Option<SerializedClientSession>,
+    method: &str,
+    path: &str,
+    access_token: &str,
+    sync_id: u32,
+) -> Result<(), CollectionQueryError> {
+    let trace = next_request_trace(sync_id);
+    let mut response_buffer =
+        allocate_standard_response_buffer(path).map_err(CollectionQueryError::Other)?;
+    let response = send_https_request_reusing_session(
+        stack,
+        tls,
+        ca_chain,
+        tcp_client,
+        reusable_session,
+        tls_session_cache,
+        HttpRequest {
+            trace,
+            class: RequestClass::BufferedMetadata,
+            method,
+            path,
+            content_type: Some("application/json"),
+            bearer_token: Some(access_token),
+            body: b"",
+            connection_close: false,
+        },
+        response_buffer.as_mut_slice(),
+    )
+    .await
+    .map_err(CollectionQueryError::Other)?;
+
+    if (400..500).contains(&response.status) {
+        return Err(CollectionQueryError::Rejected(response.status));
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(CollectionQueryError::Other(BackendError::InvalidResponse));
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6084,6 +6858,35 @@ fn parse_recommendation_manifest(item_json: &str) -> Result<CollectionManifestIt
     Ok(manifest)
 }
 
+fn parse_reader_pause_detail(
+    content_id: InlineText<{ domain::content::CONTENT_ID_MAX_BYTES }>,
+    body: &str,
+) -> Result<ReaderPauseDetail, BackendError> {
+    let is_saved = extract_json_bool(body, "\"is_saved\"").ok_or(BackendError::MissingField)?;
+    let is_subscribed_source =
+        extract_json_bool(body, "\"is_subscribed_source\"").ok_or(BackendError::MissingField)?;
+    let saved_content_id = extract_json_optional_inline_text::<REMOTE_ITEM_ID_MAX_BYTES>(
+        body,
+        "\"saved_content_id\"",
+    )?
+    .unwrap_or_default();
+    let source_json = extract_json_object_slice(body, "\"source\"");
+    let source_id = if let Some(source_json) = source_json {
+        extract_json_optional_inline_text::<SOURCE_ID_MAX_BYTES>(source_json, "\"id\"")?
+            .unwrap_or_default()
+    } else {
+        InlineText::new()
+    };
+
+    Ok(ReaderPauseDetail {
+        content_id,
+        saved_content_id,
+        source_id,
+        is_saved,
+        is_subscribed_source,
+    })
+}
+
 fn extract_json_top_level_array_items<'a, const N: usize>(
     json: &'a str,
     key: &str,
@@ -6351,6 +7154,16 @@ fn bounded_string<const N: usize>(value: &str) -> Result<heapless::String<N>, Ba
 fn log_status(status: SyncStatus) {
     info!("backend status={:?}", status);
     publish_event(Event::BackendSyncStatusChanged(status), now_ms());
+}
+
+fn log_startup_progress(completed_queries: u8, total_queries: u8) {
+    publish_event(
+        Event::StartupSyncProgressChanged(domain::sync::StartupSyncProgress::new(
+            completed_queries,
+            total_queries,
+        )),
+        now_ms(),
+    );
 }
 
 fn log_heap(label: &str) {
@@ -7034,6 +7847,31 @@ mod tests {
         assert_eq!(
             path.as_str(),
             "/device/v1/me/saved-content?limit=4&archived=false&cursor=cursor-123"
+        );
+    }
+
+    #[test]
+    fn builds_reader_pause_detail_path_with_device_prefix() {
+        let path = build_reader_pause_content_path(&InlineText::from_slice("content-123")).unwrap();
+
+        assert_eq!(path.as_str(), "/device/v1/me/content/content-123");
+    }
+
+    #[test]
+    fn builds_reader_save_path_with_device_prefix() {
+        let path = build_reader_save_path(&InlineText::from_slice("content-123")).unwrap();
+
+        assert_eq!(path.as_str(), "/device/v1/me/content/content-123/save");
+    }
+
+    #[test]
+    fn builds_reader_source_subscription_path_with_device_prefix() {
+        let path =
+            build_reader_source_subscription_path(&InlineText::from_slice("source-123")).unwrap();
+
+        assert_eq!(
+            path.as_str(),
+            "/device/v1/me/sources/source-123/subscription"
         );
     }
 

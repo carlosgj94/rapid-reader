@@ -15,13 +15,13 @@ pub mod view_models;
 pub use animation::{AnimationDescriptor, MotionDirection, TransitionPlan};
 pub use components::{
     ComponentId, ContentListShell, DashboardShell, ParagraphNavigationShell, PreparedScreen,
-    ReaderShell, SettingsShell,
+    ReaderShell, SettingsShell, StartupSplashShell,
 };
 pub use navigation::NavigationState;
 pub use screens::Screen;
 pub use view_models::{
     ActiveScreenModel, ContentListScreenModel, DashboardScreenModel, ParagraphNavigationModel,
-    ReaderScreenModel, SettingsScreenModel,
+    ReaderScreenModel, SettingsScreenModel, StartupSplashScreenModel,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

@@ -5,6 +5,7 @@ use domain::{
     selectors::{
         ActiveScreenModel, ContentListScreenModel, DashboardScreenModel, ParagraphNavigationModel,
         ReaderScreenModel, RecommendationBarModel, RecommendationTabModel, SettingsScreenModel,
+        StartupSplashScreenModel,
     },
     settings::AppearanceMode,
     ui::{SettingsMode, TopicRegion},
@@ -51,6 +52,14 @@ pub struct DashboardShell {
     pub rail: VerticalRail,
     pub items: [DashboardItem; 3],
     pub band: SelectionBand,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct StartupSplashShell {
+    pub appearance: AppearanceMode,
+    pub progress_width: u16,
+    pub stripe_phase: u8,
+    pub skip_hint: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -104,12 +113,14 @@ pub struct ModeBadge {
 pub struct PauseModalRow {
     pub label: &'static str,
     pub action: &'static str,
+    pub selected: bool,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PauseModal {
     pub title: &'static str,
-    pub rows: [PauseModalRow; 3],
+    pub rows: [PauseModalRow; 4],
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -208,6 +219,7 @@ pub struct SettingsShell {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum PreparedScreen {
+    StartupSplash(StartupSplashShell),
     Dashboard(DashboardShell),
     Collection(ContentListShell),
     Reader(ReaderShell),
@@ -217,6 +229,10 @@ pub enum PreparedScreen {
 
 pub fn compose(model: ActiveScreenModel) -> (Screen, PreparedScreen) {
     match model {
+        ActiveScreenModel::StartupSplash(model) => (
+            Screen::StartupSplash,
+            PreparedScreen::StartupSplash(compose_startup_splash(model)),
+        ),
         ActiveScreenModel::Dashboard(model) => (
             Screen::Dashboard,
             PreparedScreen::Dashboard(compose_dashboard(model)),
@@ -241,6 +257,15 @@ pub fn compose(model: ActiveScreenModel) -> (Screen, PreparedScreen) {
             Screen::Settings,
             PreparedScreen::Settings(compose_settings(model)),
         ),
+    }
+}
+
+fn compose_startup_splash(model: StartupSplashScreenModel) -> StartupSplashShell {
+    StartupSplashShell {
+        appearance: model.appearance,
+        progress_width: model.progress_width,
+        stripe_phase: model.stripe_phase,
+        skip_hint: model.skip_hint,
     }
 }
 
@@ -374,14 +399,26 @@ fn compose_reader(model: ReaderScreenModel) -> ReaderShell {
                     PauseModalRow {
                         label: actions[0].label,
                         action: actions[0].action,
+                        selected: actions[0].selected,
+                        enabled: actions[0].enabled,
                     },
                     PauseModalRow {
                         label: actions[1].label,
                         action: actions[1].action,
+                        selected: actions[1].selected,
+                        enabled: actions[1].enabled,
                     },
                     PauseModalRow {
                         label: actions[2].label,
                         action: actions[2].action,
+                        selected: actions[2].selected,
+                        enabled: actions[2].enabled,
+                    },
+                    PauseModalRow {
+                        label: actions[3].label,
+                        action: actions[3].action,
+                        selected: actions[3].selected,
+                        enabled: actions[3].enabled,
                     },
                 ],
             }),
@@ -527,6 +564,7 @@ fn compose_settings(model: SettingsScreenModel) -> SettingsShell {
 impl PreparedScreen {
     pub const fn appearance(self) -> AppearanceMode {
         match self {
+            PreparedScreen::StartupSplash(shell) => shell.appearance,
             PreparedScreen::Dashboard(shell) => shell.appearance,
             PreparedScreen::Collection(shell) => shell.appearance,
             PreparedScreen::Reader(shell) => shell.appearance,

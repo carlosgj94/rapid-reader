@@ -9,6 +9,7 @@ pub const CONTENT_META_MAX_BYTES: usize = 48;
 pub const CONTENT_TITLE_MAX_BYTES: usize = 96;
 pub const CONTENT_ID_MAX_BYTES: usize = 36;
 pub const REMOTE_ITEM_ID_MAX_BYTES: usize = 36;
+pub const SOURCE_ID_MAX_BYTES: usize = 36;
 pub const RECOMMENDATION_SERVE_ID_MAX_BYTES: usize = 36;
 pub const RECOMMENDATION_SUBTOPIC_CAPACITY: usize = 8;
 pub const RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES: usize = 32;
@@ -267,6 +268,19 @@ impl CollectionManifestState {
 
         false
     }
+
+    pub fn contains_content_id(&self, content_id: &InlineText<CONTENT_ID_MAX_BYTES>) -> bool {
+        let len = self.len();
+        let mut index = 0;
+        while index < len {
+            if self.items[index].content_id == *content_id {
+                return true;
+            }
+            index += 1;
+        }
+
+        false
+    }
 }
 
 impl Default for CollectionManifestState {
@@ -460,6 +474,77 @@ impl RecommendationState {
 impl Default for RecommendationState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReaderPauseDetail {
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub saved_content_id: InlineText<REMOTE_ITEM_ID_MAX_BYTES>,
+    pub source_id: InlineText<SOURCE_ID_MAX_BYTES>,
+    pub is_saved: bool,
+    pub is_subscribed_source: bool,
+}
+
+impl ReaderPauseDetail {
+    pub const fn empty() -> Self {
+        Self {
+            content_id: InlineText::new(),
+            saved_content_id: InlineText::new(),
+            source_id: InlineText::new(),
+            is_saved: false,
+            is_subscribed_source: false,
+        }
+    }
+}
+
+impl Default for ReaderPauseDetail {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReaderPauseDetailRequest {
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+}
+
+impl ReaderPauseDetailRequest {
+    pub const fn new(content_id: InlineText<CONTENT_ID_MAX_BYTES>) -> Self {
+        Self { content_id }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReaderSavedToggleRequest {
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub save: bool,
+}
+
+impl ReaderSavedToggleRequest {
+    pub const fn new(content_id: InlineText<CONTENT_ID_MAX_BYTES>, save: bool) -> Self {
+        Self { content_id, save }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ReaderSubscriptionToggleRequest {
+    pub content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+    pub source_id: InlineText<SOURCE_ID_MAX_BYTES>,
+    pub subscribe: bool,
+}
+
+impl ReaderSubscriptionToggleRequest {
+    pub const fn new(
+        content_id: InlineText<CONTENT_ID_MAX_BYTES>,
+        source_id: InlineText<SOURCE_ID_MAX_BYTES>,
+        subscribe: bool,
+    ) -> Self {
+        Self {
+            content_id,
+            source_id,
+            subscribe,
+        }
     }
 }
 
@@ -709,6 +794,14 @@ impl ContentState {
         index: usize,
     ) -> Option<CollectionManifestItem> {
         self.collection_state(kind).item_at(index)
+    }
+
+    pub fn collection_contains_content_id(
+        &self,
+        kind: CollectionKind,
+        content_id: &InlineText<CONTENT_ID_MAX_BYTES>,
+    ) -> bool {
+        self.collection_state(kind).contains_content_id(content_id)
     }
 
     pub fn update_collection(&mut self, kind: CollectionKind, collection: CollectionManifestState) {

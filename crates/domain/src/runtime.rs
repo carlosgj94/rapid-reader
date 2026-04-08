@@ -4,17 +4,18 @@ use crate::{
     content::{
         CONTENT_TITLE_MAX_BYTES, CollectionKind, CollectionManifestState, PackageState,
         PrepareContentProgress, PrepareContentRequest, RECOMMENDATION_SUBTOPIC_SLUG_MAX_BYTES,
-        REMOTE_ITEM_ID_MAX_BYTES, ReadingProgressState, RecommendationSubtopicsState,
-        RecommendationTopicRequest,
+        REMOTE_ITEM_ID_MAX_BYTES, ReaderPauseDetail, ReaderPauseDetailRequest,
+        ReaderSavedToggleRequest, ReaderSubscriptionToggleRequest, ReadingProgressState,
+        RecommendationSubtopicsState, RecommendationTopicRequest,
     },
     device::DeviceState,
     input::InputGesture,
     network::NetworkState,
     network::NetworkStatus,
-    reader::{ReaderParagraphInfo, ReaderWindow, ReaderWindowLoadRequest},
+    reader::{ReaderParagraphInfo, ReaderPauseActionKind, ReaderWindow, ReaderWindowLoadRequest},
     settings::PersistedSettings,
     storage::StorageHealth,
-    sync::SyncStatus,
+    sync::{StartupSyncProgress, SyncStatus},
     text::InlineText,
 };
 
@@ -72,6 +73,7 @@ pub enum Event {
     InputGestureReceived(InputGesture),
     NetworkStatusChanged(NetworkStatus),
     BackendSyncStatusChanged(SyncStatus),
+    StartupSyncProgressChanged(StartupSyncProgress),
     CollectionContentUpdated(CollectionKind, Box<CollectionManifestState>),
     RecommendationSubtopicsUpdated(Box<RecommendationSubtopicsState>),
     RecommendationTopicContentUpdated {
@@ -95,6 +97,19 @@ pub enum Event {
         content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
         progress: PrepareContentProgress,
     },
+    ReaderPauseDetailLoaded(ReaderPauseDetail),
+    ReaderPauseDetailFailed {
+        content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
+    },
+    ReaderPauseActionApplied {
+        content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
+        action: ReaderPauseActionKind,
+        enabled: bool,
+    },
+    ReaderPauseActionFailed {
+        content_id: InlineText<{ crate::content::CONTENT_ID_MAX_BYTES }>,
+        action: ReaderPauseActionKind,
+    },
     UiTick(u64),
     ReaderTick(u64),
     WokeFromDeepSleep,
@@ -112,8 +127,12 @@ pub enum Effect {
     OpenCachedContent(PrepareContentRequest),
     LoadReaderWindow(ReaderWindowLoadRequest),
     PrepareContent(PrepareContentRequest),
+    LoadReaderPauseDetail(ReaderPauseDetailRequest),
+    ToggleReaderSaved(ReaderSavedToggleRequest),
+    ToggleReaderSubscription(ReaderSubscriptionToggleRequest),
     LoadRecommendationSubtopics,
     LoadRecommendationTopic(RecommendationTopicRequest),
+    RefreshCollection(CollectionKind),
     PersistSettings(PersistedSettings),
 }
 
